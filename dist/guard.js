@@ -334,6 +334,8 @@ export function stripLeakedNotes(answer) {
     };
 }
 const MD_LINK_RE = /\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g;
+const SANDBOX_IMAGE_MD_RE = /!\[[^\]\n]*\]\(\s*(?:\.{0,2}\/)?media\/[^)\s]+\s*\)/gi;
+const EMPTY_CODE_FENCE_RE = /```[a-zA-Z0-9_-]*\s*```/g;
 const NON_PAREN_WRAPPED_URL_RE = /([[\（【<《"'])(https?:\/\/[^\s<>[\]（）【】《》"']+?)([\]）】>》"'])/g;
 const PAREN_WRAPPED_URL_RE = /\((https?:\/\/[^\s<>,;"'\u3000-\u303F\u3400-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]+)\)/g;
 const BARE_URL_RE = /https?:\/\/[^\s<>[\]"'\u3000-\u303F\u3400-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]+/g;
@@ -369,8 +371,12 @@ function splitUrlAndTrailingPunct(token) {
 export function sanitizeMobileLinks(text) {
     if (!text)
         return '';
+    // 0. Remove unrenderable sandbox relative image links (e.g., ![cover](media/cover-xxx.jpg)) and empty fences
+    let out = text
+        .replace(SANDBOX_IMAGE_MD_RE, '')
+        .replace(EMPTY_CODE_FENCE_RE, '');
     // 1. Unwrap Markdown links [label](https://...)
-    let out = text.replace(MD_LINK_RE, (_whole, rawLabel, rawUrl) => {
+    out = out.replace(MD_LINK_RE, (_whole, rawLabel, rawUrl) => {
         const label = rawLabel.trim();
         const url = rawUrl.trim();
         if (!label || label === url || url.includes(label)) {
@@ -405,11 +411,12 @@ export function sanitizeMobileLinks(text) {
         const needsAfter = Boolean(next && !/\s/.test(next));
         return `${lead}${url}${needsAfter ? ' ' : ''}`;
     });
-    // Clean horizontal multi-spaces on each line while preserving intentional newlines
+    // Clean horizontal multi-spaces on each line and collapse excess blank lines while preserving newlines
     return out
         .split('\n')
         .map((line) => line.replace(/ {2,}/g, ' ').trimEnd())
         .join('\n')
+        .replace(/\n{3,}/g, '\n\n')
         .trim();
 }
 //# sourceMappingURL=guard.js.map

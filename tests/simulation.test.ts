@@ -1801,5 +1801,19 @@ describe('narra-agent-kit simulation & unit suite', () => {
       expect(fallbackRes.reason).toBe('heuristic_fallback');
       expect(fallbackRes.score).toBeGreaterThan(0.55);
     });
+
+    it('sanitizeMobileLinks strips dead relative media/*.jpg markdown images and empty code fences while keeping https URLs', () => {
+      const dirty = [
+        'Soho 這週末有幾個快閃：',
+        'https://app.manyfold.ai/spotted-london/p/sample-popup',
+        '```![](media/cover-145e6a0f270f4ab9.jpg) ![](media/cover-d4f2152bafda4d18.jpg)```',
+        '![alt](./media/preview.png)',
+      ].join('\n');
+      const sanitized = sanitizeMobileLinks(dirty);
+      expect(sanitized).toContain('https://app.manyfold.ai/spotted-london/p/sample-popup');
+      expect(sanitized).not.toContain('media/cover-');
+      expect(sanitized).not.toContain('media/preview.png');
+      expect(sanitized).not.toContain('```');
+    });
   });
 });

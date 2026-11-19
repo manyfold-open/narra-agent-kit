@@ -38,6 +38,7 @@ import {
 import {
   fetchEventContext,
   fetchMatrixCredential,
+  fetchNarraChatMessagesBackstop,
   fetchRoomMessagesBackstop,
   matrixSyncRequest,
   redactSecrets,
@@ -122,6 +123,7 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
     event: InboundEvent,
     decision: TriageDecision,
     memories: RecallTurnResult,
+    context?: RoomContext,
   ) => Promise<string | null>;
   resolveA2ACredential?: (env: TEnv) => Promise<NarraA2ACredentialResult | null>;
   triageModel?: (env: TEnv) => TriageModel | undefined;
@@ -154,10 +156,11 @@ export type NarraMatrixOp =
     }
   | { op: 'typing'; roomId: string; typing: boolean; timeoutMs?: number }
   | { op: 'receipt'; roomId: string; eventId: string }
-  | { op: 'fetchEvent'; roomId: string; eventId: string };
+  | { op: 'fetchEvent'; roomId: string; eventId: string }
+  | { op: 'recentMessages'; roomId: string; limit?: number };
 
 export type NarraMatrixOpResult =
-  | { ok: true; eventId?: string; event?: InboundEvent | null }
+  | { ok: true; eventId?: string; event?: InboundEvent | null; events?: InboundEvent[] }
   | { ok: false; status: number; errcode?: string; narraCode?: string };
 
 export interface NarraGatewayKickResult {
@@ -607,6 +610,19 @@ export class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGatewayEnv>
       const event = await fetchEventContext(login, op.roomId, op.eventId, fetchImpl);
       if (!event) return { ok: false, status: 404, errcode: 'M_NOT_FOUND' };
       return { ok: true, event };
+    }
+    if (op.op === 'recentMessages') {
+      try {
+        const res = await fetchRoomMessagesBackstop(
+          login,
+          op.roomId,
+          { dir: 'b', limit: op.limit ?? 8 },
+          fetchImpl,
+        );
+        return { ok: true, events: res.events };
+      } catch {
+        return { ok: false, status: 500, errcode: 'MESSAGES_FETCH_FAILED' };
+      }
     }
 
     const roomBase = `${login.homeserverUrl}/_matrix/client/v3/rooms/${enc(op.roomId)}`;
@@ -1673,6 +1689,63 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     });
   }
 
+  private async hasLivePeerRepliedAfter(
+    event: InboundEvent,
+    baseContext: RoomContext,
+    selfMatrixId: string | undefined,
+  ): Promise<boolean> {
+    const localHistory = (await this.ctx.storage.get<HistoryTurn[]>('recentHistory')) ?? [];
+    if (hasPeerRepliedAfter(event, { ...baseContext, recentHistory: localHistory }, selfMatrixId)) {
+      return true;
+    }
+
+    if (!isNarraSyncEnabled(this.env)) {
+      return false;
+    }
+
+    const isPeerEventAfter = (ev: InboundEvent): boolean =>
+      ev.eventId !== event.eventId &&
+      ev.senderId !== selfMatrixId &&
+      isNarraAgent(ev.senderId) &&
+      ev.timestampMs > event.timestampMs;
+
+    if (this.env.NARRA_SYNC_DO) {
+      try {
+        const mat = await this.matrixOp({
+          op: 'recentMessages',
+          roomId: event.roomId,
+          limit: 8,
+        });
+        if (mat.ok && Array.isArray(mat.events) && mat.events.some(isPeerEventAfter)) {
+          return true;
+        }
+      } catch {
+        // Fall through cleanly to Narra chat/messages backstop.
+      }
+    }
+
+    if ((this.env.NARRA_AGENT_TOKEN ?? '').trim()) {
+      try {
+        const backstop = await fetchNarraChatMessagesBackstop(
+          {
+            narraApiEndpoint: narraEndpoint(this.env),
+            narraAgentToken: this.env.NARRA_AGENT_TOKEN,
+            fetchImpl: this.getConfig().fetchImpl,
+          },
+          event.roomId,
+          { dir: 'b', limit: 8 },
+        );
+        if (backstop.events.some(isPeerEventAfter)) {
+          return true;
+        }
+      } catch {
+        // Non-fatal: ignore transient 404/network errors on backstop check.
+      }
+    }
+
+    return false;
+  }
+
   private async buildRoomContextForTurn(
     turn: PendingTurn,
     effectiveSpec: AgentSpec,
@@ -1866,15 +1939,18 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             const yieldOutcome = await executePoliteYield({
               delayMs: decision.yieldDelayMs,
               sleep: cfg.sleep,
-              checkPeerAnswered: async () => {
-                const latestHistory =
-                  (await this.ctx.storage.get<HistoryTurn[]>('recentHistory')) ?? [];
-                return hasPeerRepliedAfter(
-                  nextTurn.event,
-                  { ...context, recentHistory: latestHistory },
-                  effectiveSpec.matrixId,
-                );
-              },
+              checkPeerAnswered: () =>
+                decision!.reason === 'multi_mention_domain_match'
+                  ? (async () => {
+                      const latestHistory =
+                        (await this.ctx.storage.get<HistoryTurn[]>('recentHistory')) ?? [];
+                      return hasPeerRepliedAfter(
+                        nextTurn.event,
+                        { ...context, recentHistory: latestHistory },
+                        effectiveSpec.matrixId,
+                      );
+                    })()
+                  : this.hasLivePeerRepliedAfter(nextTurn.event, context, effectiveSpec.matrixId),
             });
             if (yieldOutcome.yield) {
               if (decision.reason === 'active_session') {
@@ -2009,7 +2085,13 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
 
             if (!handledFast && cfg.fastRespond) {
               try {
-                const fast = await cfg.fastRespond(this.env, nextTurn.event, decision, memories);
+                const fast = await cfg.fastRespond(
+                  this.env,
+                  nextTurn.event,
+                  decision,
+                  memories,
+                  context,
+                );
                 if (fast !== null && fast !== undefined) {
                   rawAnswer = fast;
                   handledFast = true;
@@ -2083,21 +2165,20 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           !decision.directRoute &&
           decision.reason !== 'multi_mention_domain_match'
         ) {
-          const latestHistory = (await this.ctx.storage.get<HistoryTurn[]>('recentHistory')) ?? [];
           const latestPeers = inspectRoomPeers(meta?.members ?? [], effectiveSpec.matrixId);
           if (
             latestPeers.length > 0 &&
-            hasPeerRepliedAfter(
+            (await this.hasLivePeerRepliedAfter(
               nextTurn.event,
               {
                 roomId: nextTurn.event.roomId,
                 chatType,
                 members: meta?.members ?? [],
                 peers: latestPeers,
-                recentHistory: latestHistory,
+                recentHistory: [],
               },
               effectiveSpec.matrixId,
-            )
+            ))
           ) {
             await this.clearUserSession(nextTurn.event.senderId);
             await appendDoLog(

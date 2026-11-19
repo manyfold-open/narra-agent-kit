@@ -8,7 +8,7 @@ import { MemoryStore, handleStandardMemoryCommand, } from './memory.js';
 import { editContent, messageContent, plainMentions } from './mentions.js';
 import { shouldQuote } from './quote.js';
 import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSION_WINDOW_MS, createWorkersAiTriageModel, executePoliteYield, hasPeerRepliedAfter, inspectRoomPeers, isChainExhaustedError, isSelfMentioned, routeEvent, } from './router.js';
-import { fetchEventContext, fetchMatrixCredential, fetchRoomMessagesBackstop, matrixSyncRequest, redactSecrets, SyncError, syncOnce, } from './sync.js';
+import { fetchEventContext, fetchMatrixCredential, fetchNarraChatMessagesBackstop, fetchRoomMessagesBackstop, matrixSyncRequest, redactSecrets, SyncError, syncOnce, } from './sync.js';
 const DEFAULT_NARRA_API_ENDPOINT = 'https://api.netmind.chat';
 const DEFAULT_MATRIX_HOMESERVER = 'https://matrix.netmind.chat';
 const ROOM_META_REFRESH_MS = 5 * 60_000;
@@ -321,6 +321,15 @@ export class BaseNarraMatrixSync {
             if (!event)
                 return { ok: false, status: 404, errcode: 'M_NOT_FOUND' };
             return { ok: true, event };
+        }
+        if (op.op === 'recentMessages') {
+            try {
+                const res = await fetchRoomMessagesBackstop(login, op.roomId, { dir: 'b', limit: op.limit ?? 8 }, fetchImpl);
+                return { ok: true, events: res.events };
+            }
+            catch {
+                return { ok: false, status: 500, errcode: 'MESSAGES_FETCH_FAILED' };
+            }
         }
         const roomBase = `${login.homeserverUrl}/_matrix/client/v3/rooms/${enc(op.roomId)}`;
         let method = 'PUT';
@@ -1282,6 +1291,50 @@ export class BaseNarraRoomCoordinator {
             }
         });
     }
+    async hasLivePeerRepliedAfter(event, baseContext, selfMatrixId) {
+        const localHistory = (await this.ctx.storage.get('recentHistory')) ?? [];
+        if (hasPeerRepliedAfter(event, { ...baseContext, recentHistory: localHistory }, selfMatrixId)) {
+            return true;
+        }
+        if (!isNarraSyncEnabled(this.env)) {
+            return false;
+        }
+        const isPeerEventAfter = (ev) => ev.eventId !== event.eventId &&
+            ev.senderId !== selfMatrixId &&
+            isNarraAgent(ev.senderId) &&
+            ev.timestampMs > event.timestampMs;
+        if (this.env.NARRA_SYNC_DO) {
+            try {
+                const mat = await this.matrixOp({
+                    op: 'recentMessages',
+                    roomId: event.roomId,
+                    limit: 8,
+                });
+                if (mat.ok && Array.isArray(mat.events) && mat.events.some(isPeerEventAfter)) {
+                    return true;
+                }
+            }
+            catch {
+                // Fall through cleanly to Narra chat/messages backstop.
+            }
+        }
+        if ((this.env.NARRA_AGENT_TOKEN ?? '').trim()) {
+            try {
+                const backstop = await fetchNarraChatMessagesBackstop({
+                    narraApiEndpoint: narraEndpoint(this.env),
+                    narraAgentToken: this.env.NARRA_AGENT_TOKEN,
+                    fetchImpl: this.getConfig().fetchImpl,
+                }, event.roomId, { dir: 'b', limit: 8 });
+                if (backstop.events.some(isPeerEventAfter)) {
+                    return true;
+                }
+            }
+            catch {
+                // Non-fatal: ignore transient 404/network errors on backstop check.
+            }
+        }
+        return false;
+    }
     async buildRoomContextForTurn(turn, effectiveSpec, memoryStore, nowMs) {
         const meta = (await this.ctx.storage.get('roomMeta')) ?? {
             roomId: turn.event.roomId,
@@ -1427,10 +1480,12 @@ export class BaseNarraRoomCoordinator {
                         const yieldOutcome = await executePoliteYield({
                             delayMs: decision.yieldDelayMs,
                             sleep: cfg.sleep,
-                            checkPeerAnswered: async () => {
-                                const latestHistory = (await this.ctx.storage.get('recentHistory')) ?? [];
-                                return hasPeerRepliedAfter(nextTurn.event, { ...context, recentHistory: latestHistory }, effectiveSpec.matrixId);
-                            },
+                            checkPeerAnswered: () => decision.reason === 'multi_mention_domain_match'
+                                ? (async () => {
+                                    const latestHistory = (await this.ctx.storage.get('recentHistory')) ?? [];
+                                    return hasPeerRepliedAfter(nextTurn.event, { ...context, recentHistory: latestHistory }, effectiveSpec.matrixId);
+                                })()
+                                : this.hasLivePeerRepliedAfter(nextTurn.event, context, effectiveSpec.matrixId),
                         });
                         if (yieldOutcome.yield) {
                             if (decision.reason === 'active_session') {
@@ -1541,7 +1596,7 @@ export class BaseNarraRoomCoordinator {
                         }
                         if (!handledFast && cfg.fastRespond) {
                             try {
-                                const fast = await cfg.fastRespond(this.env, nextTurn.event, decision, memories);
+                                const fast = await cfg.fastRespond(this.env, nextTurn.event, decision, memories, context);
                                 if (fast !== null && fast !== undefined) {
                                     rawAnswer = fast;
                                     handledFast = true;
@@ -1606,16 +1661,15 @@ export class BaseNarraRoomCoordinator {
                     decision?.tier === 1 &&
                     !decision.directRoute &&
                     decision.reason !== 'multi_mention_domain_match') {
-                    const latestHistory = (await this.ctx.storage.get('recentHistory')) ?? [];
                     const latestPeers = inspectRoomPeers(meta?.members ?? [], effectiveSpec.matrixId);
                     if (latestPeers.length > 0 &&
-                        hasPeerRepliedAfter(nextTurn.event, {
+                        (await this.hasLivePeerRepliedAfter(nextTurn.event, {
                             roomId: nextTurn.event.roomId,
                             chatType,
                             members: meta?.members ?? [],
                             peers: latestPeers,
-                            recentHistory: latestHistory,
-                        }, effectiveSpec.matrixId)) {
+                            recentHistory: [],
+                        }, effectiveSpec.matrixId))) {
                         await this.clearUserSession(nextTurn.event.senderId);
                         await appendDoLog(this.ctx.storage, `yielded_post_gen ${nextTurn.event.eventId}: peer_already_replied`, this.nowMs(), this.env);
                         await this.removePendingTurn(nextTurn.event.eventId);

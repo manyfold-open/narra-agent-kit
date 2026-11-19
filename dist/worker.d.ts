@@ -1,6 +1,6 @@
 import { type BroadcastScheduleResult } from './broadcast.js';
 import { type RecallTurnResult } from './memory.js';
-import type { AgentSpec, AgentUpdateItem, InboundEvent, TriageDecision, TriageModel } from './types.js';
+import type { AgentSpec, AgentUpdateItem, InboundEvent, RoomContext, TriageDecision, TriageModel } from './types.js';
 export declare const NARRA_GATEWAY_STATE_SCHEMA = "\nCREATE TABLE IF NOT EXISTS narra_gateway_state (\n  agent_id TEXT PRIMARY KEY,\n  last_broadcast_iso TEXT NOT NULL,\n  updated_at TEXT NOT NULL\n);\n";
 export interface NarraGatewayEnv {
     DB?: D1Database;
@@ -31,7 +31,7 @@ export interface NarraA2ACredentialResult {
 export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayEnv> {
     spec: AgentSpec;
     fetchUpdates?: (env: TEnv, sinceIso: string) => Promise<AgentUpdateItem[]>;
-    fastRespond?: (env: TEnv, event: InboundEvent, decision: TriageDecision, memories: RecallTurnResult) => Promise<string | null>;
+    fastRespond?: (env: TEnv, event: InboundEvent, decision: TriageDecision, memories: RecallTurnResult, context?: RoomContext) => Promise<string | null>;
     resolveA2ACredential?: (env: TEnv) => Promise<NarraA2ACredentialResult | null>;
     triageModel?: (env: TEnv) => TriageModel | undefined;
     /** Optional custom fetch implementation (defaults to global fetch). */
@@ -75,11 +75,16 @@ export type NarraMatrixOp = {
     op: 'fetchEvent';
     roomId: string;
     eventId: string;
+} | {
+    op: 'recentMessages';
+    roomId: string;
+    limit?: number;
 };
 export type NarraMatrixOpResult = {
     ok: true;
     eventId?: string;
     event?: InboundEvent | null;
+    events?: InboundEvent[];
 } | {
     ok: false;
     status: number;
@@ -173,6 +178,7 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
     private removePendingTurn;
     private updatePendingTurn;
     private clearUserSession;
+    private hasLivePeerRepliedAfter;
     private buildRoomContextForTurn;
     alarm(): Promise<void>;
 }

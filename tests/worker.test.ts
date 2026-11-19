@@ -2133,4 +2133,186 @@ describe('worker runtime layer (src/worker.ts)', () => {
     const logs = (await storage.get<string[]>('log')) ?? [];
     expect(logs.some((l) => l.includes('yielded_post_gen $race_1'))).toBe(true);
   });
+
+  it('13. live recentMessages & Narra chat/messages backstop stop duplicate replies even when /sync filters peer bots, and passes context to fastRespond', async () => {
+    let nowMs = 1_760_800_000_000;
+    const postedPayloads: string[] = [];
+    const seenHistoryCounts: number[] = [];
+    const peerId = '@agent-b2b526f3:matrix.netmind.chat';
+    const roomId = '!grp_live_backstop:matrix.netmind.chat';
+    const members = [
+      { matrixId: '@zack:matrix.netmind.chat', displayName: 'Zack', isAgent: false },
+      { matrixId: TEST_SPEC.matrixId!, displayName: 'Spotted London', isAgent: true },
+      { matrixId: peerId, displayName: 'London Chinese Food', isAgent: true },
+    ];
+
+    let mode: 'matrix_messages' | 'narra_chat_api' | 'clear' = 'clear';
+    let triggerTs = nowMs;
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith('/api/agent-runtime/matrix-credential')) {
+        return Response.json({
+          status: 'ok',
+          data: {
+            homeserver_url: 'https://matrix.netmind.chat',
+            matrix_user_id: TEST_SPEC.matrixId,
+            access_token: 'syt_live_backstop_tok',
+          },
+        });
+      }
+      if (url.includes('/typing/') || url.includes('/receipt/')) {
+        return Response.json({});
+      }
+      if (url.includes('/_matrix/client/v3/rooms/') && url.includes('/messages')) {
+        if (mode === 'matrix_messages') {
+          return Response.json({
+            chunk: [
+              {
+                event_id: '$peer_via_matrix_msgs',
+                sender: peerId,
+                type: 'm.room.message',
+                origin_server_ts: triggerTs + 200,
+                content: { msgtype: 'm.text', body: 'LCF answered first via Matrix /messages!' },
+              },
+            ],
+          });
+        }
+        return Response.json({ chunk: [] });
+      }
+      if (url.includes('/api/agent-runtime/chat/messages')) {
+        if (mode === 'narra_chat_api') {
+          return Response.json({
+            status: 'ok',
+            data: {
+              messages: [
+                {
+                  event_id: '$peer_via_narra_chat',
+                  sender: peerId,
+                  type: 'm.room.message',
+                  origin_server_ts: triggerTs + 300,
+                  content: { msgtype: 'm.text', body: 'LCF answered first via Narra chat/messages!' },
+                },
+              ],
+            },
+          });
+        }
+        return Response.json({ status: 'ok', data: { messages: [] } });
+      }
+      if (url.includes('/send/')) {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { body?: string };
+        postedPayloads.push(body.body ?? '');
+        return Response.json({ event_id: `$bot_live_${postedPayloads.length}` });
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    const gateway = createNarraWorkerGateway({
+      spec: {
+        ...TEST_SPEC,
+        domainKeywords: ['pop-up', '市集', 'UCL'],
+        politeYieldDelayMs: 25,
+      },
+      now: () => nowMs,
+      sleep: async (ms: number) => {
+        nowMs += ms;
+      },
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      fastRespond: async (_env, ev, _dec, _mem, context) => {
+        seenHistoryCounts.push(context?.recentHistory.length ?? -1);
+        return `Answer:${ev.text}`;
+      },
+    });
+
+    let env!: NarraGatewayEnv;
+    const syncHandle = createFakeNamespace((ctx) => new gateway.BaseNarraMatrixSync(ctx, env));
+    const roomHandle = createFakeNamespace((ctx) => new gateway.BaseNarraRoomCoordinator(ctx, env));
+
+    env = {
+      DB: createD1(),
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'on',
+      NARRA_AGENT_TOKEN: 'narra_tok_live_backstop',
+      NARRA_SYNC_DO: syncHandle.namespace,
+      NARRA_ROOM_DO: roomHandle.namespace,
+    };
+
+    const roomStub = roomHandle.namespace.get(roomHandle.namespace.idFromName(roomId));
+    const roomInst = () => roomHandle.instances.get(roomId)!.instance;
+
+    // 1) Normal unmentioned domain match -> replies cleanly AND fastRespond receives context.recentHistory!
+    mode = 'clear';
+    triggerTs = nowMs;
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        chatType: 'group',
+        members,
+        events: [
+          {
+            event_id: '$ok_1',
+            sender: '@zack:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: triggerTs,
+            content: { msgtype: 'm.text', body: 'Any pop-up near UCL?' },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    await roomInst().alarm();
+    expect(postedPayloads).toHaveLength(1);
+    expect(seenHistoryCounts[0]).toBeGreaterThanOrEqual(1);
+
+    // 2) Wait past 3-min active session; peer replies in Matrix /messages WITHOUT appearing in local /sync -> MUST yield!
+    nowMs += 200_000;
+    mode = 'matrix_messages';
+    triggerTs = nowMs;
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        chatType: 'group',
+        members,
+        events: [
+          {
+            event_id: '$dup_matrix',
+            sender: '@zack:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: triggerTs,
+            content: { msgtype: 'm.text', body: 'What pop-up market is near Soho?' },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    await roomInst().alarm();
+    expect(postedPayloads).toHaveLength(1);
+
+    // 3) Matrix /messages empty (delivery filter!), ONLY Narra chat/messages has peer reply -> MUST yield!
+    nowMs += 200_000;
+    mode = 'narra_chat_api';
+    triggerTs = nowMs;
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        chatType: 'group',
+        members,
+        events: [
+          {
+            event_id: '$dup_narra_api',
+            sender: '@zack:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: triggerTs,
+            content: { msgtype: 'm.text', body: 'Any weekend pop-up in Soho?' },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    await roomInst().alarm();
+    expect(postedPayloads).toHaveLength(1);
+  });
 });
