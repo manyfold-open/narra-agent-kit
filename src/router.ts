@@ -1,5 +1,5 @@
 import { isNarraAgent } from './guard.js';
-import { detectLang } from './lang.js';
+import { detectLang, stripAgentMentions } from './lang.js';
 import { shouldQuote } from './quote.js';
 import type {
   AgentSpec,
@@ -50,6 +50,13 @@ function allNamesFor(name?: string, aliases?: string[]): string[] {
     .map((s) => (s ?? '').trim())
     .filter((s) => s.length > 0);
   return [...new Set(out)];
+}
+
+function collectMentionNames(spec: AgentSpec, peers: PeerAgentInfo[] = []): string[] {
+  return [
+    ...allNamesFor(spec.name, spec.aliases),
+    ...peers.flatMap((p) => allNamesFor(p.displayName, p.aliases)),
+  ];
 }
 
 function nameMentionedInText(text: string, names: string[], requireAtPrefix = false): boolean {
@@ -368,9 +375,11 @@ const STOPWORDS = new Set([
 export function heuristicDomainScore(
   event: InboundEvent,
   spec: AgentSpec,
-  _context?: RoomContext,
+  context?: RoomContext,
 ): number {
-  const text = (event.text ?? '').trim();
+  const peers = context?.peers ?? inspectRoomPeers(context?.members ?? [], spec.matrixId);
+  const mentionNames = collectMentionNames(spec, peers);
+  const text = stripAgentMentions(event.text ?? '', mentionNames).trim();
   if (!text) return 0;
   const lower = text.toLowerCase();
 
@@ -434,10 +443,13 @@ export async function routeEvent(
   options: RouteOptions = {},
 ): Promise<TriageDecision> {
   const nowMs = options.nowMs ?? Date.now();
+  const peers = context.peers ?? inspectRoomPeers(context.members, spec.matrixId);
+  const mentionNames = collectMentionNames(spec, peers);
   const detectedLang: LangCode = detectLang(
     event.text,
     context.userLanguageHint,
     context.roomLanguageHint,
+    { extraMentionNames: mentionNames },
   );
   const quoteFlag = shouldQuote(event, {
     chatType: context.chatType,
@@ -528,7 +540,6 @@ export async function routeEvent(
     };
   }
 
-  const peers = context.peers ?? inspectRoomPeers(context.members, spec.matrixId);
   const selfMentioned = isSelfMentioned(event, spec);
   const mentionedPeers = findMentionedPeers(event, spec, peers);
   const isSingleExplicitMention = selfMentioned && mentionedPeers.length === 0;

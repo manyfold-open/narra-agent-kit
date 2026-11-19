@@ -1476,4 +1476,57 @@ describe('worker runtime layer (src/worker.ts)', () => {
     expect(roomExecSpy).not.toHaveBeenCalled();
     expect(roomBatchSpy).toHaveBeenCalledTimes(3);
   });
+
+  it('8. BaseNarraRoomCoordinator propagates payload.chatType "dm" onto normalized sync events', async () => {
+    let nowMs = 1_760_400_000_000;
+    const seenChatTypes: string[] = [];
+    const dmGateway = createNarraWorkerGateway({
+      spec: TEST_SPEC,
+      now: () => nowMs,
+      fastRespond: async (_env, ev) => {
+        seenChatTypes.push(ev.chatType);
+        return ev.chatType === 'dm' ? 'DM greeting ok' : null;
+      },
+      fetchImpl: (async () =>
+        Response.json({ status: 'ok', data: { event_id: '$dm_ev_1' } })) as unknown as typeof fetch,
+    });
+    const env: NarraGatewayEnv = {
+      DB: createD1(),
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'off',
+      NARRA_AGENT_TOKEN: 'narra_tok_dm_prop',
+    };
+    const { state } = createFakeDOState();
+    const roomDo = new dmGateway.BaseNarraRoomCoordinator(state, env);
+
+    const normalizedFromSync: InboundEvent = {
+      roomId: '!dm_sync_1:matrix.netmind.chat',
+      chatType: 'group', // default before BaseNarraMatrixSync attaches roomMeta.chatType='dm'
+      eventId: '$sync_dm_hi',
+      senderId: '@alice:matrix.netmind.chat',
+      type: 'm.room.message',
+      kind: 'text',
+      msgtype: 'm.text',
+      text: '你好',
+      timestampMs: nowMs,
+      timeIso: new Date(nowMs).toISOString(),
+      mentions: [],
+    };
+
+    await roomDo.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId: '!dm_sync_1:matrix.netmind.chat',
+          chatType: 'dm',
+          events: [normalizedFromSync],
+        }),
+      }),
+    );
+
+    nowMs += 2_000;
+    await roomDo.alarm();
+
+    expect(seenChatTypes).toEqual(['dm']);
+  });
 });

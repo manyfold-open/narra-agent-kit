@@ -1,5 +1,5 @@
 import { isNarraAgent } from './guard.js';
-import { detectLang } from './lang.js';
+import { detectLang, stripAgentMentions } from './lang.js';
 import { shouldQuote } from './quote.js';
 export const DEFAULT_SESSION_WINDOW_MS = 3 * 60_000;
 export const DEFAULT_STALE_GROUP_MS = 15 * 60_000;
@@ -32,6 +32,12 @@ function allNamesFor(name, aliases) {
         .map((s) => (s ?? '').trim())
         .filter((s) => s.length > 0);
     return [...new Set(out)];
+}
+function collectMentionNames(spec, peers = []) {
+    return [
+        ...allNamesFor(spec.name, spec.aliases),
+        ...peers.flatMap((p) => allNamesFor(p.displayName, p.aliases)),
+    ];
 }
 function nameMentionedInText(text, names, requireAtPrefix = false) {
     if (!text)
@@ -299,8 +305,10 @@ const STOPWORDS = new Set([
  * Zero-LLM-key lightweight Tier 1 heuristic scorer matching `domainKeywords`,
  * `antiKeywords`, and `domainDescription` tokens against the inbound message.
  */
-export function heuristicDomainScore(event, spec, _context) {
-    const text = (event.text ?? '').trim();
+export function heuristicDomainScore(event, spec, context) {
+    const peers = context?.peers ?? inspectRoomPeers(context?.members ?? [], spec.matrixId);
+    const mentionNames = collectMentionNames(spec, peers);
+    const text = stripAgentMentions(event.text ?? '', mentionNames).trim();
     if (!text)
         return 0;
     const lower = text.toLowerCase();
@@ -352,7 +360,9 @@ export function heuristicDomainScore(event, spec, _context) {
  */
 export async function routeEvent(event, context, spec, options = {}) {
     const nowMs = options.nowMs ?? Date.now();
-    const detectedLang = detectLang(event.text, context.userLanguageHint, context.roomLanguageHint);
+    const peers = context.peers ?? inspectRoomPeers(context.members, spec.matrixId);
+    const mentionNames = collectMentionNames(spec, peers);
+    const detectedLang = detectLang(event.text, context.userLanguageHint, context.roomLanguageHint, { extraMentionNames: mentionNames });
     const quoteFlag = shouldQuote(event, {
         chatType: context.chatType,
         subsequentEvents: context.subsequentEvents,
@@ -436,7 +446,6 @@ export async function routeEvent(event, context, spec, options = {}) {
             shouldQuote: false,
         };
     }
-    const peers = context.peers ?? inspectRoomPeers(context.members, spec.matrixId);
     const selfMentioned = isSelfMentioned(event, spec);
     const mentionedPeers = findMentionedPeers(event, spec, peers);
     const isSingleExplicitMention = selfMentioned && mentionedPeers.length === 0;

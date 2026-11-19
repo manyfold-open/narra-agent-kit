@@ -137,13 +137,14 @@ function makeSendFailure(message, status, opts = {}) {
             (status === 401 || status === 403 || status === 429 || status >= 500 || status === 0);
     return err;
 }
-function hasExplicitLangSignal(text) {
+function hasExplicitLangSignal(text, extraMentionNames) {
     const trimmed = (text ?? '').trim();
     if (!trimmed)
         return false;
-    const a = detectLang(trimmed, 'zh-Hant', 'zh-Hant');
-    const b = detectLang(trimmed, 'zh-Hans', 'zh-Hans');
-    const c = detectLang(trimmed, 'en', 'en');
+    const options = extraMentionNames?.length ? { extraMentionNames: [...extraMentionNames] } : undefined;
+    const a = detectLang(trimmed, 'zh-Hant', 'zh-Hant', options);
+    const b = detectLang(trimmed, 'zh-Hans', 'zh-Hans', options);
+    const c = detectLang(trimmed, 'en', 'en', options);
     return a === b && b === c;
 }
 function isNormalizedInboundEvent(raw) {
@@ -448,9 +449,9 @@ export class BaseNarraMatrixSync {
         }
         await this.ctx.storage.put('roomIds', [...knownRoomIds].slice(-100));
     }
-    async refreshNarraRoomsMeta(nowMs) {
+    async refreshNarraRoomsMeta(nowMs, force = false) {
         const lastRefreshed = (await this.ctx.storage.get('roomsMetaRefreshedAt')) ?? 0;
-        if (nowMs - lastRefreshed < ROOM_META_REFRESH_MS)
+        if (!force && nowMs - lastRefreshed < ROOM_META_REFRESH_MS)
             return;
         const token = (this.env.NARRA_AGENT_TOKEN ?? '').trim();
         if (!token)
@@ -490,7 +491,10 @@ export class BaseNarraMatrixSync {
                     displayName: typeof m.display_name === 'string' ? m.display_name : undefined,
                     isAgent: isNarraAgent(String(m.matrix_user_id)),
                 }));
-                const chatType = r.conversation_type === 'dm' ? 'dm' : 'group';
+                const rawType = String(r.conversation_type ?? r.chat_type ?? r.type ?? '').toLowerCase();
+                const chatType = ['dm', 'direct', 'private', 'one_on_one'].includes(rawType)
+                    ? 'dm'
+                    : 'group';
                 const roomName = typeof r.title === 'string' && r.title.trim() ? r.title.trim() : undefined;
                 await this.ctx.storage.put(`roomMeta:${roomId}`, {
                     roomId,
@@ -576,10 +580,16 @@ export class BaseNarraMatrixSync {
                     (await storage.get('matrixUserId')) ??
                     cfg.spec.matrixId;
                 if (this.env.NARRA_ROOM_DO) {
+                    let forcedRefresh = false;
                     for (const room of rooms) {
                         if (room.events.length === 0)
                             continue;
-                        const meta = await storage.get(`roomMeta:${room.roomId}`);
+                        let meta = await storage.get(`roomMeta:${room.roomId}`);
+                        if (!meta && !forcedRefresh) {
+                            forcedRefresh = true;
+                            await this.refreshNarraRoomsMeta(this.nowMs(), true);
+                            meta = await storage.get(`roomMeta:${room.roomId}`);
+                        }
                         const mergedMembers = meta?.members?.length ? meta.members : room.members ?? [];
                         const stub = this.env.NARRA_ROOM_DO.get(this.env.NARRA_ROOM_DO.idFromName(room.roomId));
                         const response = await stub.fetch('https://narra-room/events', {
@@ -964,12 +974,19 @@ export class BaseNarraRoomCoordinator {
                 let pendingTurns = (await this.ctx.storage.get('pendingTurns')) ?? [];
                 const coalescer = this.createCoalescer(nowMs, storedBursts);
                 let accepted = 0;
+                const mentionNames = [
+                    effectiveSpec.name,
+                    ...(effectiveSpec.aliases ?? []),
+                    ...members.flatMap((m) => (m.displayName ? [m.displayName] : [])),
+                ].filter((s) => typeof s === 'string' && s.trim().length > 0);
                 for (const rawEv of payload.events) {
                     const ev = isNormalizedInboundEvent(rawEv)
                         ? {
                             ...rawEv,
                             roomId: rawEv.roomId || roomId,
-                            chatType: rawEv.chatType ?? chatType,
+                            chatType: payload.chatType === 'dm' || payload.chatType === 'group'
+                                ? payload.chatType
+                                : (rawEv.chatType ?? chatType),
                             ...(rawEv.roomName || roomName ? { roomName: rawEv.roomName ?? roomName } : {}),
                         }
                         : parseMatrixEvent(rawEv, {
@@ -1124,8 +1141,10 @@ export class BaseNarraRoomCoordinator {
                             text: ev.text.slice(0, 1000),
                             timestampMs: ev.timestampMs,
                         };
-                        if (hasExplicitLangSignal(ev.text)) {
-                            const explicit = detectLang(ev.text);
+                        if (hasExplicitLangSignal(ev.text, mentionNames)) {
+                            const explicit = detectLang(ev.text, undefined, undefined, {
+                                extraMentionNames: mentionNames,
+                            });
                             userLanguageHints[ev.senderId] = explicit;
                             roomLanguageHint = explicit;
                         }

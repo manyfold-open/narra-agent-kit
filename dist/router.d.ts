@@ -74,7 +74,7 @@ export declare function executePoliteYield(options: PoliteYieldOptions): Promise
  * Zero-LLM-key lightweight Tier 1 heuristic scorer matching `domainKeywords`,
  * `antiKeywords`, and `domainDescription` tokens against the inbound message.
  */
-export declare function heuristicDomainScore(event: InboundEvent, spec: AgentSpec, _context?: RoomContext): number;
+export declare function heuristicDomainScore(event: InboundEvent, spec: AgentSpec, context?: RoomContext): number;
 export interface RouteOptions {
     nowMs?: number;
     triageModel?: TriageModel;

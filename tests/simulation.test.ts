@@ -37,8 +37,10 @@ import {
   shouldQuote,
   splitSqlStatements,
   staggerWindowMinute,
+  stripAgentMentions,
   stripLeakedNotes,
   syncOnce,
+  toZhHant,
   type AgentSpec,
   type D1DatabaseLike,
   type FastPathModel,
@@ -1382,6 +1384,76 @@ describe('narra-agent-kit simulation & unit suite', () => {
       const noopPrepare = vi.fn();
       await runSchemaStatements({ prepare: noopPrepare }, '  -- nothing here\n/* empty */  ');
       expect(noopPrepare).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('10. Unicode/multi-word @mention stripping, toZhHant, and multi-@ triage', () => {
+    it('strips CJK and multi-word @mentions before classifying script or English commands', () => {
+      expect(detectLang('@問一籤 帮我求一签', 'zh-Hant', 'zh-Hant')).toBe('zh-Hans');
+      expect(detectLang('@問一籤 draw a fortune stick', 'zh-Hant', 'zh-Hant')).toBe('en');
+      expect(detectLang('@塔羅大師 daily card', 'zh-Hant', 'zh-Hant')).toBe('en');
+      expect(stripAgentMentions('@問一籤 @AI in 5 今日 AI 新聞', ['問一籤', 'AI in 5'])).toBe(
+        '今日 AI 新聞',
+      );
+      expect(toZhHant('网络安全事件 50 亿美元 C 轮融资 锦里')).toBe(
+        '網絡安全事件 50 億美元 C 輪融資 錦里',
+      );
+    });
+
+    it('lets the domain-matching agent reply in multi-@ prompts without peer-alias antiKeyword penalty', async () => {
+      const fortuneSpec: AgentSpec = {
+        id: 'fortune-stick',
+        matrixId: '@agent-bc3282c7:matrix.netmind.chat',
+        name: 'AI Fortune Stick',
+        aliases: ['問一籤', '问一签'],
+        domainDescription: 'Chinese fortune stick draws and daily oracle interpretations.',
+        domainKeywords: ['fortune stick', 'draw a stick', '求籤', '求签', '問一籤'],
+        antiKeywords: ['ai news', 'ai新聞', '新聞'],
+        silenceThreshold: 0.55,
+      };
+      const ai5Spec: AgentSpec = {
+        id: 'ai5-chat',
+        matrixId: '@agent-3add8bb6:matrix.netmind.chat',
+        name: 'AI in 5',
+        aliases: ['AI in 5', 'ai5-chat', 'AI新聞'],
+        domainDescription: 'Daily AI news briefing and headline summaries.',
+        domainKeywords: ['ai news', '今日 ai 新聞', /\b今日\s+ai\s+新聞\b/i, 'ai新聞'],
+        antiKeywords: ['求籤', '問一籤', '问一签', 'fortune stick'],
+        silenceThreshold: 0.55,
+      };
+
+      const members: RoomMemberInfo[] = [
+        { matrixId: '@zack:matrix.netmind.chat', displayName: 'Zack', isAgent: false },
+        { matrixId: fortuneSpec.matrixId!, displayName: '問一籤', isAgent: true },
+        { matrixId: ai5Spec.matrixId!, displayName: 'AI in 5', isAgent: true },
+      ];
+      const event: InboundEvent = {
+        roomId: '!grp_multi:matrix.netmind.chat',
+        chatType: 'group',
+        eventId: '$ev_multi_1',
+        senderId: '@zack:matrix.netmind.chat',
+        type: 'm.room.message',
+        kind: 'text',
+        text: '@問一籤 @AI in 5 今日 AI 新聞',
+        timestampMs: BASE_TIME,
+        timeIso: new Date(BASE_TIME).toISOString(),
+        mentions: [fortuneSpec.matrixId!, ai5Spec.matrixId!],
+      };
+
+      const ctx: RoomContext = {
+        roomId: event.roomId,
+        chatType: 'group',
+        members,
+        recentHistory: [],
+        consecutiveAgentMessages: 0,
+      };
+
+      const ai5Decision = await routeEvent(event, ctx, ai5Spec, { nowMs: BASE_TIME });
+      const fortuneDecision = await routeEvent(event, ctx, fortuneSpec, { nowMs: BASE_TIME });
+
+      expect(ai5Decision.shouldReply).toBe(true);
+      expect(ai5Decision.reason).toBe('multi_mention_domain_match');
+      expect(fortuneDecision.shouldReply).toBe(false);
     });
   });
 });
