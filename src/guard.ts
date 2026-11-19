@@ -376,6 +376,8 @@ export function stripLeakedNotes(answer: string): { text: string; cut: string } 
 const MD_LINK_RE = /\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g;
 const SANDBOX_IMAGE_MD_RE = /!\[[^\]\n]*\]\(\s*(?:\.{0,2}\/)?media\/[^)\s]+\s*\)/gi;
 const EMPTY_CODE_FENCE_RE = /```[a-zA-Z0-9_-]*\s*```/g;
+const ORPHAN_PICTURES_LINE_RE =
+  /(?:Their pictures follow in the same order\.|圖片依序附在後面[。.]?|图片依序附在后面[。.]?)\s*/gi;
 const NON_PAREN_WRAPPED_URL_RE = /([[\（【<《"'])(https?:\/\/[^\s<>[\]（）【】《》"']+?)([\]）】>》"'])/g;
 const PAREN_WRAPPED_URL_RE = /\((https?:\/\/[^\s<>,;"'\u3000-\u303F\u3400-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]+)\)/g;
 const BARE_URL_RE = /https?:\/\/[^\s<>[\]"'\u3000-\u303F\u3400-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]+/g;
@@ -415,10 +417,11 @@ function splitUrlAndTrailingPunct(token: string): { url: string; trailing: strin
 export function sanitizeMobileLinks(text: string): string {
   if (!text) return '';
 
-  // 0. Remove unrenderable sandbox relative image links (e.g., ![cover](media/cover-xxx.jpg)) and empty fences
+  // 0. Remove unrenderable sandbox relative image links (e.g., ![cover](media/cover-xxx.jpg)), empty fences, and orphan captions
   let out = text
     .replace(SANDBOX_IMAGE_MD_RE, '')
-    .replace(EMPTY_CODE_FENCE_RE, '');
+    .replace(EMPTY_CODE_FENCE_RE, '')
+    .replace(ORPHAN_PICTURES_LINE_RE, '');
 
   // 1. Unwrap Markdown links [label](https://...)
   out = out.replace(MD_LINK_RE, (_whole, rawLabel: string, rawUrl: string) => {

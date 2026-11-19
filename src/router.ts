@@ -65,7 +65,10 @@ const SHORT_CONFIRM_RE =
   /^(?:抽|搖|摇|好|好的|好喔|好哦|對|对|對的|对的|對啊|对啊|繼續|继续|更多|下一[頁页]|是|不是|行|可以|要|再來|再来|yes|no|ok|okay|sure|more|next|another|draw|shake|go ahead)[!！。.~～?？\s]*$/i;
 
 const ACTIVE_FOLLOWUP_RE =
-  /(?:這[個間家張支條筆輪期]|这[个间家张支条笔轮期]|哪[一]?[個間家張支條筆]|第\s*[0-9一二三四五六七八九十]+|[那這][張支間家位筆][牌籤簽店]?|還有|还有|別[間家的個]|别[间家的个]|換一|换一|再[抽來找看查問问試试]|詳細|详细|細節|细节|解說|解说|解釋|解释|意思|含義|含义|地址|菜單|菜单|價格|价格|價錢|价钱|多少錢|多少钱|人均|幾點|几点|開門|开门|營業|营业|怎麼去|怎么去|坐什麼|坐什么|地鐵|地铁|附近|比較近|比较近|比較便宜|比较便宜|推薦|推荐|算一份|也算|改成|取消|截止|日期|時間|时间|來源|来源|連結|链接|網址|网址|網站|网站)|\b(?:which\s+one|that\s+one|those|this\s+one|another|more|next|details?|explain|meaning|interpret|address|menu|price|cost|hours?|opening|how\s+(?:do\s+(?:i|we)|to)\s+get|tube|station|walk|closer|cheaper|recommend|also|actually|make\s+that|what\s+about|how\s+about|why|when|where\s+is|deadline|source|link)\b/i;
+  /(?:這[個間家張支條筆輪期]|这[个间家张支条笔轮期]|哪[一]?[個間家張支條筆]|第\s*[0-9一二三四五六七八九十]+|[那這][張支間家位筆][牌籤簽店]?|還有|还有|別[間家的個]|别[间家的个]|換一|换一|再[抽來找看查問问試试]|詳細|详细|細節|细节|解說|解说|解釋|解释|意思|含義|含义|地址|菜單|菜单|價格|价格|價錢|价钱|多少錢|多少钱|人均|(?:開到|开到|營業到|营业到)\s*(?:幾點|几点)|幾點(?:開門|开门|關門|关门|營業|营业|打烊|開始|开始|結束|结束|截止)|几点(?:开门|关门|营业|打烊|开始|结束|截止)|(?:開門|开门|關門|关门|營業|营业|開始|开始|截止|開放|开放)\s*(?:時間|时间)|開門|开门|營業|营业|怎麼去|怎么去|坐什麼|坐什么|地鐵|地铁|附近|比較近|比较近|比較便宜|比较便宜|推薦|推荐|算一份|也算|改成|取消|截止|日期|來源|来源|連結|链接|網址|网址|網站|网站)|\b(?:which\s+one|that\s+one|those|this\s+one|another|more|next|details?|explain|meaning|interpret|address|menu|price|cost|hours?|opening|how\s+(?:do\s+(?:i|we)|to)\s+get|tube|station|walk|closer|cheaper|recommend|also|actually|make\s+that|what\s+about|how\s+about|why|when|where\s+is|deadline|source|link)\b/i;
+
+const HUMAN_GROUP_CHATTER_RE =
+  /(?:對了\s*大家|对了\s*大家|大家(?:晚點|晚点|等等|待會|待会|明天|等下|幾點|几点|要不|覺得|觉得)|會議室|会议室|開會|开会|約個會|约个会|訂會議室|订会议室|幾點開會|几点开会|幾點下班|几点下班|幾點出發|几点出发|地鐵誤點|地铁误点|地鐵延誤|地铁延误|延誤|延误|\b(?:everyone|guys|folks|team)\b.{0,24}\b(?:meeting|room|book|call|standup|sync|late|delayed|office|pint|pub)\b|\b(?:meeting\s+room|book\s+a\s+room|standup|conference\s+room|late\s+to\s+the\s+office)\b)/i;
 
 /** Extracts peer `@agent-*` members from a room roster, excluding self. */
 export function inspectRoomPeers(
@@ -906,6 +909,17 @@ export async function routeEvent(
           tier: 0,
           reason: 'active_session_off_topic',
           confidence: 0.95,
+          detectedLang,
+          shouldQuote: false,
+        };
+      }
+
+      if (!hasDomainHit && HUMAN_GROUP_CHATTER_RE.test(strippedText)) {
+        return {
+          shouldReply: false,
+          tier: 0,
+          reason: 'active_session_chatter',
+          confidence: 0.92,
           detectedLang,
           shouldQuote: false,
         };

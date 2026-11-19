@@ -1802,18 +1802,92 @@ describe('narra-agent-kit simulation & unit suite', () => {
       expect(fallbackRes.score).toBeGreaterThan(0.55);
     });
 
-    it('sanitizeMobileLinks strips dead relative media/*.jpg markdown images and empty code fences while keeping https URLs', () => {
+    it('sanitizeMobileLinks strips dead relative media/*.jpg markdown images, empty code fences, and orphan picture captions while keeping https URLs', () => {
       const dirty = [
         'Soho 這週末有幾個快閃：',
         'https://app.manyfold.ai/spotted-london/p/sample-popup',
         '```![](media/cover-145e6a0f270f4ab9.jpg) ![](media/cover-d4f2152bafda4d18.jpg)```',
         '![alt](./media/preview.png)',
+        '圖片依序附在後面。Their pictures follow in the same order. Want more options?',
       ].join('\n');
       const sanitized = sanitizeMobileLinks(dirty);
       expect(sanitized).toContain('https://app.manyfold.ai/spotted-london/p/sample-popup');
+      expect(sanitized).toContain('Want more options?');
       expect(sanitized).not.toContain('media/cover-');
       expect(sanitized).not.toContain('media/preview.png');
       expect(sanitized).not.toContain('```');
+      expect(sanitized).not.toContain('Their pictures follow in the same order.');
+      expect(sanitized).not.toContain('圖片依序附在後面');
+    });
+
+    it('rejects colleague office scheduling chatter during active_session while keeping genuine opening-hours and draw follow-ups', async () => {
+      const lcfSpec: AgentSpec = {
+        id: 'lcf-guide',
+        matrixId: '@agent-b2b526f3:matrix.netmind.chat',
+        name: 'London Chinese Food',
+        domainDescription: 'London Chinese restaurants',
+        domainKeywords: ['川菜', '火鍋', '拉麵'],
+        antiKeywords: ['塔羅', '快閃'],
+      };
+      const ctx: RoomContext = {
+        roomId: '!grp:matrix.netmind.chat',
+        chatType: 'group',
+        members: [
+          { matrixId: '@zack:matrix.netmind.chat', isAgent: false },
+          { matrixId: '@agent-b2b526f3:matrix.netmind.chat', isAgent: true, displayName: 'London Chinese Food' },
+          { matrixId: '@agent-852feddf:matrix.netmind.chat', isAgent: true, displayName: 'AI Tarot' },
+        ],
+        recentHistory: [
+          { eventId: '$q1', senderId: '@zack:matrix.netmind.chat', isAgent: false, text: 'Covent Garden 附近有什麼川菜？', timestampMs: 1_000 },
+          { eventId: '$a1', senderId: '@agent-b2b526f3:matrix.netmind.chat', isAgent: true, text: '🍜 Covent Garden 一帶...', timestampMs: 2_000 },
+        ],
+        activeSession: { active: true, lastAgentReplyAtMs: 2_000, expiresAtMs: 182_000 },
+      };
+
+      const meetingRoomDecision = await routeEvent(
+        makeTextEvent({ eventId: '$m2', text: '對了大家晚點要訂幾點的會議室？', timestampMs: 3_000 }),
+        ctx,
+        lcfSpec,
+        { nowMs: 3_000 },
+      );
+      expect(meetingRoomDecision.shouldReply).toBe(false);
+      expect(meetingRoomDecision.reason).toBe('active_session_chatter');
+
+      const hoursFollowUp = await routeEvent(
+        makeTextEvent({ eventId: '$h1', text: '他們幾點關門？', timestampMs: 4_000 }),
+        ctx,
+        lcfSpec,
+        { nowMs: 4_000 },
+      );
+      expect(hoursFollowUp.shouldReply).toBe(true);
+      expect(hoursFollowUp.reason).toBe('active_session');
+
+      const openUntilFollowUp = await routeEvent(
+        makeTextEvent({ eventId: '$h2', text: '開到幾點？', timestampMs: 4_500 }),
+        ctx,
+        lcfSpec,
+        { nowMs: 4_500 },
+      );
+      expect(openUntilFollowUp.shouldReply).toBe(true);
+      expect(openUntilFollowUp.reason).toBe('active_session');
+
+      const tubeFollowUp = await routeEvent(
+        makeTextEvent({ eventId: '$t1', text: '有沒有離地鐵站近一點的？', timestampMs: 5_000 }),
+        ctx,
+        lcfSpec,
+        { nowMs: 5_000 },
+      );
+      expect(tubeFollowUp.shouldReply).toBe(true);
+      expect(tubeFollowUp.reason).toBe('active_session');
+
+      const drawFollowUp = await routeEvent(
+        makeTextEvent({ eventId: '$d1', text: 'draw', timestampMs: 6_000 }),
+        ctx,
+        { ...lcfSpec, id: 'ai-tarot', matrixId: '@agent-852feddf:matrix.netmind.chat', name: 'AI Tarot' },
+        { nowMs: 6_000 },
+      );
+      expect(drawFollowUp.shouldReply).toBe(true);
+      expect(drawFollowUp.reason).toBe('active_session');
     });
   });
 });
