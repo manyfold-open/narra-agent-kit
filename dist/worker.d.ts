@@ -170,6 +170,7 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
     private isTurnRedacted;
     private removePendingTurn;
     private updatePendingTurn;
+    private clearUserSession;
     private buildRoomContextForTurn;
     alarm(): Promise<void>;
 }

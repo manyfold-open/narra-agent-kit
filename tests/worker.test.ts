@@ -1529,4 +1529,199 @@ describe('worker runtime layer (src/worker.ts)', () => {
 
     expect(seenChatTypes).toEqual(['dm']);
   });
+
+  it('9. BaseNarraRoomCoordinator does not resurrect yielded sessions, clears switched/chatter sessions, and guards unmentioned active_session', async () => {
+    let nowMs = 1_760_500_000_000;
+    const postedBodies: string[] = [];
+    const peerId = '@agent-bbbb2222:matrix.netmind.chat';
+    const roomId = '!grp_session_guard:matrix.netmind.chat';
+    const members = [
+      { matrixId: '@zack:matrix.netmind.chat', displayName: 'Zack', isAgent: false },
+      { matrixId: TEST_SPEC.matrixId!, displayName: 'Penny', isAgent: true },
+      { matrixId: peerId, displayName: 'Spotted London', isAgent: true },
+    ];
+
+    const sleepCalls: number[] = [];
+    const gateway = createNarraWorkerGateway({
+      spec: {
+        ...TEST_SPEC,
+        antiKeywords: ['快閃', '展覽', '黑客松'],
+        politeYieldDelayMs: 1_800,
+      },
+      now: () => nowMs,
+      sleep: async (ms: number) => {
+        sleepCalls.push(ms);
+        nowMs += ms;
+      },
+      fastRespond: async (_env, ev) => `Reply to: ${ev.text}`,
+      fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { text?: string };
+        postedBodies.push(body.text ?? '');
+        return Response.json({ status: 'ok', data: { event_id: `$bot_${postedBodies.length}` } });
+      }) as unknown as typeof fetch,
+    });
+
+    const env: NarraGatewayEnv = {
+      DB: createD1(),
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'off',
+      NARRA_AGENT_TOKEN: 'narra_tok_session_guard',
+    };
+    const { state, storage } = createFakeDOState();
+    const roomDo = new gateway.BaseNarraRoomCoordinator(state, env);
+
+    // 1) Initial domain reply opens active session for @zack
+    await roomDo.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId,
+          chatType: 'group',
+          members,
+          events: [
+            {
+              event_id: '$u_dom1',
+              sender: '@zack:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: { msgtype: 'm.text', body: '誰付了拉麵錢？' },
+            },
+          ],
+        }),
+      }),
+    );
+    nowMs += 2_000;
+    await roomDo.alarm();
+    expect(postedBodies).toHaveLength(1);
+    let sessions = (await storage.get<Record<string, { expiresAtMs: number }>>('sessions')) ?? {};
+    expect(sessions['@zack:matrix.netmind.chat']).toBeDefined();
+
+    // 2) Casual chatter ("今天天氣真不錯，晚上想早點休息") within 30s -> dropped as active_session_chatter AND clears DO session!
+    nowMs += 30_000;
+    await roomDo.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId,
+          chatType: 'group',
+          members,
+          events: [
+            {
+              event_id: '$u_chatter1',
+              sender: '@zack:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: { msgtype: 'm.text', body: '今天天氣真不錯，晚上想早點休息' },
+            },
+          ],
+        }),
+      }),
+    );
+    nowMs += 2_000;
+    await roomDo.alarm();
+    expect(postedBodies).toHaveLength(1);
+    sessions = (await storage.get<Record<string, { expiresAtMs: number }>>('sessions')) ?? {};
+    expect(sessions['@zack:matrix.netmind.chat']).toBeUndefined();
+
+    // 3) Re-open session via explicit @mention, then test ambiguous follow-up yieldDelay >= 2400ms & antiKeyword drop
+    nowMs += 10_000;
+    await roomDo.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId,
+          chatType: 'group',
+          members,
+          events: [
+            {
+              event_id: '$u_dom2',
+              sender: '@zack:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: { msgtype: 'm.text', body: '@Penny 記一下拉麵', 'm.mentions': { user_ids: [TEST_SPEC.matrixId!] } },
+            },
+          ],
+        }),
+      }),
+    );
+    nowMs += 2_000;
+    await roomDo.alarm();
+    expect(postedBodies).toHaveLength(2);
+
+    // Ambiguous non-domain follow-up ("那詳細金額呢") in multi-agent room yields >= 2400ms and clears session if peer replies
+    nowMs += 15_000;
+    sleepCalls.length = 0;
+    await roomDo.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId,
+          chatType: 'group',
+          members,
+          events: [
+            {
+              event_id: '$u_ambig',
+              sender: '@zack:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: { msgtype: 'm.text', body: '那詳細呢？' },
+            },
+            {
+              event_id: '$peer_beat_us',
+              sender: peerId,
+              type: 'm.room.message',
+              origin_server_ts: nowMs + 100,
+              content: { msgtype: 'm.text', body: 'Peer answered first' },
+            },
+          ],
+        }),
+      }),
+    );
+    nowMs += 2_000;
+    await roomDo.alarm();
+    expect(postedBodies).toHaveLength(2);
+    sessions = (await storage.get<Record<string, { expiresAtMs: number }>>('sessions')) ?? {};
+    expect(sessions['@zack:matrix.netmind.chat']).toBeUndefined();
+
+    // 4) Expired session is NOT resurrected when polite yield drops a domain turn
+    nowMs += 10_000;
+    await storage.put('sessions', {
+      '@zack:matrix.netmind.chat': {
+        lastAgentReplyAtMs: nowMs - 300_000,
+        lastUserTurnAtMs: nowMs - 300_000,
+        expiresAtMs: nowMs - 60_000,
+      },
+    });
+    await roomDo.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId,
+          chatType: 'group',
+          members,
+          events: [
+            {
+              event_id: '$u_dom3',
+              sender: '@zack:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: { msgtype: 'm.text', body: '誰付了分帳？' },
+            },
+            {
+              event_id: '$peer_dom3',
+              sender: peerId,
+              type: 'm.room.message',
+              origin_server_ts: nowMs + 200,
+              content: { msgtype: 'm.text', body: 'Already handled' },
+            },
+          ],
+        }),
+      }),
+    );
+    nowMs += 2_000;
+    await roomDo.alarm();
+    expect(postedBodies).toHaveLength(2);
+    const staleSess = (await storage.get<Record<string, { expiresAtMs: number }>>('sessions')) ?? {};
+    expect(staleSess['@zack:matrix.netmind.chat']).toBeUndefined();
+  });
 });

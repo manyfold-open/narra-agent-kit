@@ -51,6 +51,13 @@ export function buildPromptEnvelope(input) {
         `message_id: ${cleanInline(event.eventId)}`,
         `detected_lang: ${langDirective(decision.detectedLang)}`,
         `routing_tier: ${decision.tier} (${decision.reason})`,
+        ...(context.chatType === 'group' &&
+            decision.reason !== 'explicit_mention' &&
+            decision.reason !== 'reply_to_self'
+            ? [
+                'unmentioned_group_turn: true (The user did NOT @mention you. Reply ONLY if this directly asks for your domain or continues your active topic. If it is casual chatter, small talk, or another domain/agent, output ONLY [NO_REPLY] — never explain that it is outside your scope.)',
+            ]
+            : []),
         ...(event.isVoice ? ['voice_mode: true (keep reply concise and natural for speech; no markdown tables)'] : []),
         ...(humanMembers.length ? [`room_members: ${humanMembers.join(', ')}`] : []),
         ...(peerAgents.length ? [`peer_agents: ${peerAgents.join(', ')}`] : []),

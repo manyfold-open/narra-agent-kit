@@ -25,6 +25,15 @@ const CJK_RE = /[\u3400-\u9FFF\uF900-\uFAFF]/;
 const QUESTION_OR_INTENT_RE =
   /[?？]|嗎|吗|呢|哪裡|哪里|推薦|推荐|介紹|介绍|請問|请问|有什麼|有什么|有沒有|有没有|多少|怎麼|怎么|\b(?:what|where|when|which|how|who|why|any|best|recommend|find|check|code|deals?|split|owe|news)\b/i;
 
+const CASUAL_SMALL_TALK_RE =
+  /天氣|天气|下雨|下雪|晴天|陰天|阴天|好冷|好熱|好热|好累|累死了|好睏|好困|睡覺|睡觉|早點睡|早点睡|早點休息|早点休息|休息了?|先休息|先去忙|去忙一下|晚點聊|晚点聊|晚點見|晚点见|下次聊|下班|上班|出門|出门|到家|哈哈+|笑死|掰掰|拜拜|先這樣|先这样|沒事了|没事了|(?:好[喔哦啊呀]?[，,\s]*)?(?:謝謝|谢谢)(?:[!！。.~～\s]*$|[，,]?\s*(?:我先|先去|沒事|没事))|\b(?:nice\s+weather|good\s+weather|so\s+tired|going\s+to\s+(?:bed|sleep)|get\s+some\s+rest|heading\s+out|got\s+to\s+go|gtg|brb|ttyl|see\s+you|bye|good\s*night|good\s*morning|haha+|lol|lmao|thanks?\s*(?:a\s+lot)?|ty|never\s*mind|nvm)\b/i;
+
+const SHORT_CONFIRM_RE =
+  /^(?:抽|搖|摇|好|好的|好喔|好哦|對|对|對的|对的|對啊|对啊|繼續|继续|更多|下一[頁页]|是|不是|行|可以|要|再來|再来|yes|no|ok|okay|sure|more|next|another|draw|shake|go ahead)[!！。.~～?？\s]*$/i;
+
+const ACTIVE_FOLLOWUP_RE =
+  /(?:這[個間家張支條筆輪期]|这[个间家张支条笔轮期]|哪[一]?[個間家張支條筆]|第\s*[0-9一二三四五六七八九十]+|[那這][張支間家位筆][牌籤簽店]?|還有|还有|別[間家的個]|别[间家的个]|換一|换一|再[抽來找看查問问試试]|詳細|详细|細節|细节|解說|解说|解釋|解释|意思|含義|含义|地址|菜單|菜单|價格|价格|價錢|价钱|多少錢|多少钱|人均|幾點|几点|開門|开门|營業|营业|怎麼去|怎么去|坐什麼|坐什么|地鐵|地铁|附近|比較近|比较近|比較便宜|比较便宜|推薦|推荐|算一份|也算|改成|取消|截止|日期|時間|时间|來源|来源|連結|链接|網址|网址|網站|网站)|\b(?:which\s+one|that\s+one|those|this\s+one|another|more|next|details?|explain|meaning|interpret|address|menu|price|cost|hours?|opening|how\s+(?:do\s+(?:i|we)|to)\s+get|tube|station|walk|closer|cheaper|recommend|also|actually|make\s+that|what\s+about|how\s+about|why|when|where\s+is|deadline|source|link)\b/i;
+
 /** Extracts peer `@agent-*` members from a room roster, excluding self. */
 export function inspectRoomPeers(
   members: RoomMemberInfo[],
@@ -354,6 +363,18 @@ function matchKeyword(text: string, lowerText: string, kw: string | RegExp): boo
   return new RegExp(`(?<![a-z0-9])${escapeRegex(needle)}(?![a-z0-9])`, 'i').test(text);
 }
 
+function countKeywordMatches(
+  text: string,
+  lowerText: string,
+  keywords?: Array<string | RegExp>,
+): number {
+  let hits = 0;
+  for (const kw of keywords ?? []) {
+    if (matchKeyword(text, lowerText, kw)) hits++;
+  }
+  return hits;
+}
+
 const STOPWORDS = new Set([
   'the',
   'and',
@@ -387,15 +408,8 @@ export function heuristicDomainScore(
   if (!text) return 0;
   const lower = text.toLowerCase();
 
-  let antiHits = 0;
-  for (const anti of spec.antiKeywords ?? []) {
-    if (matchKeyword(text, lower, anti)) antiHits++;
-  }
-
-  let keywordHits = 0;
-  for (const kw of spec.domainKeywords ?? []) {
-    if (matchKeyword(text, lower, kw)) keywordHits++;
-  }
+  const antiHits = countKeywordMatches(text, lower, spec.antiKeywords);
+  const keywordHits = countKeywordMatches(text, lower, spec.domainKeywords);
 
   let descHits = 0;
   if ((spec.domainKeywords ?? []).length === 0 && spec.domainDescription) {
@@ -593,6 +607,69 @@ export async function routeEvent(
         ? context.activeSession.lastAgentReplyAtMs + (spec.sessionWindowMs ?? DEFAULT_SESSION_WINDOW_MS)
         : Infinity);
     if (expires >= nowMs) {
+      const strippedText = stripAgentMentions(event.text ?? '', mentionNames).trim();
+      const lowerText = strippedText.toLowerCase();
+      const hasAntiHit = countKeywordMatches(strippedText, lowerText, spec.antiKeywords) > 0;
+      const hasDomainHit = countKeywordMatches(strippedText, lowerText, spec.domainKeywords) > 0;
+
+      if (hasAntiHit && !hasDomainHit) {
+        return {
+          shouldReply: false,
+          tier: 0,
+          reason: 'active_session_off_topic',
+          confidence: 0.95,
+          detectedLang,
+          shouldQuote: false,
+        };
+      }
+
+      const isGenuineFollowUp =
+        SHORT_CONFIRM_RE.test(strippedText) || ACTIVE_FOLLOWUP_RE.test(strippedText);
+      const isCasualChatter = CASUAL_SMALL_TALK_RE.test(strippedText) && !isGenuineFollowUp;
+
+      if (!hasDomainHit && isCasualChatter) {
+        return {
+          shouldReply: false,
+          tier: 0,
+          reason: 'active_session_chatter',
+          confidence: 0.9,
+          detectedLang,
+          shouldQuote: false,
+        };
+      }
+
+      if (peers.length > 0 && !hasDomainHit) {
+        if (hasPeerRepliedAfter(event, context, spec.matrixId)) {
+          return {
+            shouldReply: false,
+            tier: 1,
+            reason: 'peer_already_replied',
+            confidence: 0.9,
+            detectedLang,
+            shouldQuote: false,
+          };
+        }
+        if (!isGenuineFollowUp) {
+          return {
+            shouldReply: false,
+            tier: 0,
+            reason: 'active_session_chatter',
+            confidence: 0.9,
+            detectedLang,
+            shouldQuote: false,
+          };
+        }
+        return {
+          shouldReply: true,
+          tier: 0,
+          reason: 'active_session',
+          confidence: 0.9,
+          detectedLang,
+          shouldQuote: quoteFlag,
+          yieldDelayMs: Math.max(2_400, (spec.politeYieldDelayMs ?? DEFAULT_YIELD_DELAY_MS) + 600),
+        };
+      }
+
       return {
         shouldReply: true,
         tier: 0,

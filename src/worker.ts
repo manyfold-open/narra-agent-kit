@@ -1629,6 +1629,18 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     });
   }
 
+  private async clearUserSession(senderId: string | undefined): Promise<void> {
+    if (!senderId) return;
+    await this.runLocked(async () => {
+      const sessions =
+        (await this.ctx.storage.get<Record<string, StoredSessionEntry>>('sessions')) ?? {};
+      if (Object.prototype.hasOwnProperty.call(sessions, senderId)) {
+        delete sessions[senderId];
+        await this.ctx.storage.put('sessions', sessions);
+      }
+    });
+  }
+
   private async buildRoomContextForTurn(
     turn: PendingTurn,
     effectiveSpec: AgentSpec,
@@ -1786,6 +1798,14 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           });
 
           if (!decision.shouldReply) {
+            if (
+              decision.reason === 'active_session_off_topic' ||
+              decision.reason === 'active_session_chatter' ||
+              decision.reason === 'aimed_elsewhere' ||
+              decision.reason === 'peer_already_replied'
+            ) {
+              await this.clearUserSession(nextTurn.event.senderId);
+            }
             await appendDoLog(
               this.ctx.storage,
               `dropped ${nextTurn.event.eventId}: ${decision.reason}`,
@@ -1794,24 +1814,6 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             );
             await this.removePendingTurn(nextTurn.event.eventId);
             continue;
-          }
-
-          // Slide active 3-min session on user follow-up inside group.
-          if (context.chatType === 'group' && nextTurn.event.senderId) {
-            await this.runLocked(async () => {
-              const sessions =
-                (await this.ctx.storage.get<Record<string, StoredSessionEntry>>('sessions')) ?? {};
-              const prev = sessions[nextTurn.event.senderId];
-              if (prev) {
-                const win = effectiveSpec.sessionWindowMs ?? DEFAULT_SESSION_WINDOW_MS;
-                sessions[nextTurn.event.senderId] = {
-                  ...prev,
-                  lastUserTurnAtMs: currentNowMs,
-                  expiresAtMs: currentNowMs + win,
-                };
-                await this.ctx.storage.put('sessions', sessions);
-              }
-            });
           }
 
           // Polite yield for unmentioned / multi-@ turns so peers don't pile on.
@@ -1830,6 +1832,9 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
               },
             });
             if (yieldOutcome.yield) {
+              if (decision.reason === 'active_session') {
+                await this.clearUserSession(nextTurn.event.senderId);
+              }
               await appendDoLog(
                 this.ctx.storage,
                 `yielded ${nextTurn.event.eventId}: ${yieldOutcome.reason}`,
@@ -1964,6 +1969,9 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           const { text: withoutNotes } = stripLeakedNotes(rawAnswer);
           const cleaned = withoutNotes ? sanitizeMobileLinks(withoutNotes) : '';
           if (!cleaned || isSilence(cleaned)) {
+            if (decision.reason === 'active_session') {
+              await this.clearUserSession(nextTurn.event.senderId);
+            }
             await appendDoLog(
               this.ctx.storage,
               `silent ${nextTurn.event.eventId} (${decision.reason})`,

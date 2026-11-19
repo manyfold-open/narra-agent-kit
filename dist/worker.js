@@ -1252,6 +1252,17 @@ export class BaseNarraRoomCoordinator {
             }
         });
     }
+    async clearUserSession(senderId) {
+        if (!senderId)
+            return;
+        await this.runLocked(async () => {
+            const sessions = (await this.ctx.storage.get('sessions')) ?? {};
+            if (Object.prototype.hasOwnProperty.call(sessions, senderId)) {
+                delete sessions[senderId];
+                await this.ctx.storage.put('sessions', sessions);
+            }
+        });
+    }
     async buildRoomContextForTurn(turn, effectiveSpec, memoryStore, nowMs) {
         const meta = (await this.ctx.storage.get('roomMeta')) ?? {
             roomId: turn.event.roomId,
@@ -1371,25 +1382,15 @@ export class BaseNarraRoomCoordinator {
                         chainCap: AGENT_CHAIN_CAP,
                     });
                     if (!decision.shouldReply) {
+                        if (decision.reason === 'active_session_off_topic' ||
+                            decision.reason === 'active_session_chatter' ||
+                            decision.reason === 'aimed_elsewhere' ||
+                            decision.reason === 'peer_already_replied') {
+                            await this.clearUserSession(nextTurn.event.senderId);
+                        }
                         await appendDoLog(this.ctx.storage, `dropped ${nextTurn.event.eventId}: ${decision.reason}`, currentNowMs, this.env);
                         await this.removePendingTurn(nextTurn.event.eventId);
                         continue;
-                    }
-                    // Slide active 3-min session on user follow-up inside group.
-                    if (context.chatType === 'group' && nextTurn.event.senderId) {
-                        await this.runLocked(async () => {
-                            const sessions = (await this.ctx.storage.get('sessions')) ?? {};
-                            const prev = sessions[nextTurn.event.senderId];
-                            if (prev) {
-                                const win = effectiveSpec.sessionWindowMs ?? DEFAULT_SESSION_WINDOW_MS;
-                                sessions[nextTurn.event.senderId] = {
-                                    ...prev,
-                                    lastUserTurnAtMs: currentNowMs,
-                                    expiresAtMs: currentNowMs + win,
-                                };
-                                await this.ctx.storage.put('sessions', sessions);
-                            }
-                        });
                     }
                     // Polite yield for unmentioned / multi-@ turns so peers don't pile on.
                     if (decision.yieldDelayMs && decision.yieldDelayMs > 0) {
@@ -1402,6 +1403,9 @@ export class BaseNarraRoomCoordinator {
                             },
                         });
                         if (yieldOutcome.yield) {
+                            if (decision.reason === 'active_session') {
+                                await this.clearUserSession(nextTurn.event.senderId);
+                            }
                             await appendDoLog(this.ctx.storage, `yielded ${nextTurn.event.eventId}: ${yieldOutcome.reason}`, this.nowMs(), this.env);
                             await this.removePendingTurn(nextTurn.event.eventId);
                             continue;
@@ -1516,6 +1520,9 @@ export class BaseNarraRoomCoordinator {
                     const { text: withoutNotes } = stripLeakedNotes(rawAnswer);
                     const cleaned = withoutNotes ? sanitizeMobileLinks(withoutNotes) : '';
                     if (!cleaned || isSilence(cleaned)) {
+                        if (decision.reason === 'active_session') {
+                            await this.clearUserSession(nextTurn.event.senderId);
+                        }
                         await appendDoLog(this.ctx.storage, `silent ${nextTurn.event.eventId} (${decision.reason})`, this.nowMs(), this.env);
                         await this.removePendingTurn(nextTurn.event.eventId);
                         continue;

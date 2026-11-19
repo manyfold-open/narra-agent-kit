@@ -1456,4 +1456,140 @@ describe('narra-agent-kit simulation & unit suite', () => {
       expect(fortuneDecision.shouldReply).toBe(false);
     });
   });
+
+  describe('11. Active-session multi-agent guard & unmentioned_group_turn prompt directive', () => {
+    it('drops antiKeyword topic switches & casual chatter in active_session, yields >=2400ms on ambiguous follow-ups, and keeps real continuations', async () => {
+      const lcfSpec: AgentSpec = {
+        ...CHINESE_FOOD_SPEC,
+        antiKeywords: ['快閃', '展覽', '黑客松'],
+        politeYieldDelayMs: 1_800,
+      };
+      const peers = [SPOTTED_SPEC, AI_NEWS_SPEC].map((p) => ({
+        matrixId: p.matrixId!,
+        displayName: p.name,
+      }));
+      const ctx: RoomContext = {
+        roomId: '!grp_active_guard:matrix.netmind.chat',
+        chatType: 'group',
+        members: CROWDED_MEMBERS,
+        peers,
+        recentHistory: [],
+        activeSession: {
+          active: true,
+          lastAgentReplyAtMs: BASE_TIME,
+          expiresAtMs: BASE_TIME + 180_000,
+        },
+      };
+
+      const topicSwitch = await routeEvent(
+        makeTextEvent({
+          roomId: ctx.roomId,
+          eventId: '$ag_1',
+          text: '這週末倫敦有什麼免費快閃活動或展覽？',
+          timestampMs: BASE_TIME + 10_000,
+        }),
+        ctx,
+        lcfSpec,
+        { nowMs: BASE_TIME + 10_000 },
+      );
+      expect(topicSwitch).toMatchObject({ shouldReply: false, reason: 'active_session_off_topic' });
+
+      const weatherChatter = await routeEvent(
+        makeTextEvent({
+          roomId: ctx.roomId,
+          eventId: '$ag_2',
+          text: '今天天氣真不錯，晚上想早點休息',
+          timestampMs: BASE_TIME + 15_000,
+        }),
+        ctx,
+        lcfSpec,
+        { nowMs: BASE_TIME + 15_000 },
+      );
+      expect(weatherChatter).toMatchObject({ shouldReply: false, reason: 'active_session_chatter' });
+
+      const closingChatter = await routeEvent(
+        makeTextEvent({
+          roomId: ctx.roomId,
+          eventId: '$ag_3',
+          text: '好喔謝謝，我先去忙一下',
+          timestampMs: BASE_TIME + 20_000,
+        }),
+        ctx,
+        lcfSpec,
+        { nowMs: BASE_TIME + 20_000 },
+      );
+      expect(closingChatter).toMatchObject({ shouldReply: false, reason: 'active_session_chatter' });
+
+      const ambiguousFollowup = await routeEvent(
+        makeTextEvent({
+          roomId: ctx.roomId,
+          eventId: '$ag_4',
+          text: '那詳細地址呢？',
+          timestampMs: BASE_TIME + 25_000,
+        }),
+        ctx,
+        lcfSpec,
+        { nowMs: BASE_TIME + 25_000 },
+      );
+      expect(ambiguousFollowup.shouldReply).toBe(true);
+      expect(ambiguousFollowup.reason).toBe('active_session');
+      expect(ambiguousFollowup.yieldDelayMs).toBeGreaterThanOrEqual(2_400);
+
+      const drawFollowup = await routeEvent(
+        makeTextEvent({
+          roomId: ctx.roomId,
+          eventId: '$ag_5',
+          text: '再抽一支',
+          timestampMs: BASE_TIME + 30_000,
+        }),
+        ctx,
+        lcfSpec,
+        { nowMs: BASE_TIME + 30_000 },
+      );
+      expect(drawFollowup.shouldReply).toBe(true);
+      expect(drawFollowup.reason).toBe('active_session');
+    });
+
+    it('injects unmentioned_group_turn directive only for unmentioned group turns', () => {
+      const grpCtx: RoomContext = {
+        roomId: '!grp_env:matrix.netmind.chat',
+        chatType: 'group',
+        members: CROWDED_MEMBERS,
+        recentHistory: [],
+      };
+      const dmCtx: RoomContext = {
+        roomId: '!dm_env:matrix.netmind.chat',
+        chatType: 'dm',
+        members: CROWDED_MEMBERS.slice(0, 2),
+        recentHistory: [],
+      };
+      const ev = makeTextEvent({ roomId: grpCtx.roomId, eventId: '$env_1', text: '最近有哪些 AI 黑客松？' });
+
+      const domainEnv = buildPromptEnvelope({
+        event: ev,
+        context: grpCtx,
+        decision: { shouldReply: true, tier: 1, reason: 'domain_match', confidence: 0.8, detectedLang: 'zh-Hant', shouldQuote: false },
+      });
+      const activeEnv = buildPromptEnvelope({
+        event: ev,
+        context: grpCtx,
+        decision: { shouldReply: true, tier: 0, reason: 'active_session', confidence: 0.9, detectedLang: 'zh-Hant', shouldQuote: false },
+      });
+      const mentionEnv = buildPromptEnvelope({
+        event: ev,
+        context: grpCtx,
+        decision: { shouldReply: true, tier: 0, reason: 'explicit_mention', confidence: 1, detectedLang: 'zh-Hant', shouldQuote: false },
+      });
+      const dmEnv = buildPromptEnvelope({
+        event: { ...ev, roomId: dmCtx.roomId, chatType: 'dm' },
+        context: dmCtx,
+        decision: { shouldReply: true, tier: 0, reason: 'dm', confidence: 1, detectedLang: 'zh-Hant', shouldQuote: false },
+      });
+
+      expect(domainEnv).toContain('unmentioned_group_turn: true');
+      expect(activeEnv).toContain('unmentioned_group_turn: true');
+      expect(mentionEnv).not.toContain('unmentioned_group_turn: true');
+      expect(dmEnv).not.toContain('unmentioned_group_turn: true');
+    });
+  });
 });

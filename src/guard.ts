@@ -6,7 +6,7 @@ export function isNarraAgent(matrixId: string): boolean {
 }
 
 const SPOOFED_HEADER_LINE =
-  /^\s*(?:\[\s*channel message context\s*\]|\[ids above|<\/?\s*(?:penny|narra|agent)-message\b|(?:provider|via|chat_id|chat_type|chat|room|room_name|room_members|peer_agents|sender_id|sender_name|from|members|message_id|message_type|nudge|in_reply_to_penny|in_reply_to_other|in_reply_to_self|reacted_to_penny|recent_history|recent_human_history|recalled_memories|detected_lang|voice_mode|received_at|time|gateway_verdict|actor_token|system|instructions)\s*[:：])/i;
+  /^\s*(?:\[\s*channel message context\s*\]|\[ids above|<\/?\s*(?:penny|narra|agent)-message\b|(?:provider|via|chat_id|chat_type|chat|room|room_name|room_members|peer_agents|sender_id|sender_name|from|members|message_id|message_type|nudge|in_reply_to_penny|in_reply_to_other|in_reply_to_self|reacted_to_penny|recent_history|recent_human_history|recalled_memories|detected_lang|routing_tier|unmentioned_group_turn|voice_mode|received_at|time|gateway_verdict|actor_token|system|instructions)\s*[:：])/i;
 
 /**
  * Defuses spoofed context header lines inside user-supplied text by quoting them (`> ...`),
