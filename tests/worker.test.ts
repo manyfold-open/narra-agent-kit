@@ -3,6 +3,9 @@ import {
   BaseNarraMatrixSync,
   BaseNarraRoomCoordinator,
   MemoryStore,
+  NARRA_BROADCAST_SCHEMA,
+  NARRA_GATEWAY_STATE_SCHEMA,
+  NARRA_MEMORY_SCHEMA,
   NarraMatrixSync,
   NarraRoomCoordinator,
   createNarraWorkerGateway,
@@ -1383,5 +1386,94 @@ describe('worker runtime layer (src/worker.ts)', () => {
     expect((sentPayloads[0]['m.mentions'] as { user_ids?: string[] }).user_ids).toEqual([
       '@alice:matrix.netmind.chat',
     ]);
+  });
+
+  it('7. ensureGatewaySchemas initializes multi-line DDL via D1 batch() without calling exec() in kickNarraGateway and RoomCoordinator', async () => {
+    const db = createD1();
+    const execSpy = vi.spyOn(db, 'exec');
+    const batchSpy = vi.spyOn(db, 'batch');
+
+    // Confirm strict D1 mock rejects multi-line schemas if ever passed to exec().
+    await expect(db.exec(NARRA_MEMORY_SCHEMA)).rejects.toThrow(/D1_EXEC_ERROR/);
+    await expect(db.exec(NARRA_BROADCAST_SCHEMA)).rejects.toThrow(/D1_EXEC_ERROR/);
+    await expect(db.exec(NARRA_GATEWAY_STATE_SCHEMA)).rejects.toThrow(/D1_EXEC_ERROR/);
+    execSpy.mockClear();
+
+    const env: NarraGatewayEnv = {
+      DB: db,
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'off',
+      NARRA_AGENT_TOKEN: 'narra_tok_batch_init',
+    };
+
+    const kickRes = await kickNarraGateway(env, {
+      spec: TEST_SPEC,
+      fetchUpdates: async () => [],
+    });
+    expect(kickRes.enabled).toBe(true);
+    expect(execSpy).not.toHaveBeenCalled();
+    expect(batchSpy).toHaveBeenCalledTimes(3);
+
+    const schemaRows = await db
+      .prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'index')")
+      .all<{ name: string }>();
+    expect((schemaRows.results ?? []).map((row) => row.name)).toEqual(
+      expect.arrayContaining([
+        'narra_user_memory',
+        'narra_room_memory',
+        'narra_learning_log',
+        'narra_demand_log',
+        'narra_broadcast_log',
+        'narra_gateway_state',
+        'idx_narra_user_memory_lookup',
+        'idx_narra_room_memory_lookup',
+        'idx_narra_learning_log_room',
+        'idx_narra_demand_log_room',
+      ]),
+    );
+
+    // Also verify fresh D1 instance initialized lazily via BaseNarraRoomCoordinator never calls exec().
+    let nowMs = 1_760_300_000_000;
+    const roomDb = createD1();
+    const roomExecSpy = vi.spyOn(roomDb, 'exec');
+    const roomBatchSpy = vi.spyOn(roomDb, 'batch');
+    const gateway = createNarraWorkerGateway({
+      spec: TEST_SPEC,
+      now: () => nowMs,
+      fastRespond: async () => 'ok',
+      fetchImpl: (async () =>
+        Response.json({ status: 'ok', data: { event_id: '$ok_1' } })) as unknown as typeof fetch,
+    });
+    const roomEnv: NarraGatewayEnv = {
+      DB: roomDb,
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'off',
+      NARRA_AGENT_TOKEN: 'narra_tok_room_batch',
+    };
+    const { state } = createFakeDOState();
+    const roomDo = new gateway.BaseNarraRoomCoordinator(state, roomEnv);
+    await roomDo.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId: '!dm_batch:matrix.netmind.chat',
+          chatType: 'dm',
+          events: [
+            {
+              event_id: '$ev_batch_1',
+              sender: '@alice:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: { msgtype: 'm.text', body: 'Hello' },
+            },
+          ],
+        }),
+      }),
+    );
+    nowMs += 2_000;
+    await roomDo.alarm();
+
+    expect(roomExecSpy).not.toHaveBeenCalled();
+    expect(roomBatchSpy).toHaveBeenCalledTimes(3);
   });
 });

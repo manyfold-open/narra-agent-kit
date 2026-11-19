@@ -5,6 +5,7 @@ import {
   ProactiveBroadcastScheduler,
   type BroadcastScheduleResult,
 } from './broadcast.js';
+import { runSchemaStatements } from './d1.js';
 import { BurstCoalescer, type PendingBurstBuffer } from './debounce.js';
 import {
   isNarraAgent,
@@ -14,7 +15,7 @@ import {
   stripLeakedNotes,
 } from './guard.js';
 import { detectLang } from './lang.js';
-import { MemoryStore, NARRA_MEMORY_SCHEMA, type RecallTurnResult } from './memory.js';
+import { MemoryStore, type RecallTurnResult } from './memory.js';
 import { editContent, messageContent, plainMentions } from './mentions.js';
 import { shouldQuote } from './quote.js';
 import {
@@ -239,7 +240,7 @@ async function ensureGatewaySchemas(db: D1Database): Promise<void> {
       await mem.ensureSchema();
       const bcast = new D1BroadcastStore(db);
       await bcast.ensureSchema();
-      await db.exec(NARRA_GATEWAY_STATE_SCHEMA);
+      await runSchemaStatements(db, NARRA_GATEWAY_STATE_SCHEMA);
     })().catch((err) => {
       schemaInitCache.delete(db);
       throw err;

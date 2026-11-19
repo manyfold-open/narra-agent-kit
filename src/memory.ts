@@ -1,3 +1,4 @@
+import { runSchemaStatements } from './d1.js';
 import type { ChatType, LangCode, MemoryEntry, MemoryKind } from './types.js';
 
 export const NARRA_MEMORY_SCHEMA = `
@@ -267,7 +268,7 @@ export class MemoryStore {
   }
 
   async ensureSchema(): Promise<void> {
-    await this.db.exec(NARRA_MEMORY_SCHEMA);
+    await runSchemaStatements(this.db, NARRA_MEMORY_SCHEMA);
   }
 
   private clampThreshold(value: number): number {
