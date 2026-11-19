@@ -1,4 +1,29 @@
 export const DEFAULT_COALESCE_WINDOW_MS = 1_800;
+function burstTargetSignature(event) {
+    if (event.mentions.length > 0) {
+        return [...new Set(event.mentions)].sort().join(',');
+    }
+    const tokens = [
+        ...(event.text ?? '').matchAll(/(?:^|\s)@(AI\s+(?:Fortune\s+Stick|Tarot|in\s+5)|Spotted\s+London|London\s+Chinese\s+Food|Manyfold\s+Data|[\p{L}\p{N}._=\-/+]+)/giu),
+    ].map((m) => `text:${m[1].replace(/\s+/g, ' ').trim().toLowerCase()}`);
+    return tokens.length > 0 ? [...new Set(tokens)].sort().join(',') : null;
+}
+function shouldSplitBurst(existing, incoming) {
+    if (existing.length === 0)
+        return false;
+    const prevReplyTo = existing.find((f) => f.replyToEventId)?.replyToEventId;
+    if (prevReplyTo && incoming.replyToEventId && incoming.replyToEventId !== prevReplyTo) {
+        return true;
+    }
+    const nextSig = burstTargetSignature(incoming);
+    if (nextSig === null) {
+        // Follow-up fragment without a new @mention continues coalescing with the prior turn.
+        return false;
+    }
+    const prevMentions = [...new Set(existing.flatMap((f) => f.mentions))].sort();
+    const prevSig = prevMentions.length > 0 ? prevMentions.join(',') : burstTargetSignature(existing[0]);
+    return nextSig !== prevSig;
+}
 /** Merge a list of fragments from the same (roomId, senderId) into a single logical InboundEvent. */
 export function mergeBurstFragments(fragments) {
     if (fragments.length === 1) {
@@ -87,6 +112,13 @@ export class BurstCoalescer {
         const nowMs = this.now();
         const key = this.bufferKey(event.roomId, event.senderId);
         let buf = this.buffers.get(key);
+        let flushedPrior;
+        if (buf && shouldSplitBurst(buf.fragments, event)) {
+            const prior = await this.flushKey(key);
+            if (prior)
+                flushedPrior = prior;
+            buf = undefined;
+        }
         if (!buf) {
             buf = {
                 key,
@@ -116,6 +148,7 @@ export class BurstCoalescer {
             key,
             flushAtMs: buf.flushAtMs,
             fragmentCount: buf.fragments.length,
+            ...(flushedPrior ? { flushedPrior } : {}),
         };
     }
     /** Cancels a buffered fragment (or entire queued turn if it was the only fragment) when redacted. */

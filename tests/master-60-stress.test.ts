@@ -3592,5 +3592,65 @@ describe('Master 60-Case Stress & Concurrency Suite', () => {
       expect(sim.sent).toHaveLength(20);
       expect(isNarraAgent(PENNY_SPEC.matrixId!)).toBe(true);
     });
+
+    it('CONC-21: sub-1s (500ms) same-sender rapid messages targeting distinct @agents split cleanly without mutual antiKeyword drop', async () => {
+      const nowRef = { ms: BASE_TIME };
+      const db = createD1();
+      const roomId = '!conc21:matrix.netmind.chat';
+      const sim = setup8AgentRoom(roomId, db, nowRef);
+
+      await sim.broadcast([
+        makeRawTextEvent('$sub1_a', HUMANS.alice.matrixId, '@AI Fortune Stick 看第18籤', nowRef.ms, {
+          'm.mentions': { user_ids: [FORTUNE_SPEC.matrixId!] },
+        }),
+      ]);
+      nowRef.ms += 500;
+      await sim.broadcast([
+        makeRawTextEvent('$sub1_b', HUMANS.alice.matrixId, '@AI Tarot 每日一牌', nowRef.ms, {
+          'm.mentions': { user_ids: [TAROT_SPEC.matrixId!] },
+        }),
+      ]);
+
+      // Drain alarm fired immediately for flushedPrior ($sub1_a) first, then advance past 1.8s burst window for $sub1_b
+      await sim.flushAll();
+      nowRef.ms += 2_000;
+      await sim.flushAll();
+
+      expect(sim.sent).toHaveLength(2);
+      const fortuneReply = sim.sent.find((s) => s.agentId === 'fortune-stick');
+      const tarotReply = sim.sent.find((s) => s.agentId === 'tarot-master-2');
+      expect(fortuneReply).toBeDefined();
+      expect(tarotReply).toBeDefined();
+      // $sub1_b arrived after $sub1_a, so Fortune Stick smart-quotes $sub1_a while Tarot is latest/unquoted
+      expect(
+        (fortuneReply?.content['m.relates_to'] as { 'm.in_reply_to'?: { event_id?: string } } | undefined)?.[
+          'm.in_reply_to'
+        ]?.event_id,
+      ).toBe('$sub1_a');
+      expect(tarotReply?.content['m.relates_to']).toBeUndefined();
+    });
+
+    it('CONC-22: same-sender "@AI Fortune Stick" followed 500ms later by unmentioned "看第18籤" still coalesces cleanly', async () => {
+      const nowRef = { ms: BASE_TIME };
+      const db = createD1();
+      const roomId = '!conc22:matrix.netmind.chat';
+      const sim = setup8AgentRoom(roomId, db, nowRef);
+
+      await sim.broadcast([
+        makeRawTextEvent('$coal_a', HUMANS.alice.matrixId, '@AI Fortune Stick', nowRef.ms, {
+          'm.mentions': { user_ids: [FORTUNE_SPEC.matrixId!] },
+        }),
+      ]);
+      nowRef.ms += 500;
+      await sim.broadcast([
+        makeRawTextEvent('$coal_b', HUMANS.alice.matrixId, '看第18籤', nowRef.ms),
+      ]);
+      nowRef.ms += 2_000;
+      await sim.flushAll();
+
+      expect(sim.sent).toHaveLength(1);
+      expect(sim.sent[0].agentId).toBe('fortune-stick');
+      expect(sim.byId.get('fortune-stick')?.fastCalls[0]?.event.text).toBe('@AI Fortune Stick\n看第18籤');
+    });
   });
 });

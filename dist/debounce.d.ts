@@ -27,6 +27,7 @@ export type CoalescePushResult = {
     key: string;
     flushAtMs: number;
     fragmentCount: number;
+    flushedPrior?: InboundEvent;
 } | {
     status: 'flushed';
     key: string;

@@ -1550,12 +1550,17 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           }
 
           const pushed = await coalescer.push(ev);
-          if (pushed.status === 'flushed' || pushed.status === 'bypass') {
-            const target = pushed.event;
-            const alreadyQueued = pendingTurns.some((t) => t.event.eventId === target.eventId);
+          const readyTarget =
+            pushed.status === 'flushed' || pushed.status === 'bypass'
+              ? pushed.event
+              : pushed.status === 'buffered'
+                ? pushed.flushedPrior
+                : undefined;
+          if (readyTarget) {
+            const alreadyQueued = pendingTurns.some((t) => t.event.eventId === readyTarget.eventId);
             if (!alreadyQueued && pendingTurns.length < MAX_QUEUE_SIZE) {
               pendingTurns.push({
-                event: target,
+                event: readyTarget,
                 attempts: 0,
                 enqueuedAtMs: nowMs,
                 dueAtMs: nowMs,
