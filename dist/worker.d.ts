@@ -20,6 +20,8 @@ export interface NarraGatewayEnv {
     NARRA_AUTHORIZE_EVENTS?: string;
     ENVIRONMENT?: string;
     AI?: unknown;
+    AI_TRIAGE_MODEL?: string;
+    NARRA_AI_TRIAGE?: string;
 }
 export interface NarraA2ACredentialResult {
     url: string;

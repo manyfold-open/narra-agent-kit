@@ -5,6 +5,7 @@ import {
   AgentChainTracker,
   BurstCoalescer,
   D1BroadcastStore,
+  DEFAULT_UNMENTIONED_COOLDOWN_MS,
   MemoryKVStore,
   MemoryRejectionError,
   MemoryStore,
@@ -15,6 +16,8 @@ import {
   SyncError,
   authorizeEvent,
   buildPromptEnvelope,
+  computeStaggeredYieldDelayMs,
+  createWorkersAiTriageModel,
   defuse,
   detectExplicitLangSwitch,
   detectLang,
@@ -24,9 +27,11 @@ import {
   fetchMatrixCredential,
   fetchRoomMessagesBackstop,
   hasOnlyTrailingAgentMessages,
+  heuristicDomainScore,
   inspectRoomPeers,
   isChainExhaustedError,
   isNarraAgent,
+  isPastAnecdoteOrStatement,
   isSilence,
   messageContent,
   parseMatrixEvent,
@@ -1601,6 +1606,200 @@ describe('narra-agent-kit simulation & unit suite', () => {
       expect(detectExplicitLangSwitch('用英文')).toBe('en');
       expect(detectExplicitLangSwitch('speak English')).toBe('en');
       expect(detectExplicitLangSwitch('每日一牌')).toBeNull();
+    });
+  });
+
+  describe('12. Unmentioned group autonomy ("讀空氣"): anecdote suppression, staggered yield, cooldown & Workers AI triage', () => {
+    const groupCtx = (overrides: Partial<RoomContext> = {}): RoomContext => ({
+      roomId: '!netmind_london:matrix.netmind.chat',
+      roomName: 'Netmind London',
+      chatType: 'group',
+      members: CROWDED_MEMBERS,
+      peers: inspectRoomPeers(CROWDED_MEMBERS, undefined),
+      recentHistory: [],
+      ...overrides,
+    });
+
+    it('suppresses past-tense anecdotes and stress statements while preserving genuine questions', () => {
+      const anecdotes = [
+        '昨晚去中國城吃川菜吃到撐死哈哈',
+        '我朋友上週參加 AI 黑客松拿了冠軍超強',
+        '上次去 Shoreditch 那個快閃展覽排隊排一小時',
+        '明天要跟投資人談融資好緊張',
+        '昨天去算塔羅抽到愚人牌覺得超神奇',
+        'Yesterday I went to Chinatown and ate Sichuan food',
+      ];
+      for (const sample of anecdotes) {
+        expect(isPastAnecdoteOrStatement(sample)).toBe(true);
+      }
+
+      const genuineQuestions = [
+        '昨晚去中國城吃川菜，今晚有推薦別間嗎？',
+        'Where can I eat Sichuan food in Chinatown tonight?',
+        '好餓喔，等下在 Soho 附近有沒有推薦吃的？',
+      ];
+      for (const q of genuineQuestions) {
+        expect(isPastAnecdoteOrStatement(q)).toBe(false);
+      }
+
+      const lcfScore = heuristicDomainScore(
+        makeTextEvent({ eventId: '$anec_1', text: '昨晚去中國城吃川菜吃到撐死哈哈' }),
+        { ...CHINESE_FOOD_SPEC, domainKeywords: ['中國城', '川菜'] },
+        groupCtx(),
+      );
+      expect(lcfScore).toBeLessThan(0.55);
+    });
+
+    it('computes strictly shorter staggered yield delays for higher confidence tiers while keeping multi-@ exact', async () => {
+      const high = computeStaggeredYieldDelayMs(1_800, 0.92, 'agent-a', '$ev1');
+      const med = computeStaggeredYieldDelayMs(1_800, 0.80, 'agent-a', '$ev1');
+      const low = computeStaggeredYieldDelayMs(1_800, 0.68, 'agent-a', '$ev1');
+      const border = computeStaggeredYieldDelayMs(1_800, 0.56, 'agent-a', '$ev1');
+
+      expect(high).toBeLessThan(med);
+      expect(med).toBeLessThan(low);
+      expect(low).toBeLessThan(border);
+      expect(computeStaggeredYieldDelayMs(0, 0.95, 'agent-a', '$ev1')).toBe(0);
+
+      const multiEvent = makeTextEvent({
+        text: '@ChineseFood @SpottedLondon recommend Sichuan food',
+        mentions: [CHINESE_FOOD_SPEC.matrixId!, SPOTTED_SPEC.matrixId!],
+      });
+      const multiDecision = await routeEvent(
+        multiEvent,
+        groupCtx({ peers: inspectRoomPeers(CROWDED_MEMBERS, CHINESE_FOOD_SPEC.matrixId) }),
+        CHINESE_FOOD_SPEC,
+        { nowMs: BASE_TIME },
+      );
+      expect(multiDecision.reason).toBe('multi_mention_domain_match');
+      expect(multiDecision.yieldDelayMs).toBe(1_200);
+    });
+
+    it('applies soft unmentioned cooldown for borderline hits while allowing high-confidence & @mention turns', async () => {
+      const ctxInCooldown = groupCtx({
+        lastUnmentionedReplyAtMs: BASE_TIME - Math.floor(DEFAULT_UNMENTIONED_COOLDOWN_MS / 2),
+      });
+
+      const borderline = await routeEvent(
+        makeTextEvent({ eventId: '$cd_1', text: 'I want dim sum today' }),
+        ctxInCooldown,
+        CHINESE_FOOD_SPEC,
+        {
+          nowMs: BASE_TIME,
+          triageModel: { score: async () => ({ score: 0.62, reason: 'borderline' }) },
+        },
+      );
+      expect(borderline.shouldReply).toBe(false);
+      expect(borderline.reason).toBe('unmentioned_cooldown');
+
+      const highConf = await routeEvent(
+        makeTextEvent({ eventId: '$cd_2', text: 'Recommend Sichuan dim sum near Soho?' }),
+        ctxInCooldown,
+        CHINESE_FOOD_SPEC,
+        {
+          nowMs: BASE_TIME,
+          triageModel: { score: async () => ({ score: 0.90, reason: 'high_conf' }) },
+        },
+      );
+      expect(highConf.shouldReply).toBe(true);
+
+      const explicitMention = await routeEvent(
+        makeTextEvent({
+          eventId: '$cd_3',
+          text: '@ChineseFood dim sum',
+          mentions: [CHINESE_FOOD_SPEC.matrixId!],
+        }),
+        ctxInCooldown,
+        CHINESE_FOOD_SPEC,
+        { nowMs: BASE_TIME },
+      );
+      expect(explicitMention.shouldReply).toBe(true);
+      expect(explicitMention.reason).toBe('explicit_mention');
+    });
+
+    it('createWorkersAiTriageModel pre-filters noise/anecdotes at 0ms, classifies implicit needs, and fails safe on errors', async () => {
+      const runMock = vi.fn(async (_model: string, input: { messages: Array<{ content: string }> }) => {
+        const prompt = input.messages.map((m) => m.content).join('\n');
+        if (prompt.includes('好餓')) {
+          return { response: '{"score":0.86,"reason":"implicit_food_need"}' };
+        }
+        if (prompt.includes('so expensive lately')) {
+          return { response: '{"score":0.12,"reason":"casual_vent"}' };
+        }
+        throw new Error('upstream_ai_error');
+      });
+
+      const model = createWorkersAiTriageModel({ run: runMock });
+      const lcfSpec: AgentSpec = {
+        ...CHINESE_FOOD_SPEC,
+        matrixId: '@agent-b2b526f3:matrix.netmind.chat',
+        domainDescription: 'London Chinese restaurants, dishes, dim sum, hotpot, bubble tea.',
+        domainKeywords: ['中國城', '川菜', 'dim sum'],
+        antiKeywords: ['塔羅', '黑客松'],
+      };
+      const ctx = groupCtx({
+        peers: [
+          { matrixId: '@agent-852feddf:matrix.netmind.chat', displayName: 'AI Tarot' },
+          { matrixId: '@agent-f9388b28:matrix.netmind.chat', displayName: 'Spotted London' },
+        ],
+        recentHistory: [
+          {
+            eventId: '$h1',
+            senderId: '@alice:matrix.netmind.chat',
+            senderName: 'Alice',
+            isAgent: false,
+            text: '我快下課了',
+            timestampMs: BASE_TIME - 5_000,
+          },
+        ],
+      });
+
+      // 0ms pre-filter cases: must NOT invoke Workers AI
+      expect(await model.score({ event: makeTextEvent({ text: 'ok' }), context: ctx, spec: lcfSpec, detectedLang: 'en' }))
+        .toMatchObject({ reason: 'triage_too_short' });
+      expect(await model.score({ event: makeTextEvent({ text: '昨晚去中國城吃川菜吃到撐死哈哈' }), context: ctx, spec: lcfSpec, detectedLang: 'zh-Hant' }))
+        .toMatchObject({ reason: 'triage_past_anecdote' });
+      expect(await model.score({ event: makeTextEvent({ text: '今天天氣真不錯哈哈' }), context: ctx, spec: lcfSpec, detectedLang: 'zh-Hant' }))
+        .toMatchObject({ reason: 'triage_casual_chatter' });
+      expect(await model.score({ event: makeTextEvent({ text: '幫忙抽塔羅牌' }), context: ctx, spec: lcfSpec, detectedLang: 'zh-Hant' }))
+        .toMatchObject({ reason: 'triage_other_domain' });
+      expect(await model.score({ event: makeTextEvent({ text: '晚點七點地鐵站見喔' }), context: ctx, spec: lcfSpec, detectedLang: 'zh-Hant' }))
+        .toMatchObject({ reason: 'triage_no_need_cue' });
+      expect(await model.score({ event: makeTextEvent({ text: '請問中國城有推薦的川菜嗎？' }), context: ctx, spec: lcfSpec, detectedLang: 'zh-Hant' }))
+        .toMatchObject({ reason: 'domain_match' });
+      expect(runMock).toHaveBeenCalledTimes(0);
+
+      // Implicit craving -> invokes Workers AI with peer roles + recent history -> accepts
+      const implicitRes = await model.score({
+        event: makeTextEvent({ text: '好餓喔，等下在 Soho 附近有沒有推薦吃的？' }),
+        context: ctx,
+        spec: lcfSpec,
+        detectedLang: 'zh-Hant',
+      });
+      expect(implicitRes).toEqual({ score: 0.86, reason: 'implicit_food_need' });
+      expect(runMock).toHaveBeenCalledTimes(1);
+      const sentPayload = JSON.stringify(runMock.mock.calls[0]);
+      expect(sentPayload).toContain('AI Tarot');
+      expect(sentPayload).toContain('我快下課了');
+
+      // Subtle non-request statement -> Workers AI rejects
+      const ventRes = await model.score({
+        event: makeTextEvent({ text: 'Why are places in Soho so expensive lately' }),
+        context: ctx,
+        spec: lcfSpec,
+        detectedLang: 'en',
+      });
+      expect(ventRes).toEqual({ score: 0.12, reason: 'casual_vent' });
+
+      // Error fallback -> returns heuristic safely without throwing
+      const fallbackRes = await model.score({
+        event: makeTextEvent({ text: 'What dim sum places exist near Soho?' }),
+        context: ctx,
+        spec: lcfSpec,
+        detectedLang: 'en',
+      });
+      expect(fallbackRes.reason).toBe('heuristic_fallback');
+      expect(fallbackRes.score).toBeGreaterThan(0.55);
     });
   });
 });

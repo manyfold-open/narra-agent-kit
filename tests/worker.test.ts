@@ -1962,4 +1962,175 @@ describe('worker runtime layer (src/worker.ts)', () => {
     await post('$ls_9', '@AI Tarot ?');
     expect(fastLangs.at(-1)).toBe('en');
   });
+
+  it('12. BaseNarraRoomCoordinator auto-wires env.AI triage, tracks lastUnmentionedReplyAtMs cooldown, and aborts post when peer answers mid-generation', async () => {
+    let nowMs = 1_760_700_000_000;
+    const postedBodies: string[] = [];
+    const peerId = '@agent-ffff9999:matrix.netmind.chat';
+    const roomId = '!grp_ai_triage:matrix.netmind.chat';
+    const members = [
+      { matrixId: '@zack:matrix.netmind.chat', displayName: 'Zack', isAgent: false },
+      { matrixId: TEST_SPEC.matrixId!, displayName: 'London Chinese Food', isAgent: true },
+      { matrixId: peerId, displayName: 'Spotted London', isAgent: true },
+    ];
+
+    const aiCalls: string[] = [];
+    const fakeAi = {
+      async run(_model: string, input: { messages: Array<{ content: string }> }): Promise<{ response: string }> {
+        const userMsg = input.messages[input.messages.length - 1]?.content ?? '';
+        const currentLine =
+          userMsg
+            .split('\n')
+            .find((l) => l.startsWith('current_message:')) ?? userMsg;
+        aiCalls.push(currentLine);
+        if (currentLine.includes('好餓')) {
+          return { response: '{"score":0.88,"reason":"ai_food_need"}' };
+        }
+        if (currentLine.includes('還有其他選擇嗎')) {
+          return { response: '{"score":0.62,"reason":"ai_borderline_followup"}' };
+        }
+        if (currentLine.includes('Soho 有什麼吃的')) {
+          return { response: '{"score":0.85,"reason":"ai_race_food"}' };
+        }
+        return { response: '{"score":0.1,"reason":"ai_ignore"}' };
+      },
+    };
+
+    const { state, storage } = createFakeDOState();
+    let doInstance!: BaseNarraRoomCoordinator;
+
+    const env: NarraGatewayEnv = {
+      DB: createD1(),
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'off',
+      NARRA_AGENT_TOKEN: 'narra_tok_ai_triage',
+      AI: fakeAi,
+    };
+
+    const gateway = createNarraWorkerGateway({
+      spec: {
+        ...TEST_SPEC,
+        domainDescription: 'London Chinese restaurants, dishes, dim sum, hotpot, bubble tea.',
+        domainKeywords: ['中國城', '川菜'],
+        antiKeywords: ['快閃', '塔羅'],
+        politeYieldDelayMs: 25,
+      },
+      now: () => nowMs,
+      sleep: async (ms: number) => {
+        nowMs += ms;
+      },
+      fastRespond: async (_env, ev) => {
+        // Simulate peer agent replying DURING response generation on '$race_1'
+        if (ev.eventId === '$race_1') {
+          await doInstance.fetch(
+            new Request('https://narra-room/events', {
+              method: 'POST',
+              body: JSON.stringify({
+                roomId,
+                chatType: 'group',
+                members,
+                events: [
+                  {
+                    event_id: '$peer_mid_gen',
+                    sender: peerId,
+                    type: 'm.room.message',
+                    origin_server_ts: ev.timestampMs + 50,
+                    content: { msgtype: 'm.text', body: 'Peer answered while you were thinking!' },
+                  },
+                ],
+              }),
+            }),
+          );
+        }
+        return `Answer:${ev.text}`;
+      },
+      fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { text?: string };
+        postedBodies.push(body.text ?? '');
+        return Response.json({ status: 'ok', data: { event_id: `$ai_bot_${postedBodies.length}` } });
+      }) as unknown as typeof fetch,
+    });
+
+    doInstance = new gateway.BaseNarraRoomCoordinator(state, env);
+
+    // 1) Implicit food need -> env.AI triage auto-wired -> replies & stores lastUnmentionedReplyAtMs
+    await doInstance.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId,
+          chatType: 'group',
+          members,
+          events: [
+            {
+              event_id: '$implicit_1',
+              sender: '@zack:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: { msgtype: 'm.text', body: '好餓喔，有沒有推薦吃的？' },
+            },
+          ],
+        }),
+      }),
+    );
+    nowMs += 2_000;
+    await doInstance.alarm();
+    expect(aiCalls).toHaveLength(1);
+    expect(postedBodies).toEqual(['Answer:好餓喔，有沒有推薦吃的？']);
+    const lastUnmentioned = await storage.get<number>('lastUnmentionedReplyAtMs');
+    expect(typeof lastUnmentioned).toBe('number');
+
+    // Clear active session to isolate cooldown test on a borderline 0.62 unmentioned message within 10s
+    await storage.delete('sessions');
+    nowMs += 10_000;
+    await doInstance.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId,
+          chatType: 'group',
+          members,
+          events: [
+            {
+              event_id: '$border_2',
+              sender: '@zack:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: { msgtype: 'm.text', body: '還有其他選擇嗎？' },
+            },
+          ],
+        }),
+      }),
+    );
+    nowMs += 2_000;
+    await doInstance.alarm();
+    expect(postedBodies).toHaveLength(1); // Dropped by unmentioned_cooldown!
+
+    // 3) Advance past 30s cooldown; peer answers MID-GENERATION -> pre-post check aborts before postReplyToRoom!
+    nowMs += 35_000;
+    await doInstance.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId,
+          chatType: 'group',
+          members,
+          events: [
+            {
+              event_id: '$race_1',
+              sender: '@zack:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: { msgtype: 'm.text', body: 'Soho 有什麼吃的？' },
+            },
+          ],
+        }),
+      }),
+    );
+    nowMs += 2_000;
+    await doInstance.alarm();
+    expect(postedBodies).toHaveLength(1); // Aborted before posting!
+    const logs = (await storage.get<string[]>('log')) ?? [];
+    expect(logs.some((l) => l.includes('yielded_post_gen $race_1'))).toBe(true);
+  });
 });

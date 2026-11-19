@@ -119,6 +119,7 @@ export interface RoomContext {
   roomMuted?: boolean;
   roomThreshold?: number;
   activeSession?: ActiveSessionInfo;
+  lastUnmentionedReplyAtMs?: number;
   subsequentEvents?: Array<{ eventId: string; senderId: string; kind?: string }>;
   latestEventId?: string;
   latestHumanEventId?: string;
@@ -133,6 +134,7 @@ export interface TriageDecision {
   shouldQuote: boolean;
   directRoute?: boolean;
   yieldDelayMs?: number;
+  triageSource?: 'heuristic' | 'model' | 'fast_path';
 }
 
 export type MemoryScope = 'user' | 'room';

@@ -27,6 +27,7 @@ import {
   AGENT_CHAIN_RETRY_MS,
   AgentChainTracker,
   DEFAULT_SESSION_WINDOW_MS,
+  createWorkersAiTriageModel,
   executePoliteYield,
   hasPeerRepliedAfter,
   inspectRoomPeers,
@@ -103,6 +104,8 @@ export interface NarraGatewayEnv {
   NARRA_AUTHORIZE_EVENTS?: string;
   ENVIRONMENT?: string;
   AI?: unknown;
+  AI_TRIAGE_MODEL?: string;
+  NARRA_AI_TRIAGE?: string;
 }
 
 export interface NarraA2ACredentialResult {
@@ -1691,6 +1694,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     const sessions = (await this.ctx.storage.get<Record<string, StoredSessionEntry>>('sessions')) ?? {};
     const latestEventId = await this.ctx.storage.get<string>('latestEventId');
     const latestHumanEventId = await this.ctx.storage.get<string>('latestHumanEventId');
+    const lastUnmentionedReplyAtMs = await this.ctx.storage.get<number>('lastUnmentionedReplyAtMs');
 
     const replyToTarget = await this.hydrateReplyTarget(
       turn.event.roomId,
@@ -1748,6 +1752,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       roomMuted,
       ...(roomThreshold !== undefined ? { roomThreshold } : {}),
       activeSession,
+      ...(lastUnmentionedReplyAtMs !== undefined ? { lastUnmentionedReplyAtMs } : {}),
       subsequentEvents,
       ...(effectiveLatestId ? { latestEventId: effectiveLatestId } : {}),
       ...(effectiveLatestHumanId ? { latestHumanEventId: effectiveLatestHumanId } : {}),
@@ -1825,9 +1830,15 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             currentNowMs,
           );
 
+          const triageModel =
+            cfg.triageModel?.(this.env) ??
+            (this.env.AI && (this.env.NARRA_AI_TRIAGE ?? '').trim() !== 'off'
+              ? createWorkersAiTriageModel(this.env.AI, { model: this.env.AI_TRIAGE_MODEL })
+              : undefined);
+
           decision = await routeEvent(nextTurn.event, context, effectiveSpec, {
             nowMs: currentNowMs,
-            triageModel: cfg.triageModel?.(this.env),
+            triageModel,
             chainCap: AGENT_CHAIN_CAP,
           });
 
@@ -2066,6 +2077,39 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
 
         const meta = await this.ctx.storage.get<RoomMeta>('roomMeta');
         const chatType = meta?.chatType ?? nextTurn.event.chatType;
+        if (
+          chatType === 'group' &&
+          decision?.tier === 1 &&
+          !decision.directRoute &&
+          decision.reason !== 'multi_mention_domain_match'
+        ) {
+          const latestHistory = (await this.ctx.storage.get<HistoryTurn[]>('recentHistory')) ?? [];
+          const latestPeers = inspectRoomPeers(meta?.members ?? [], effectiveSpec.matrixId);
+          if (
+            latestPeers.length > 0 &&
+            hasPeerRepliedAfter(
+              nextTurn.event,
+              {
+                roomId: nextTurn.event.roomId,
+                chatType,
+                members: meta?.members ?? [],
+                peers: latestPeers,
+                recentHistory: latestHistory,
+              },
+              effectiveSpec.matrixId,
+            )
+          ) {
+            await this.clearUserSession(nextTurn.event.senderId);
+            await appendDoLog(
+              this.ctx.storage,
+              `yielded_post_gen ${nextTurn.event.eventId}: peer_already_replied`,
+              this.nowMs(),
+              this.env,
+            );
+            await this.removePendingTurn(nextTurn.event.eventId);
+            continue;
+          }
+        }
         const quoteNow = await this.computeShouldQuote(nextTurn.event, chatType);
         const replyToEventId = quoteNow ? nextTurn.event.eventId : undefined;
 
@@ -2105,6 +2149,10 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           if (posted.eventId) {
             await this.ctx.storage.put('latestEventId', posted.eventId);
             await this.markEventHandled(posted.eventId);
+          }
+
+          if (chatType === 'group' && decision?.tier === 1 && !decision.directRoute) {
+            await this.ctx.storage.put('lastUnmentionedReplyAtMs', repliedAtMs);
           }
 
           if (nextTurn.event.senderId) {

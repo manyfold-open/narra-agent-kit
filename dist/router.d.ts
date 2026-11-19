@@ -3,8 +3,12 @@ export declare const DEFAULT_SESSION_WINDOW_MS: number;
 export declare const DEFAULT_STALE_GROUP_MS: number;
 export declare const DEFAULT_SILENCE_THRESHOLD = 0.55;
 export declare const DEFAULT_YIELD_DELAY_MS = 1800;
+export declare const DEFAULT_UNMENTIONED_COOLDOWN_MS = 30000;
+export declare const DEFAULT_WORKERS_AI_TRIAGE_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 export declare const AGENT_CHAIN_CAP = 6;
 export declare const AGENT_CHAIN_RETRY_MS: readonly [15000, 45000, 120000];
+export declare const IMPLICIT_NEED_CUE_RE: RegExp;
+export declare const KNOWN_NARRA_PEER_ROLES: Record<string, string>;
 /** Extracts peer `@agent-*` members from a room roster, excluding self. */
 export declare function inspectRoomPeers(members: RoomMemberInfo[], selfMatrixId?: string): PeerAgentInfo[];
 export declare function isSelfMentioned(event: InboundEvent, spec: AgentSpec): boolean;
@@ -70,11 +74,30 @@ export declare function executePoliteYield(options: PoliteYieldOptions): Promise
     yield: boolean;
     reason?: string;
 }>;
+/** Returns true when a message is a past-tense story, anecdote, or stress statement without help-seeking intent. */
+export declare function isPastAnecdoteOrStatement(text: string): boolean;
+/**
+ * Computes confidence-weighted staggered polite yield delay so higher-confidence specialists
+ * reply earlier in unmentioned group conversations and borderline agents yield gracefully.
+ */
+export declare function computeStaggeredYieldDelayMs(baseDelayMs: number, score: number, agentId: string, eventId: string): number;
 /**
  * Zero-LLM-key lightweight Tier 1 heuristic scorer matching `domainKeywords`,
- * `antiKeywords`, and `domainDescription` tokens against the inbound message.
+ * `antiKeywords`, `domainDescription`, and anecdote/statement suppression.
  */
 export declare function heuristicDomainScore(event: InboundEvent, spec: AgentSpec, context?: RoomContext): number;
+export interface WorkersAiTriageOptions {
+    model?: string;
+    timeoutMs?: number;
+    peerDirectory?: Record<string, string>;
+}
+/**
+ * Fail-safe hybrid semantic Tier 1 triage backed by Cloudflare Workers AI (`env.AI`).
+ * Applies deterministic 0ms pre-filters for obvious casual chatter / anti-domain / high-signal
+ * hits / clear past-tense anecdotes, invokes Workers AI only on ambiguous group turns, and
+ * falls back seamlessly to `heuristicDomainScore` if Workers AI errors or times out.
+ */
+export declare function createWorkersAiTriageModel(ai: unknown, options?: WorkersAiTriageOptions): TriageModel;
 export interface RouteOptions {
     nowMs?: number;
     triageModel?: TriageModel;
