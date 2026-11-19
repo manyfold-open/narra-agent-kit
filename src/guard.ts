@@ -377,7 +377,7 @@ const MD_LINK_RE = /\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g;
 const SANDBOX_IMAGE_MD_RE = /!\[[^\]\n]*\]\(\s*(?:\.{0,2}\/)?media\/[^)\s]+\s*\)/gi;
 const EMPTY_CODE_FENCE_RE = /```[a-zA-Z0-9_-]*\s*```/g;
 const ORPHAN_PICTURES_LINE_RE =
-  /(?:Their pictures follow in the same order\.|圖片依序附在後面[。.]?|图片依序附在后面[。.]?)\s*/gi;
+  /(?:\b(?:(?:Their|The)\s+)?(?:cover\s+)?(?:pictures?|photos?|images?)\s+(?:follow(?:\s+below)?|are\s+(?:attached|listed|below|included)|appear\s+below)(?:\s+in\s+(?:the\s+same|that|this|listed)\s+order)?[.:!]?|(?:封面)?(?:圖片|图片|照片)(?:已|都)?(?:依序|按順序|按顺序|照順序|照顺序)?附在(?:後面|后面|下方)[。.!！]?)\s*/gi;
 const NON_PAREN_WRAPPED_URL_RE = /([[\（【<《"'])(https?:\/\/[^\s<>[\]（）【】《》"']+?)([\]）】>》"'])/g;
 const PAREN_WRAPPED_URL_RE = /\((https?:\/\/[^\s<>,;"'\u3000-\u303F\u3400-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]+)\)/g;
 const BARE_URL_RE = /https?:\/\/[^\s<>[\]"'\u3000-\u303F\u3400-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]+/g;

@@ -1808,16 +1808,23 @@ describe('narra-agent-kit simulation & unit suite', () => {
         'https://app.manyfold.ai/spotted-london/p/sample-popup',
         '```![](media/cover-145e6a0f270f4ab9.jpg) ![](media/cover-d4f2152bafda4d18.jpg)```',
         '![alt](./media/preview.png)',
-        '圖片依序附在後面。Their pictures follow in the same order. Want more options?',
+        '圖片依序附在後面。',
+        '图片按顺序附在下方。',
+        'Their pictures follow in the same order.',
+        'Their pictures follow in that order.',
+        'The photos are attached in that order.',
+        'Take photos at the pop-up gallery. Want more options?',
       ].join('\n');
       const sanitized = sanitizeMobileLinks(dirty);
       expect(sanitized).toContain('https://app.manyfold.ai/spotted-london/p/sample-popup');
-      expect(sanitized).toContain('Want more options?');
+      expect(sanitized).toContain('Take photos at the pop-up gallery. Want more options?');
       expect(sanitized).not.toContain('media/cover-');
       expect(sanitized).not.toContain('media/preview.png');
       expect(sanitized).not.toContain('```');
-      expect(sanitized).not.toContain('Their pictures follow in the same order.');
+      expect(sanitized).not.toContain('Their pictures follow');
+      expect(sanitized).not.toContain('The photos are attached');
       expect(sanitized).not.toContain('圖片依序附在後面');
+      expect(sanitized).not.toContain('图片按顺序附在下方');
     });
 
     it('rejects colleague office scheduling chatter during active_session while keeping genuine opening-hours and draw follow-ups', async () => {
