@@ -1,5 +1,15 @@
 import { runSchemaStatements } from './d1.js';
-import type { ChatType, LangCode, MemoryEntry, MemoryKind } from './types.js';
+import { stripAgentMentions } from './lang.js';
+import type {
+  AgentSpec,
+  ChatType,
+  InboundEvent,
+  LangCode,
+  MemoryEntry,
+  MemoryKind,
+  RoomContext,
+  TriageDecision,
+} from './types.js';
 
 export const NARRA_MEMORY_SCHEMA = `
 CREATE TABLE IF NOT EXISTS narra_user_memory (
@@ -523,19 +533,25 @@ export class MemoryStore {
     userId?: string;
     roomId?: string;
     key?: string;
+    originChatType?: ChatType;
   }): Promise<number> {
     let deleted = 0;
 
     if ((input.scope === 'user' || input.scope === 'all') && input.userId) {
-      const res = input.key
-        ? await this.db
-            .prepare('DELETE FROM narra_user_memory WHERE agent_id = ? AND user_id = ? AND memory_key = ?')
-            .bind(this.agentId, input.userId, input.key)
-            .run()
-        : await this.db
-            .prepare('DELETE FROM narra_user_memory WHERE agent_id = ? AND user_id = ?')
-            .bind(this.agentId, input.userId)
-            .run();
+      const filters = ['agent_id = ?', 'user_id = ?'];
+      const bindings: unknown[] = [this.agentId, input.userId];
+      if (input.key) {
+        filters.push('memory_key = ?');
+        bindings.push(input.key);
+      }
+      if (input.originChatType) {
+        filters.push('origin_chat_type = ?');
+        bindings.push(input.originChatType);
+      }
+      const res = await this.db
+        .prepare(`DELETE FROM narra_user_memory WHERE ${filters.join(' AND ')}`)
+        .bind(...bindings)
+        .run();
       deleted += Number(res.meta.changes ?? 0);
     }
 
@@ -740,4 +756,204 @@ export class MemoryStore {
     }>();
     return results ?? [];
   }
+}
+
+export interface StandardMemoryCommandInput {
+  store: MemoryStore;
+  event: InboundEvent;
+  context: RoomContext;
+  decision: TriageDecision;
+  memories: RecallTurnResult;
+  spec: AgentSpec;
+}
+
+const GROUP_MUTE_RE =
+  /^(?:先安靜|先安静|靜音|静音|先別插嘴|先别插嘴|安靜一下|安静一下|先閉嘴|先闭嘴|mute(?:\s+(?:room|group|for\s+now))?|be\s+quiet|stay\s+quiet)[!！。.~～?？\s]*$/i;
+const GROUP_UNMUTE_RE =
+  /^(?:恢復|恢复|取消靜音|取消静音|解除靜音|解除静音|恢復主動回覆|恢复主动回复|可以說話了|可以说话了|unmute(?:\s+(?:room|group))?)[!！。.~～?？\s]*$/i;
+const FORGET_CMD_RE =
+  /^(?:(?:請|请)?(?:幫我|帮我)?(?:(?:忘掉|忘記|忘记)(?:全部|所有|這[件些段]?事?|这[件些段]?事?|我的(?:記憶|记忆|偏好|資料|资料|設定|设置)?|之前(?:說|说|記|记)的(?:事|內容|内容)?|剛剛|刚刚)?|(?:清除|清空|刪掉|删掉|刪除|删除)(?:我的)?(?:全部|所有)?(?:記憶|记忆|偏好))|(?:please\s+)?forget\s+(?:everything|all(?:\s+(?:of\s+)?(?:my\s+)?(?:memories|preferences|notes|that|it))?|my\s+(?:memories|preferences|notes)|what\s+i\s+(?:said|told\s+you)))(?:\s*(?:吧|好嗎|好吗|喔|哦|呀|please))?[!！。.~～?？\s]*$/i;
+const RECALL_CMD_RE =
+  /(?:你記得什麼|你记得什么|你還記得什麼|你还记得什么|你記得我|你记得我|你還記得我|你还记得我|記得我(?:之前|私訊|私聊|平常|說過|说过)?|记得我(?:之前|私信|私聊|平常|说过)?|你記了什麼|你记了什么|查(?:看)?我的記憶|查(?:看)?我的记忆|\bwhat\s+do\s+you\s+remember\b|\bdo\s+you\s+remember\b)/i;
+const REMEMBER_CMD_RE =
+  /^(?:(?:請|请)?(?:幫我|帮我)?(?:記住|记住|記一下|记一下|記下來|记下来)[：:，,\s]*|(?:please\s+)?remember(?:\s+that)?[：:,\s]+)/i;
+const PRIVATE_DM_SUFFIX_RE =
+  /[,，。\s]+(?:這件?事)?(?:請)?(?:只|僅)?記在私[訊信](?:裡|里)?[，,]?(?:不要|別|勿)?在?群[組组]?(?:說|说|提(?:及)?)?[!！。.]*$/i;
+
+function isInternalMemoryKey(key: string): boolean {
+  return key.startsWith('__narra_') || key.startsWith('opt_in_') || key === 'lang';
+}
+
+async function shortNoteKey(fact: string): Promise<string> {
+  const bytes = new Uint8Array(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(fact.toLowerCase())),
+  );
+  const hex = [...bytes.slice(0, 4)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return `note_${hex}`;
+}
+
+/**
+ * Handles universal D1 3-layer memory commands (`先安靜`/`恢復`, `忘掉`, `你記得什麼`, `記住...`)
+ * on directly addressed turns (`dm`, `explicit_mention`, `reply_to_self`) with strict
+ * DM-to-group privacy isolation and prompt-injection rejection.
+ */
+export async function handleStandardMemoryCommand(
+  input: StandardMemoryCommandInput,
+): Promise<string | null> {
+  const { store, event, context, decision, memories, spec } = input;
+  const isDirect =
+    context.chatType === 'dm' ||
+    decision.reason === 'dm' ||
+    decision.reason === 'explicit_mention' ||
+    decision.reason === 'reply_to_self';
+  if (!isDirect) return null;
+
+  const mentionNames = [
+    spec.name,
+    ...(spec.aliases ?? []),
+    ...(context.peers ?? []).flatMap((p) => [p.displayName, ...(p.aliases ?? [])]),
+    ...context.members.map((m) => m.displayName),
+  ].filter((s): s is string => typeof s === 'string' && s.trim().length > 0);
+
+  const cleaned = stripAgentMentions(event.text ?? '', mentionNames)
+    .trim()
+    .replace(/^[，,：:\s]+/, '')
+    .trim();
+  if (!cleaned) return null;
+  const lang = decision.detectedLang;
+
+  // 1. Group Mute / Unmute
+  if (context.chatType === 'group') {
+    if (GROUP_MUTE_RE.test(cleaned)) {
+      await store.setRoomMute(event.roomId, true, event.senderId);
+      if (lang === 'zh-Hant') {
+        return '好的，我會先安靜，只在被 @ 或直接回覆我時才開口。想恢復時在群裡 @我說「恢復」就好。';
+      }
+      if (lang === 'zh-Hans') {
+        return '好的，我会先安静，只在被 @ 或直接回复我时才开口。想恢复时在群里 @我说「恢复」就好。';
+      }
+      return 'Got it — I will stay quiet here and only reply when @mentioned or directly replied to. @mention me and say "unmute" anytime.';
+    }
+    if (GROUP_UNMUTE_RE.test(cleaned)) {
+      await store.setRoomMute(event.roomId, false, event.senderId);
+      if (lang === 'zh-Hant') {
+        return '好的，已恢復群組主動參與，有需要我幫忙的話題時我會適時加入！';
+      }
+      if (lang === 'zh-Hans') {
+        return '好的，已恢复群组主动参与，有需要我帮忙的话题时我会适时加入！';
+      }
+      return 'Back on — I will chime in naturally on relevant topics in this group again.';
+    }
+  }
+
+  // 2. Forget
+  if (FORGET_CMD_RE.test(cleaned)) {
+    await store.forget({
+      scope: 'user',
+      userId: event.senderId,
+      originChatType: context.chatType,
+    });
+    if (lang === 'zh-Hant') {
+      return context.chatType === 'dm'
+        ? '好的，已忘掉你在私訊讓我記住的偏好與紀錄。'
+        : '好的，已清除我在群組模式為你記下的偏好與紀錄（私訊紀錄各自獨立保存）。';
+    }
+    if (lang === 'zh-Hans') {
+      return context.chatType === 'dm'
+        ? '好的，已忘掉你在私信让我记住的偏好与记录。'
+        : '好的，已清除我在群组模式为你记下的偏好与记录（私信记录各自独立保存）。';
+    }
+    return context.chatType === 'dm'
+      ? 'Done — I have cleared your private DM preferences and notes.'
+      : 'Done — I have cleared your group preferences (private DM notes remain separate).';
+  }
+
+  // 3. Recall (strictly respecting DM-to-group privacy isolation from recallForTurn)
+  if (RECALL_CMD_RE.test(cleaned)) {
+    const visibleUser = memories.userMemories.filter((m) => !isInternalMemoryKey(m.key));
+    const visibleRoom =
+      context.chatType === 'group'
+        ? memories.roomMemories.filter((m) => !isInternalMemoryKey(m.key))
+        : [];
+    if (visibleUser.length === 0 && visibleRoom.length === 0) {
+      if (context.chatType === 'group') {
+        if (lang === 'zh-Hant') {
+          return '我在群組裡還沒有記下你的個人偏好；為了保護隱私，私訊中的對話與偏好不會在群組中讀取或提及。';
+        }
+        if (lang === 'zh-Hans') {
+          return '我在群组里还没有记下你的个人偏好；为了保护隐私，私信中的对话与偏好不会在群组中读取或提及。';
+        }
+        return 'I have not saved any group preferences for you yet. Private DM conversations and preferences are strictly isolated and never shared in groups.';
+      }
+      if (lang === 'zh-Hant') {
+        return '目前我還沒有特別記下你的個人偏好；直接跟我說「記住…」，我只會在私訊裡幫你記住！';
+      }
+      if (lang === 'zh-Hans') {
+        return '目前我还没有特别记下你的个人偏好；直接跟我说“记住…”，我只会在私信里帮你记住！';
+      }
+      return 'I have not saved any personal preferences for you yet — say "remember ..." and I will keep it private in our DM.';
+    }
+
+    const lines = [...visibleUser, ...visibleRoom].slice(0, 8).map((m) => `• ${m.value}`);
+    const header =
+      lang === 'zh-Hant'
+        ? context.chatType === 'dm'
+          ? '我目前在私訊裡幫你記住了（不會在群組提及）：'
+          : '我目前在這個群組裡記得：'
+        : lang === 'zh-Hans'
+          ? context.chatType === 'dm'
+            ? '我目前在私信里帮你记住了（不会在群组提及）：'
+            : '我目前在这个群组里记得：'
+          : context.chatType === 'dm'
+            ? 'Here is what I remember privately in our DM (never shared in groups):'
+            : 'Here is what I remember in this group:';
+    return [header, ...lines].join('\n');
+  }
+
+  // 4. Remember
+  if (REMEMBER_CMD_RE.test(cleaned)) {
+    const rawFact = cleaned.replace(REMEMBER_CMD_RE, '').trim();
+    const trimmedSuffix = rawFact.replace(PRIVATE_DM_SUFFIX_RE, '').trim();
+    const fact = (trimmedSuffix || rawFact).slice(0, 300).trim();
+    if (!fact) return null;
+
+    const key = await shortNoteKey(fact);
+    try {
+      await store.rememberUser({
+        userId: event.senderId,
+        key,
+        value: fact,
+        kind: 'preference',
+        originChatType: context.chatType,
+        originRoomId: event.roomId,
+      });
+    } catch (err) {
+      if (err instanceof MemoryRejectionError) {
+        if (lang === 'zh-Hant') {
+          return '這段內容包含不安全的系統格式或異常指令，為安全起見沒有寫入記憶。';
+        }
+        if (lang === 'zh-Hans') {
+          return '这段内容包含不安全的系统格式或异常指令，为安全起见没有写入记忆。';
+        }
+        return 'That note looks unsafe to store, so I skipped saving it to memory.';
+      }
+      throw err;
+    }
+
+    if (lang === 'zh-Hant') {
+      return context.chatType === 'dm'
+        ? `好的，已私訊記住「${fact}」——之後我會優先參考這項偏好，而且不會在群組中提及。`
+        : `好的，已在群組筆記中記下「${fact}」。`;
+    }
+    if (lang === 'zh-Hans') {
+      return context.chatType === 'dm'
+        ? `好的，已私信记住「${fact}」——之后我会优先参考这项偏好，而且不会在群组中提及。`
+        : `好的，已在群组笔记中记下「${fact}」。`;
+    }
+    return context.chatType === 'dm'
+      ? `Got it — saved privately in our DM: "${fact}" (never shared in groups).`
+      : `Got it — saved for this group: "${fact}".`;
+  }
+
+  return null;
 }

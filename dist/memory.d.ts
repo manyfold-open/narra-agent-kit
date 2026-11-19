@@ -1,4 +1,4 @@
-import type { ChatType, LangCode, MemoryEntry, MemoryKind } from './types.js';
+import type { AgentSpec, ChatType, InboundEvent, LangCode, MemoryEntry, MemoryKind, RoomContext, TriageDecision } from './types.js';
 export declare const NARRA_MEMORY_SCHEMA = "\nCREATE TABLE IF NOT EXISTS narra_user_memory (\n  id TEXT PRIMARY KEY,\n  agent_id TEXT NOT NULL,\n  user_id TEXT NOT NULL,\n  origin_chat_type TEXT NOT NULL DEFAULT 'group',\n  origin_room_id TEXT,\n  kind TEXT NOT NULL DEFAULT 'preference',\n  memory_key TEXT NOT NULL,\n  memory_value TEXT NOT NULL,\n  confidence REAL NOT NULL DEFAULT 1.0,\n  created_at TEXT NOT NULL,\n  updated_at TEXT NOT NULL,\n  UNIQUE(agent_id, user_id, origin_chat_type, memory_key)\n);\n\nCREATE INDEX IF NOT EXISTS idx_narra_user_memory_lookup\n  ON narra_user_memory (agent_id, user_id, origin_chat_type, updated_at);\n\nCREATE TABLE IF NOT EXISTS narra_room_memory (\n  id TEXT PRIMARY KEY,\n  agent_id TEXT NOT NULL,\n  room_id TEXT NOT NULL,\n  kind TEXT NOT NULL DEFAULT 'fact',\n  memory_key TEXT NOT NULL,\n  memory_value TEXT NOT NULL,\n  updated_by TEXT,\n  created_at TEXT NOT NULL,\n  updated_at TEXT NOT NULL,\n  UNIQUE(agent_id, room_id, memory_key)\n);\n\nCREATE INDEX IF NOT EXISTS idx_narra_room_memory_lookup\n  ON narra_room_memory (agent_id, room_id, kind, updated_at);\n\nCREATE TABLE IF NOT EXISTS narra_learning_log (\n  id TEXT PRIMARY KEY,\n  agent_id TEXT NOT NULL,\n  room_id TEXT NOT NULL,\n  user_id TEXT,\n  event_id TEXT,\n  signal TEXT NOT NULL,\n  delta REAL NOT NULL DEFAULT 0,\n  threshold_after REAL,\n  detail TEXT,\n  created_at TEXT NOT NULL\n);\n\nCREATE INDEX IF NOT EXISTS idx_narra_learning_log_room\n  ON narra_learning_log (agent_id, room_id, created_at);\n\nCREATE TABLE IF NOT EXISTS narra_demand_log (\n  id TEXT PRIMARY KEY,\n  agent_id TEXT NOT NULL,\n  room_id TEXT NOT NULL,\n  user_id TEXT,\n  query TEXT NOT NULL,\n  category TEXT,\n  outcome TEXT NOT NULL DEFAULT 'unanswered',\n  lang TEXT,\n  created_at TEXT NOT NULL\n);\n\nCREATE INDEX IF NOT EXISTS idx_narra_demand_log_room\n  ON narra_demand_log (agent_id, room_id, created_at);\n";
 export declare const DEFAULT_ROOM_THRESHOLD = 0.55;
 export declare const MIN_ROOM_THRESHOLD = 0.25;
@@ -95,6 +95,7 @@ export declare class MemoryStore {
         userId?: string;
         roomId?: string;
         key?: string;
+        originChatType?: ChatType;
     }): Promise<number>;
     private upsertInternalRoomState;
     getRoomThreshold(roomId: string): Promise<number>;
@@ -132,4 +133,18 @@ export declare class MemoryStore {
         createdAt: string;
     }>>;
 }
+export interface StandardMemoryCommandInput {
+    store: MemoryStore;
+    event: InboundEvent;
+    context: RoomContext;
+    decision: TriageDecision;
+    memories: RecallTurnResult;
+    spec: AgentSpec;
+}
+/**
+ * Handles universal D1 3-layer memory commands (`先安靜`/`恢復`, `忘掉`, `你記得什麼`, `記住...`)
+ * on directly addressed turns (`dm`, `explicit_mention`, `reply_to_self`) with strict
+ * DM-to-group privacy isolation and prompt-injection rejection.
+ */
+export declare function handleStandardMemoryCommand(input: StandardMemoryCommandInput): Promise<string | null>;
 //# sourceMappingURL=memory.d.ts.map

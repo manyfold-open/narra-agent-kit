@@ -15,7 +15,11 @@ import {
   stripLeakedNotes,
 } from './guard.js';
 import { detectLang } from './lang.js';
-import { MemoryStore, type RecallTurnResult } from './memory.js';
+import {
+  MemoryStore,
+  handleStandardMemoryCommand,
+  type RecallTurnResult,
+} from './memory.js';
 import { editContent, messageContent, plainMentions } from './mentions.js';
 import { shouldQuote } from './quote.js';
 import {
@@ -1926,7 +1930,26 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             });
 
             let handledFast = false;
-            if (cfg.fastRespond) {
+            if (memoryStore) {
+              try {
+                const memReply = await handleStandardMemoryCommand({
+                  store: memoryStore,
+                  event: nextTurn.event,
+                  context,
+                  decision,
+                  memories,
+                  spec: effectiveSpec,
+                });
+                if (memReply !== null) {
+                  rawAnswer = memReply;
+                  handledFast = true;
+                }
+              } catch {
+                // Fall back cleanly if memory command fails unexpectedly.
+              }
+            }
+
+            if (!handledFast && cfg.fastRespond) {
               try {
                 const fast = await cfg.fastRespond(this.env, nextTurn.event, decision, memories);
                 if (fast !== null && fast !== undefined) {

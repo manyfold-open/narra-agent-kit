@@ -4,7 +4,7 @@ import { runSchemaStatements } from './d1.js';
 import { BurstCoalescer } from './debounce.js';
 import { isNarraAgent, isSilence, parseMatrixEvent, sanitizeMobileLinks, stripLeakedNotes, } from './guard.js';
 import { detectLang } from './lang.js';
-import { MemoryStore } from './memory.js';
+import { MemoryStore, handleStandardMemoryCommand, } from './memory.js';
 import { editContent, messageContent, plainMentions } from './mentions.js';
 import { shouldQuote } from './quote.js';
 import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSION_WINDOW_MS, executePoliteYield, hasPeerRepliedAfter, inspectRoomPeers, isChainExhaustedError, routeEvent, } from './router.js';
@@ -1476,7 +1476,26 @@ export class BaseNarraRoomCoordinator {
                             spec: effectiveSpec,
                         });
                         let handledFast = false;
-                        if (cfg.fastRespond) {
+                        if (memoryStore) {
+                            try {
+                                const memReply = await handleStandardMemoryCommand({
+                                    store: memoryStore,
+                                    event: nextTurn.event,
+                                    context,
+                                    decision,
+                                    memories,
+                                    spec: effectiveSpec,
+                                });
+                                if (memReply !== null) {
+                                    rawAnswer = memReply;
+                                    handledFast = true;
+                                }
+                            }
+                            catch {
+                                // Fall back cleanly if memory command fails unexpectedly.
+                            }
+                        }
+                        if (!handledFast && cfg.fastRespond) {
                             try {
                                 const fast = await cfg.fastRespond(this.env, nextTurn.event, decision, memories);
                                 if (fast !== null && fast !== undefined) {
