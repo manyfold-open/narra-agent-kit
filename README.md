@@ -54,7 +54,118 @@ BurstCoalescer (Durable Object / in-memory, 1800ms window)
 
 ---
 
-## 5-Step Integration Guide (Drop Into Any Cloudflare Worker)
+## Quick Start: Cloudflare Worker + SQLite Durable Objects Runtime (`@manyfold/narra-agent-kit/worker`)
+
+Install directly from GitHub pinned to a commit SHA (pre-built `dist/` is committed so consumer `npm ci` needs no build step):
+
+```json
+{
+  "dependencies": {
+    "@manyfold/narra-agent-kit": "github:manyfold-open/narra-agent-kit#<commit-sha>"
+  }
+}
+```
+
+### 1. Declare Durable Objects & Vars in `wrangler.jsonc`
+
+```jsonc
+{
+  "durable_objects": {
+    "bindings": [
+      { "name": "NARRA_SYNC_DO", "class_name": "NarraMatrixSync" },
+      { "name": "NARRA_ROOM_DO", "class_name": "NarraRoomCoordinator" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1-narra-gateway",
+      "new_sqlite_classes": ["NarraMatrixSync", "NarraRoomCoordinator"]
+    }
+  ],
+  "vars": {
+    "NARRA_GATEWAY_ENABLED": "off",
+    "NARRA_SYNC": "off"
+  },
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  }
+}
+```
+
+### 2. Wire Your Worker Entry (`src/worker/index.ts`)
+
+Declare static `export class NarraMatrixSync` and `export class NarraRoomCoordinator` subclasses locally so `wrangler` and `@cloudflare/vite-plugin` detect them statically:
+
+```ts
+import {
+  BaseNarraMatrixSync,
+  BaseNarraRoomCoordinator,
+  createNarraWorkerGateway,
+  type NarraGatewayConfig,
+  type NarraGatewayEnv,
+} from '@manyfold/narra-agent-kit/worker';
+
+interface Env extends NarraGatewayEnv {
+  DB: D1Database;
+  ADMIN_PASSWORD?: string;
+}
+
+const narraConfig: NarraGatewayConfig<Env> = {
+  spec: {
+    id: 'agt_your_manyfold_agent_id',
+    matrixId: '@agent-1234abcd:matrix.netmind.chat',
+    name: 'MyAgent',
+    domainDescription: 'Answers questions about London restaurants and bookings',
+    domainKeywords: ['restaurant', 'ramen', 'dim sum', '倫敦', '餐廳', '拉麵'],
+    silenceThreshold: 0.55,
+    politeYieldDelayMs: 1800,
+  },
+  resolveA2ACredential: async (env) => {
+    // Decrypt or fetch your Manyfold A2A { url, token } credential
+    return null;
+  },
+  fastRespond: async (_env, _event, _decision, _memories) => null,
+  fetchUpdates: async (_env, _sinceIso) => [],
+};
+
+// Option A: factory-bound classes + helpers
+const gateway = createNarraWorkerGateway(narraConfig);
+export class NarraMatrixSync extends gateway.BaseNarraMatrixSync {}
+export class NarraRoomCoordinator extends gateway.BaseNarraRoomCoordinator {}
+
+// Option B: direct subclassing with constructor config
+// export class NarraMatrixSync extends BaseNarraMatrixSync<Env> {
+//   constructor(ctx: DurableObjectState, env: Env) { super(ctx, env, narraConfig); }
+// }
+// export class NarraRoomCoordinator extends BaseNarraRoomCoordinator<Env> {
+//   constructor(ctx: DurableObjectState, env: Env) { super(ctx, env, narraConfig); }
+// }
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === '/api/gateway/status') {
+      // Protect behind your Worker's admin auth check before returning!
+      return Response.json(await gateway.getNarraGatewayStatus(env));
+    }
+    return new Response('ok');
+  },
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    // Safe no-op (0 external calls, 0 D1 calls) unless NARRA_GATEWAY_ENABLED === 'on' and NARRA_AGENT_TOKEN is set.
+    await gateway.kickNarraGateway(env);
+  },
+};
+```
+
+> **Security & Safety Invariants:**
+> - `isNarraGatewayEnabled(env)` returns `true` **only** when `NARRA_GATEWAY_ENABLED === 'on'` and `NARRA_AGENT_TOKEN` is non-empty.
+> - `kickNarraGateway(env)` makes **zero external HTTP calls and zero D1 queries** when disabled.
+> - Matrix logins are held **strictly in memory** inside `BaseNarraMatrixSync` and are never written to DO storage, D1, or logs.
+> - `getNarraGatewayStatus(env)` returns redacted boolean/counter diagnostics and never leaks tokens or raw user message bodies.
+
+---
+
+## 5-Step Integration Guide (Low-Level Primitives)
 
 ### Step 1: Install & Initialize D1 Schema
 
@@ -213,8 +324,9 @@ await scheduler.run(updates);
 | `src/quote.ts` | `shouldQuote` |
 | `src/debounce.ts` | `BurstCoalescer`, `mergeBurstFragments` |
 | `src/memory.ts` | `NARRA_MEMORY_SCHEMA`, `MemoryStore`, `MemoryRejectionError`, `validateMemoryWrite`, `isInjectionAttempt` |
-| `src/router.ts` | `routeEvent`, `RoomRouter`, `ActiveSessionTracker`, `AgentChainTracker`, `inspectRoomPeers`, `executePoliteYield`, `heuristicDomainScore`, `AGENT_CHAIN_RETRY_MS` |
+| `src/router.ts` | `routeEvent`, `routeInboundEvent`, `RoomRouter`, `ActiveSessionTracker`, `AgentChainTracker`, `inspectRoomPeers`, `executePoliteYield`, `heuristicDomainScore`, `AGENT_CHAIN_RETRY_MS` |
 | `src/sync.ts` | `fetchMatrixCredential`, `authorizeEvent`, `matrixSyncRequest`, `fetchRoomMessagesBackstop`, `fetchNarraChatMessagesBackstop`, `fetchEventContext`, `syncOnce`, `MemoryKVStore` |
 | `src/broadcast.ts` | `NARRA_BROADCAST_SCHEMA`, `ProactiveBroadcastScheduler`, `D1BroadcastStore`, `InMemoryBroadcastStore`, `staggerWindowMinute`, `isWithinStaggerWindow`, `hasOnlyTrailingAgentMessages` |
 | `src/mentions.ts` | `renderMentions`, `plainMentions`, `messageContent`, `editContent` |
 | `src/adapters/manyfold-a2a.ts` | `buildPromptEnvelope`, `runManyfoldA2ATurn`, `runFastPathOrA2A`, `A2AError` |
+| `src/worker.ts` | `createNarraWorkerGateway`, `BaseNarraMatrixSync`, `BaseNarraRoomCoordinator`, `NarraMatrixSync`, `NarraRoomCoordinator`, `isNarraGatewayEnabled`, `isNarraSyncEnabled`, `kickNarraGateway`, `getNarraGatewayStatus` |

@@ -9,3 +9,4 @@ export * from './sync.js';
 export * from './broadcast.js';
 export * from './mentions.js';
 export * from './adapters/manyfold-a2a.js';
+export * from './worker.js';

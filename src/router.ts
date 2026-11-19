@@ -658,6 +658,8 @@ export async function routeEvent(
   };
 }
 
+export const routeInboundEvent = routeEvent;
+
 export interface RoomRouterConfig {
   spec: AgentSpec;
   triageModel?: TriageModel;

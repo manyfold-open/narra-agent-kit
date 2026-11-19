@@ -1,0 +1,1387 @@
+import { describe, expect, it, vi } from 'vitest';
+import {
+  BaseNarraMatrixSync,
+  BaseNarraRoomCoordinator,
+  MemoryStore,
+  NarraMatrixSync,
+  NarraRoomCoordinator,
+  createNarraWorkerGateway,
+  getNarraGatewayStatus,
+  isNarraGatewayEnabled,
+  isNarraSyncEnabled,
+  kickNarraGateway,
+  staggerWindowMinute,
+  type AgentSpec,
+  type AgentUpdateItem,
+  type InboundEvent,
+  type NarraGatewayConfig,
+  type NarraGatewayEnv,
+  type TriageModel,
+} from '../src/index.js';
+import { createD1 } from './d1.js';
+
+class FakeDOStorage {
+  readonly data = new Map<string, unknown>();
+  alarmAt: number | null = null;
+
+  async get<T>(key: string): Promise<T | undefined> {
+    if (!this.data.has(key)) return undefined;
+    return structuredClone(this.data.get(key)) as T;
+  }
+
+  async put(key: string, value: unknown): Promise<void> {
+    this.data.set(key, structuredClone(value));
+  }
+
+  async delete(key: string): Promise<boolean> {
+    return this.data.delete(key);
+  }
+
+  async list<T>(options: { prefix?: string; limit?: number } = {}): Promise<Map<string, T>> {
+    const out = new Map<string, T>();
+    const prefix = options.prefix ?? '';
+    const keys = [...this.data.keys()].filter((k) => k.startsWith(prefix)).sort();
+    for (const key of keys) {
+      if (options.limit && out.size >= options.limit) break;
+      out.set(key, structuredClone(this.data.get(key)) as T);
+    }
+    return out;
+  }
+
+  async getAlarm(): Promise<number | null> {
+    return this.alarmAt;
+  }
+
+  async setAlarm(scheduledTime: number | Date): Promise<void> {
+    this.alarmAt = typeof scheduledTime === 'number' ? scheduledTime : scheduledTime.getTime();
+  }
+
+  async deleteAlarm(): Promise<void> {
+    this.alarmAt = null;
+  }
+}
+
+function createFakeDOState(storage = new FakeDOStorage()): {
+  state: DurableObjectState;
+  storage: FakeDOStorage;
+} {
+  const state = {
+    storage,
+    id: { toString: () => 'fake-do-id', equals: () => false },
+    waitUntil: (_p: Promise<unknown>) => undefined,
+    blockConcurrencyWhile: async <T>(fn: () => Promise<T>) => fn(),
+  } as unknown as DurableObjectState;
+  return { state, storage };
+}
+
+interface FakeDONamespaceHandle<TInstance extends { fetch(req: Request): Promise<Response>; alarm?(): Promise<void> }> {
+  namespace: DurableObjectNamespace;
+  instances: Map<string, { instance: TInstance; storage: FakeDOStorage }>;
+  resetInstances(): void;
+}
+
+function createFakeNamespace<TInstance extends { fetch(req: Request): Promise<Response>; alarm?(): Promise<void> }>(
+  factory: (ctx: DurableObjectState) => TInstance,
+): FakeDONamespaceHandle<TInstance> {
+  const storages = new Map<string, FakeDOStorage>();
+  const instances = new Map<string, { instance: TInstance; storage: FakeDOStorage }>();
+
+  const ensureInstance = (name: string) => {
+    let existing = instances.get(name);
+    if (!existing) {
+      let storage = storages.get(name);
+      if (!storage) {
+        storage = new FakeDOStorage();
+        storages.set(name, storage);
+      }
+      const { state } = createFakeDOState(storage);
+      existing = { instance: factory(state), storage };
+      instances.set(name, existing);
+    }
+    return existing;
+  };
+
+  const namespace = {
+    idFromName: (name: string) => ({ toString: () => name, name } as unknown as DurableObjectId),
+    get: (id: DurableObjectId) => {
+      const name = String((id as unknown as { name?: string }).name ?? id.toString());
+      return {
+        fetch: (input: RequestInfo | URL, init?: RequestInit) => {
+          const req =
+            input instanceof Request
+              ? input
+              : new Request(typeof input === 'string' ? input : input.toString(), init);
+          return ensureInstance(name).instance.fetch(req);
+        },
+      } as unknown as DurableObjectStub;
+    },
+  } as unknown as DurableObjectNamespace;
+
+  return {
+    namespace,
+    instances,
+    resetInstances() {
+      // Simulate DO hibernation / eviction: instances vanish, persisted storage stays.
+      instances.clear();
+    },
+  };
+}
+
+const TEST_SPEC: AgentSpec = {
+  id: 'agt_test_penny',
+  matrixId: '@agent-aaaa1111:matrix.netmind.chat',
+  name: 'Penny',
+  aliases: ['小助手', 'SplitBot'],
+  domainDescription: 'Tracks group expenses, restaurant bill splits, receipts, and balances',
+  domainKeywords: ['split', 'owe', 'paid', 'spent', 'expense', '分帳', '分账', '花了', '誰付', '拉麵'],
+  antiKeywords: ['tarot', 'horoscope', 'fortune stick'],
+  silenceThreshold: 0.55,
+  politeYieldDelayMs: 5,
+};
+
+function makeSseResponse(text: string): Response {
+  const sse = `data: ${JSON.stringify({
+    jsonrpc: '2.0',
+    id: '1',
+    result: {
+      kind: 'status-update',
+      status: {
+        state: 'completed',
+        message: { role: 'agent', parts: [{ kind: 'text', text }] },
+      },
+    },
+  })}\n\n`;
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(sse));
+      controller.close();
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  });
+}
+
+describe('worker runtime layer (src/worker.ts)', () => {
+  it('1. isNarraGatewayEnabled & disabled no-op guarantee (0 external/D1/DO calls)', async () => {
+    expect(isNarraGatewayEnabled(undefined)).toBe(false);
+    expect(isNarraGatewayEnabled({})).toBe(false);
+    expect(isNarraGatewayEnabled({ NARRA_GATEWAY_ENABLED: 'off', NARRA_AGENT_TOKEN: 'tok_123' })).toBe(false);
+    expect(isNarraGatewayEnabled({ NARRA_GATEWAY_ENABLED: 'on', NARRA_AGENT_TOKEN: '   ' })).toBe(false);
+    expect(isNarraGatewayEnabled({ NARRA_GATEWAY_ENABLED: 'ON', NARRA_AGENT_TOKEN: 'tok_123' })).toBe(false);
+    expect(isNarraGatewayEnabled({ NARRA_GATEWAY_ENABLED: ' on ', NARRA_AGENT_TOKEN: ' tok_123 ' })).toBe(true);
+    expect(
+      isNarraSyncEnabled({ NARRA_GATEWAY_ENABLED: 'on', NARRA_AGENT_TOKEN: 'tok_123', NARRA_SYNC: 'off' }),
+    ).toBe(false);
+    expect(
+      isNarraSyncEnabled({ NARRA_GATEWAY_ENABLED: 'on', NARRA_AGENT_TOKEN: 'tok_123', NARRA_SYNC: 'on' }),
+    ).toBe(true);
+
+    const fetchSpy = vi.fn(async () => new Response('{}'));
+    const fetchUpdatesSpy = vi.fn(async () => []);
+    const dbExecSpy = vi.fn(async () => ({ count: 0, duration: 0 }));
+    const dbPrepareSpy = vi.fn();
+    const doFetchSpy = vi.fn(async () => Response.json({ ok: true }));
+
+    const fakeDb = { exec: dbExecSpy, prepare: dbPrepareSpy } as unknown as D1Database;
+    const fakeNs = {
+      idFromName: (n: string) => n as unknown as DurableObjectId,
+      get: () => ({ fetch: doFetchSpy }),
+    } as unknown as DurableObjectNamespace;
+
+    const env: NarraGatewayEnv = {
+      DB: fakeDb,
+      NARRA_GATEWAY_ENABLED: 'off',
+      NARRA_SYNC: 'on',
+      NARRA_AGENT_TOKEN: 'narra_secret_disabled_test',
+      NARRA_SYNC_DO: fakeNs,
+      NARRA_ROOM_DO: fakeNs,
+    };
+
+    const kickRes = await kickNarraGateway(env, {
+      spec: TEST_SPEC,
+      fetchImpl: fetchSpy as unknown as typeof fetch,
+      fetchUpdates: fetchUpdatesSpy,
+    });
+
+    expect(kickRes).toEqual({
+      enabled: false,
+      syncKicked: false,
+      syncRunning: false,
+      broadcast: null,
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchUpdatesSpy).not.toHaveBeenCalled();
+    expect(dbExecSpy).not.toHaveBeenCalled();
+    expect(dbPrepareSpy).not.toHaveBeenCalled();
+    expect(doFetchSpy).not.toHaveBeenCalled();
+
+    // Direct DO kick & alarm when disabled also stop any existing alarm and make 0 external calls.
+    const { state: syncState, storage: syncStorage } = createFakeDOState();
+    await syncStorage.setAlarm(Date.now() + 5_000);
+    const syncDo = new NarraMatrixSync(syncState, env, {
+      spec: TEST_SPEC,
+      fetchImpl: fetchSpy as unknown as typeof fetch,
+    });
+    const kickDoRes = await (await syncDo.fetch(new Request('https://narra-sync/kick', { method: 'POST' }))).json();
+    expect(kickDoRes).toEqual({ ok: true, enabled: false, running: false });
+    expect(syncStorage.alarmAt).toBeNull();
+    await syncDo.alarm();
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Room coordinator ignores events and clears alarm when disabled.
+    const { state: roomState, storage: roomStorage } = createFakeDOState();
+    await roomStorage.setAlarm(Date.now() + 5_000);
+    const roomDo = new NarraRoomCoordinator(roomState, env, {
+      spec: TEST_SPEC,
+      fetchImpl: fetchSpy as unknown as typeof fetch,
+    });
+    const evRes = await (
+      await roomDo.fetch(
+        new Request('https://narra-room/events', {
+          method: 'POST',
+          body: JSON.stringify({ roomId: '!r1:netmind.chat', events: [] }),
+        }),
+      )
+    ).json();
+    expect(evRes).toEqual({ ok: true, enabled: false, ignored: true });
+    expect(roomStorage.alarmAt).toBeNull();
+    expect(dbExecSpy).not.toHaveBeenCalled();
+  });
+
+  it('2. BaseNarraMatrixSync: in-memory credentials, /sync + /messages withheld_gap backstop, /matrix ops, and 401 refresh', async () => {
+    let nowMs = 1_760_000_000_000;
+    const NARRA_SECRET = 'narra_tok_super_secret_987';
+    const MATRIX_TOK_1 = 'syt_matrix_first_secret_111';
+    const MATRIX_TOK_2 = 'syt_matrix_refreshed_secret_222';
+    let credCalls = 0;
+    let syncCalls = 0;
+    const matrixCalls: Array<{ url: string; method: string; auth: string; body?: unknown }> = [];
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const method = (init?.method ?? 'GET').toUpperCase();
+      const headers = new Headers(init?.headers);
+      const auth = headers.get('authorization') ?? '';
+
+      if (url.endsWith('/api/agent-runtime/matrix-credential')) {
+        credCalls++;
+        const tok = credCalls === 1 ? MATRIX_TOK_1 : MATRIX_TOK_2;
+        return Response.json({
+          status: 'ok',
+          data: {
+            homeserver_url: 'https://matrix.netmind.chat',
+            matrix_user_id: TEST_SPEC.matrixId,
+            access_token: tok,
+          },
+        });
+      }
+
+      if (url.includes('/api/agent-runtime/chat/rooms')) {
+        return Response.json({
+          status: 'ok',
+          data: {
+            agent: { matrix_user_id: TEST_SPEC.matrixId },
+            rooms: [
+              {
+                room_id: '!grp1:matrix.netmind.chat',
+                conversation_type: 'group',
+                title: 'London Foodies',
+                members: [
+                  { matrix_user_id: '@alice:matrix.netmind.chat', display_name: 'Alice' },
+                  { matrix_user_id: TEST_SPEC.matrixId!, display_name: 'Penny' },
+                ],
+              },
+            ],
+          },
+        });
+      }
+
+      if (url.includes('/_matrix/client/v3/sync')) {
+        syncCalls++;
+        if (syncCalls === 1) {
+          // Initial sync establishes live head without replaying stale history.
+          return Response.json({
+            next_batch: 'b_head_1',
+            rooms: {
+              join: {
+                '!grp1:matrix.netmind.chat': {
+                  timeline: {
+                    events: [
+                      {
+                        event_id: '$old_stale',
+                        sender: '@alice:matrix.netmind.chat',
+                        type: 'm.room.message',
+                        origin_server_ts: nowMs - 60_000,
+                        content: { msgtype: 'm.text', body: 'old message before gateway started' },
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          });
+        }
+        // Incremental sync with withheld_gap (limited: true)
+        return Response.json({
+          next_batch: 'b_head_2',
+          rooms: {
+            join: {
+              '!grp1:matrix.netmind.chat': {
+                timeline: {
+                  limited: true,
+                  prev_batch: 'gap_tok_1',
+                  events: [
+                    {
+                      event_id: '$ev_live',
+                      sender: '@alice:matrix.netmind.chat',
+                      type: 'm.room.message',
+                      origin_server_ts: nowMs,
+                      content: { msgtype: 'm.text', body: '@Penny split £40' },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        });
+      }
+
+      if (url.includes('/messages?')) {
+        // Matrix /messages?dir=b returns newest-first; fetchRoomMessagesBackstop reverses to oldest-first.
+        return Response.json({
+          chunk: [
+            {
+              // Duplicate of live sync event -> must be deduped!
+              event_id: '$ev_live',
+              sender: '@alice:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: { msgtype: 'm.text', body: '@Penny split £40' },
+            },
+            {
+              event_id: '$ev_gap_recovered',
+              sender: '@alice:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs - 1_000,
+              content: { msgtype: 'm.text', body: 'Here is the receipt!' },
+            },
+          ],
+        });
+      }
+
+      if (url.includes('/_matrix/client/v3/rooms/')) {
+        matrixCalls.push({
+          url,
+          method,
+          auth,
+          body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        });
+        if (url.includes('/event/%24old_parent')) {
+          return Response.json({
+            event_id: '$old_parent',
+            sender: '@bob:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs - 5_000,
+            content: { msgtype: 'm.text', body: 'Parent text here' },
+          });
+        }
+        if (url.includes('/typing/') || url.includes('/receipt/')) {
+          return Response.json({});
+        }
+        if (url.includes('/send/') && auth === `Bearer ${MATRIX_TOK_1}` && matrixCalls.length === 1) {
+          return Response.json({ errcode: 'M_UNKNOWN_TOKEN' }, { status: 401 });
+        }
+        return Response.json({ event_id: '$posted_1' });
+      }
+
+      return new Response('not found', { status: 404 });
+    });
+
+    const deliveredToRoom: Array<{ roomId: string; events: InboundEvent[]; chatType?: string; roomName?: string }> = [];
+    const roomHandle = createFakeNamespace((_ctx) => ({
+      async fetch(req: Request) {
+        const body = (await req.json()) as {
+          roomId: string;
+          events: InboundEvent[];
+          chatType?: string;
+          roomName?: string;
+        };
+        deliveredToRoom.push(body);
+        return Response.json({ ok: true });
+      },
+    }));
+
+    let env!: NarraGatewayEnv;
+    const syncHandle = createFakeNamespace(
+      (ctx) =>
+        new BaseNarraMatrixSync(ctx, env, {
+          spec: TEST_SPEC,
+          fetchImpl: fetchMock as unknown as typeof fetch,
+          now: () => nowMs,
+        }),
+    );
+
+    env = {
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'on',
+      NARRA_AGENT_TOKEN: NARRA_SECRET,
+      NARRA_SYNC_DO: syncHandle.namespace,
+      NARRA_ROOM_DO: roomHandle.namespace,
+    };
+
+    const syncStub = syncHandle.namespace.get(syncHandle.namespace.idFromName('narra'));
+    const kickRes = await (await syncStub.fetch('https://narra-sync/kick', { method: 'POST' })).json();
+    expect(kickRes).toEqual({ ok: true, enabled: true, running: true });
+
+    const syncDo = syncHandle.instances.get('narra')!;
+    // Alarm 1: initial sync establishes head, forwards 0 old messages
+    await syncDo.instance.alarm();
+    expect(deliveredToRoom).toHaveLength(0);
+    // Alarm 2: incremental sync with limited=true triggers /messages backstop and dedupes $ev_live
+    await syncDo.instance.alarm();
+    expect(deliveredToRoom).toHaveLength(1);
+    expect(deliveredToRoom[0].chatType).toBe('group');
+    expect(deliveredToRoom[0].roomName).toBe('London Foodies');
+    expect(deliveredToRoom[0].events.map((e) => e.eventId)).toEqual([
+      '$ev_gap_recovered',
+      '$ev_live',
+    ]);
+
+    // Test /matrix send (401 auto-refreshes login once and succeeds), edit, typing, receipt, fetchEvent
+    const sendRes = await (
+      await syncStub.fetch('https://narra-sync/matrix', {
+        method: 'POST',
+        body: JSON.stringify({
+          op: 'send',
+          roomId: '!grp1:matrix.netmind.chat',
+          txnId: 'txn_1',
+          content: { msgtype: 'm.text', body: 'Hello!' },
+        }),
+      })
+    ).json();
+    expect(sendRes).toEqual({ ok: true, eventId: '$posted_1' });
+    expect(credCalls).toBe(2);
+
+    const editRes = await (
+      await syncStub.fetch('https://narra-sync/matrix', {
+        method: 'POST',
+        body: JSON.stringify({
+          op: 'edit',
+          roomId: '!grp1:matrix.netmind.chat',
+          eventId: '$posted_1',
+          text: 'Updated!',
+          txnId: 'txn_edit_1',
+        }),
+      })
+    ).json();
+    expect(editRes).toEqual({ ok: true, eventId: '$posted_1' });
+
+    const typingRes = await (
+      await syncStub.fetch('https://narra-sync/matrix', {
+        method: 'POST',
+        body: JSON.stringify({ op: 'typing', roomId: '!grp1:matrix.netmind.chat', typing: true }),
+      })
+    ).json();
+    expect(typingRes).toEqual({ ok: true });
+
+    const receiptRes = await (
+      await syncStub.fetch('https://narra-sync/matrix', {
+        method: 'POST',
+        body: JSON.stringify({ op: 'receipt', roomId: '!grp1:matrix.netmind.chat', eventId: '$ev_live' }),
+      })
+    ).json();
+    expect(receiptRes).toEqual({ ok: true });
+
+    const fetchEvRes = (await (
+      await syncStub.fetch('https://narra-sync/matrix', {
+        method: 'POST',
+        body: JSON.stringify({ op: 'fetchEvent', roomId: '!grp1:matrix.netmind.chat', eventId: '$old_parent' }),
+      })
+    ).json()) as { ok: boolean; event?: InboundEvent };
+    expect(fetchEvRes.ok).toBe(true);
+    expect(fetchEvRes.event?.text).toBe('Parent text here');
+
+    // Verify DO storage NEVER persisted accessToken or NARRA_AGENT_TOKEN!
+    const serializedStorage = JSON.stringify([...syncDo.storage.data.entries()]);
+    expect(serializedStorage).not.toContain(NARRA_SECRET);
+    expect(serializedStorage).not.toContain(MATRIX_TOK_1);
+    expect(serializedStorage).not.toContain(MATRIX_TOK_2);
+
+    // Optional MATRIX_ACCESS_TOKEN works directly without hitting matrix-credential
+    const { state: directState, storage: directStorage } = createFakeDOState();
+    let directCredCalls = 0;
+    const directSync = new NarraMatrixSync(
+      directState,
+      {
+        NARRA_GATEWAY_ENABLED: 'on',
+        NARRA_SYNC: 'on',
+        NARRA_AGENT_TOKEN: NARRA_SECRET,
+        MATRIX_ACCESS_TOKEN: 'syt_direct_override_tok',
+      },
+      {
+        spec: TEST_SPEC,
+        fetchImpl: (async (input: RequestInfo | URL) => {
+          const u = typeof input === 'string' ? input : input.toString();
+          if (u.includes('matrix-credential')) directCredCalls++;
+          return Response.json({ event_id: '$direct_1' });
+        }) as unknown as typeof fetch,
+      },
+    );
+    const directSend = await (
+      await directSync.fetch(
+        new Request('https://narra-sync/matrix', {
+          method: 'POST',
+          body: JSON.stringify({
+            op: 'send',
+            roomId: '!grp1:matrix.netmind.chat',
+            content: { msgtype: 'm.text', body: 'hi' },
+          }),
+        }),
+      )
+    ).json();
+    expect(directSend).toEqual({ ok: true, eventId: '$direct_1' });
+    expect(directCredCalls).toBe(0);
+    expect(JSON.stringify([...directStorage.data.entries()])).not.toContain('syt_direct_override_tok');
+  });
+
+  it('3. BaseNarraRoomCoordinator: 1.8s debounce, m.replace edit, redaction cancel, smart quoting & parent hydration', async () => {
+    let nowMs = 1_760_000_000_000;
+    const db = createD1();
+    const sentMessages: Array<{ roomId: string; content: Record<string, unknown> }> = [];
+    const matrixOps: string[] = [];
+    const fastEnvelopes: string[] = [];
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith('/api/agent-runtime/matrix-credential')) {
+        return Response.json({
+          status: 'ok',
+          data: {
+            homeserver_url: 'https://matrix.netmind.chat',
+            matrix_user_id: TEST_SPEC.matrixId,
+            access_token: 'syt_room_test_token',
+          },
+        });
+      }
+      if (url.includes('/_matrix/client/v3/rooms/') && url.includes('/receipt/')) {
+        matrixOps.push('receipt');
+        return Response.json({});
+      }
+      if (url.includes('/_matrix/client/v3/rooms/') && url.includes('/typing/')) {
+        const parsed = JSON.parse(String(init?.body ?? '{}')) as { typing?: boolean };
+        matrixOps.push(parsed.typing ? 'typing:on' : 'typing:off');
+        return Response.json({});
+      }
+      if (url.includes('/_matrix/client/v3/rooms/') && url.includes('/event/%24older_parent')) {
+        matrixOps.push('fetchEvent');
+        return Response.json({
+          event_id: '$older_parent',
+          sender: '@bob:matrix.netmind.chat',
+          type: 'm.room.message',
+          origin_server_ts: nowMs - 10_000,
+          content: { msgtype: 'm.text', body: 'Bob paid £90 for ramen earlier' },
+        });
+      }
+      if (url.includes('/_matrix/client/v3/rooms/') && url.includes('/send/')) {
+        matrixOps.push('send');
+        const content = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        sentMessages.push({ roomId: '!grp_deb:matrix.netmind.chat', content });
+        return Response.json({ event_id: `$reply_${sentMessages.length}` });
+      }
+      if (url === 'https://a2a.example.test/rpc') {
+        const reqBody = JSON.parse(String(init?.body ?? '{}')) as {
+          params: { message: { parts: Array<{ text: string }> } };
+        };
+        fastEnvelopes.push(reqBody.params.message.parts[0].text);
+        return makeSseResponse(
+          'Thought: internal reasoning\nGot it [@Alice](@alice:matrix.netmind.chat) and @Penny split with [View ledger](https://app.manyfold.ai/l/123)!',
+        );
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    const gatewayConfig: NarraGatewayConfig<NarraGatewayEnv> = {
+      spec: TEST_SPEC,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      now: () => nowMs,
+      sleep: async () => undefined,
+      resolveA2ACredential: async () => ({
+        url: 'https://a2a.example.test/rpc',
+        token: 'a2a_secret_token_xyz',
+      }),
+    };
+
+    const gw = createNarraWorkerGateway(gatewayConfig);
+    let env!: NarraGatewayEnv;
+    const syncHandle = createFakeNamespace((ctx) => new gw.BaseNarraMatrixSync(ctx, env));
+    const roomHandle = createFakeNamespace((ctx) => new gw.BaseNarraRoomCoordinator(ctx, env));
+
+    env = {
+      DB: db,
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'on',
+      NARRA_AGENT_TOKEN: 'narra_secret_room_test',
+      NARRA_SYNC_DO: syncHandle.namespace,
+      NARRA_ROOM_DO: roomHandle.namespace,
+    };
+
+    const roomId = '!grp_deb:matrix.netmind.chat';
+    const roomStub = roomHandle.namespace.get(roomHandle.namespace.idFromName(roomId));
+
+    // A) Burst coalesce 2 fragments + m.replace edit before 1.8s elapses
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        chatType: 'group',
+        members: [
+          { matrixId: '@alice:matrix.netmind.chat', displayName: 'Alice', isAgent: false },
+          { matrixId: '@bob:matrix.netmind.chat', displayName: 'Bob', isAgent: false },
+          { matrixId: TEST_SPEC.matrixId!, displayName: 'Penny', isAgent: true },
+        ],
+        events: [
+          {
+            event_id: '$frag1',
+            sender: '@alice:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: {
+              msgtype: 'm.text',
+              body: '@Penny split that bill',
+              'm.mentions': { user_ids: [TEST_SPEC.matrixId!] },
+            },
+          },
+        ],
+      }),
+    });
+
+    nowMs += 500;
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        events: [
+          {
+            event_id: '$frag2',
+            sender: '@alice:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: {
+              msgtype: 'm.text',
+              body: '3 ways',
+              'm.relates_to': { 'm.in_reply_to': { event_id: '$older_parent' } },
+            },
+          },
+        ],
+      }),
+    });
+
+    nowMs += 300;
+    // Edit frag2 from "3 ways" to "4 ways" before flush
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        events: [
+          {
+            event_id: '$edit_frag2',
+            sender: '@alice:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: {
+              msgtype: 'm.text',
+              body: '* 4 ways',
+              'm.new_content': { msgtype: 'm.text', body: '4 ways' },
+              'm.relates_to': { rel_type: 'm.replace', event_id: '$frag2' },
+            },
+          },
+        ],
+      }),
+    });
+
+    const roomDo = roomHandle.instances.get(roomId)!;
+    // Alarm shouldn't fire early: still buffered
+    expect(roomDo.storage.alarmAt).toBe(nowMs - 300 + 1800);
+    await roomDo.instance.alarm();
+    expect(sentMessages).toHaveLength(0);
+
+    // Advance past 1.8s debounce -> flushes merged burst, hydrates $older_parent, sends receipt+typing, sanitizes & posts!
+    nowMs += 1800;
+    await roomDo.instance.alarm();
+    expect(sentMessages).toHaveLength(1);
+    expect(fastEnvelopes[0]).toContain('@Penny split that bill\n4 ways');
+    expect(fastEnvelopes[0]).toContain('in_reply_to_other: "@bob:matrix.netmind.chat: Bob paid £90 for ramen earlier"');
+    expect(matrixOps).toContain('receipt');
+    expect(matrixOps).toContain('typing:on');
+    expect(matrixOps).toContain('typing:off');
+    expect(matrixOps).toContain('fetchEvent');
+
+    const sent1 = sentMessages[0].content;
+    expect(String(sent1.body)).not.toContain('Thought:');
+    expect(String(sent1.body)).toContain('View ledger: https://app.manyfold.ai/l/123');
+    expect((sent1['m.mentions'] as { user_ids?: string[] }).user_ids).toEqual(['@alice:matrix.netmind.chat']);
+    // Latest human message -> NO m.in_reply_to quote!
+    expect(sent1['m.relates_to']).toBeUndefined();
+
+    // B) Redaction cancels a buffered message before flush
+    nowMs += 5_000;
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        events: [
+          {
+            event_id: '$to_redact',
+            sender: '@alice:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: { msgtype: 'm.text', body: '@Penny wait ignore this' },
+          },
+        ],
+      }),
+    });
+    nowMs += 200;
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        events: [
+          {
+            event_id: '$redaction_1',
+            sender: '@alice:matrix.netmind.chat',
+            type: 'm.room.redaction',
+            redacts: '$to_redact',
+            origin_server_ts: nowMs,
+            content: {},
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    await roomDo.instance.alarm();
+    expect(sentMessages).toHaveLength(1);
+
+    // C) Smart quoting: when another human intervenes after Alice's question, Penny quotes Alice's message!
+    nowMs += 5_000;
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        events: [
+          {
+            event_id: '$alice_q',
+            sender: '@alice:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: {
+              msgtype: 'm.text',
+              body: '@Penny how much do I owe?',
+              'm.mentions': { user_ids: [TEST_SPEC.matrixId!] },
+            },
+          },
+        ],
+      }),
+    });
+    nowMs += 300;
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        events: [
+          {
+            event_id: '$bob_intervened',
+            sender: '@bob:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: { msgtype: 'm.text', body: 'haha nice' },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    await roomDo.instance.alarm();
+    expect(sentMessages).toHaveLength(2);
+    expect(sentMessages[1].content['m.relates_to']).toEqual({
+      'm.in_reply_to': { event_id: '$alice_q' },
+    });
+  });
+
+  it('4. 3-min activeSession, D1 3-layer MemoryStore lazy init & DM isolation, fastRespond + A2A fallback, silence, and Synapse 403 retry schedule', async () => {
+    let nowMs = 1_760_100_000_000;
+    const db = createD1();
+    const NARRA_SECRET = 'narra_tok_session_456';
+
+    // Ensure D1 has NO tables yet until gateway processes an enabled event!
+    const tablesBefore = await db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+      .all<{ name: string }>();
+    expect(tablesBefore.results ?? []).toHaveLength(0);
+
+    let sendAttempts = 0;
+    let a2aCalls = 0;
+    const postedBodies: string[] = [];
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith('/api/agent-runtime/chat/send')) {
+        sendAttempts++;
+        const payload = JSON.parse(String(init?.body ?? '{}')) as { text: string; txn_id: string };
+        // Simulate Synapse 403 agent_chain_exhausted twice before succeeding on 3rd attempt
+        if (sendAttempts <= 2) {
+          return Response.json(
+            {
+              status: 'error',
+              narra_error_code: 'agent_chain_exhausted',
+              issues: [{ code: 'agent_chain_exhausted' }],
+            },
+            { status: 403 },
+          );
+        }
+        postedBodies.push(payload.text);
+        return Response.json({ status: 'ok', data: { event_id: `$chat_ev_${postedBodies.length}` } });
+      }
+      if (url === 'https://a2a.example.test/rpc') {
+        a2aCalls++;
+        return makeSseResponse(`A2A fallback reply #${a2aCalls}`);
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    const fastModes: string[] = [];
+    const gateway = createNarraWorkerGateway({
+      spec: TEST_SPEC,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      now: () => nowMs,
+      sleep: async () => undefined,
+      fastRespond: async (_env, event, decision, memories) => {
+        fastModes.push(`${decision.reason}:${memories.userMemories.map((m) => m.key).join(',')}`);
+        if (event.text.includes('be silent')) return '[NO_REPLY]';
+        if (event.text.includes('use a2a')) return null; // trigger A2A fallback
+        return `Fast answer in ${decision.detectedLang}`;
+      },
+      resolveA2ACredential: async () => ({
+        url: 'https://a2a.example.test/rpc',
+        token: 'a2a_secret_retry_test',
+      }),
+    });
+
+    let env!: NarraGatewayEnv;
+    const roomHandle = createFakeNamespace((ctx) => new gateway.BaseNarraRoomCoordinator(ctx, env));
+    env = {
+      DB: db,
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'off', // exercises Narra chat/send fallback + 403 retry schedule
+      NARRA_AGENT_TOKEN: NARRA_SECRET,
+      NARRA_ROOM_DO: roomHandle.namespace,
+    };
+
+    // 1) DM room initializes D1 schema lazily & stores private DM user memory
+    const dmStub = roomHandle.namespace.get(roomHandle.namespace.idFromName('!dm_alice:matrix.netmind.chat'));
+    await dmStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId: '!dm_alice:matrix.netmind.chat',
+        chatType: 'dm',
+        events: [
+          {
+            event_id: '$dm_1',
+            sender: '@alice:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: { msgtype: 'm.text', body: 'Hi use a2a please' },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    // Run alarm -> hits 403 twice (`+15_000`ms then `+45_000`ms), without re-calling A2A!
+    const dmDo = roomHandle.instances.get('!dm_alice:matrix.netmind.chat')!;
+    await dmDo.instance.alarm();
+    expect(a2aCalls).toBe(1);
+    expect(dmDo.storage.alarmAt).toBe(nowMs + 15_000);
+
+    nowMs += 15_000;
+    await dmDo.instance.alarm();
+    expect(a2aCalls).toBe(1); // answer cached -> NOT re-billed!
+    expect(dmDo.storage.alarmAt).toBe(nowMs + 45_000);
+
+    nowMs += 45_000;
+    await dmDo.instance.alarm();
+    expect(a2aCalls).toBe(1);
+    expect(postedBodies).toEqual(['A2A fallback reply #1']);
+
+    // Verify D1 schemas were created lazily and store private DM memory vs group memory!
+    const memory = new MemoryStore(db, TEST_SPEC.id);
+    await memory.rememberUser({
+      userId: '@alice:matrix.netmind.chat',
+      key: 'private_salary',
+      value: '£120k',
+      originChatType: 'dm',
+      originRoomId: '!dm_alice:matrix.netmind.chat',
+    });
+    await memory.rememberUser({
+      userId: '@alice:matrix.netmind.chat',
+      key: 'group_currency',
+      value: 'GBP',
+      originChatType: 'group',
+      originRoomId: '!grp_sess:matrix.netmind.chat',
+    });
+
+    // 2) Group room: DM memory MUST NOT leak into group fastRespond/envelope; 3-min activeSession works!
+    const grpId = '!grp_sess:matrix.netmind.chat';
+    const grpStub = roomHandle.namespace.get(roomHandle.namespace.idFromName(grpId));
+
+    await grpStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId: grpId,
+        chatType: 'group',
+        events: [
+          {
+            event_id: '$g_1',
+            sender: '@alice:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: {
+              msgtype: 'm.text',
+              body: '@Penny hello',
+              'm.mentions': { user_ids: [TEST_SPEC.matrixId!] },
+            },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    const grpDo = roomHandle.instances.get(grpId)!;
+    await grpDo.instance.alarm();
+    expect(postedBodies).toHaveLength(2);
+    expect(fastModes.at(-1)).toBe('explicit_mention:group_currency'); // NO private_salary!
+
+    // Unmentioned follow-up 90s later (< 3 min) triggers via activeSession!
+    nowMs += 90_000;
+    await grpStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId: grpId,
+        events: [
+          {
+            event_id: '$g_followup',
+            sender: '@alice:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: { msgtype: 'm.text', body: 'actually make that two' },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    await grpDo.instance.alarm();
+    expect(postedBodies).toHaveLength(3);
+    expect(fastModes.at(-1)).toBe('active_session:group_currency');
+
+    // Silent [NO_REPLY] does not post
+    nowMs += 5_000;
+    await grpStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId: grpId,
+        events: [
+          {
+            event_id: '$g_silent',
+            sender: '@alice:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: { msgtype: 'm.text', body: '@Penny be silent' },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    await grpDo.instance.alarm();
+    expect(postedBodies).toHaveLength(3);
+
+    // After 4 minutes (> 3 min), unmentioned chatter does NOT trigger activeSession!
+    nowMs += 4 * 60_000;
+    await grpStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId: grpId,
+        events: [
+          {
+            event_id: '$g_chatter',
+            sender: '@alice:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: { msgtype: 'm.text', body: 'weather is nice today' },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    await grpDo.instance.alarm();
+    expect(postedBodies).toHaveLength(3);
+  });
+
+  it('5. kickNarraGateway staggered broadcast, D1 dedupe, agent-only skip & zero secret leakage in getNarraGatewayStatus', async () => {
+    const db = createD1();
+    const roomMatch = '!bcast_match:matrix.netmind.chat';
+    const roomOutside = '!bcast_outside:matrix.netmind.chat';
+    const roomAgentOnly = '!bcast_agents:matrix.netmind.chat';
+
+    const matchMinute = staggerWindowMinute(TEST_SPEC.id, roomMatch, 60);
+    // Pick a UTC timestamp right on matchMinute
+    const baseDate = new Date('2026-11-19T12:00:00.000Z');
+    baseDate.setUTCMinutes(matchMinute, 0, 0);
+    const nowMs = baseDate.getTime();
+
+    // Pick a roomId whose stagger slot is deterministically outside matchMinute's 5-min window
+    let roomOutsideName = roomOutside;
+    for (let i = 0; i < 200; i++) {
+      const candidate = `!bcast_outside_${i}:matrix.netmind.chat`;
+      const slot = staggerWindowMinute(TEST_SPEC.id, candidate, 60);
+      if ((matchMinute - slot + 60) % 60 >= 10) {
+        roomOutsideName = candidate;
+        break;
+      }
+    }
+    const outsideSlot = staggerWindowMinute(TEST_SPEC.id, roomOutsideName, 60);
+    expect((matchMinute - outsideSlot + 60) % 60).toBeGreaterThanOrEqual(5);
+
+    const NARRA_SECRET = 'narra_tok_top_secret_leak_check';
+    const MATRIX_SECRET = 'syt_matrix_top_secret_leak_check';
+    const A2A_SECRET = 'a2a_top_secret_leak_check';
+    const sentBroadcasts: Array<{ roomId: string; body: string }> = [];
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith('/api/agent-runtime/matrix-credential')) {
+        return Response.json({
+          status: 'ok',
+          data: {
+            homeserver_url: 'https://matrix.netmind.chat',
+            matrix_user_id: TEST_SPEC.matrixId,
+            access_token: MATRIX_SECRET,
+          },
+        });
+      }
+      if (url.includes('/_matrix/client/v3/rooms/') && url.includes('/send/')) {
+        const roomEncoded = url.split('/rooms/')[1].split('/send/')[0];
+        const content = JSON.parse(String(init?.body ?? '{}')) as { body: string };
+        sentBroadcasts.push({ roomId: decodeURIComponent(roomEncoded), body: content.body });
+        return Response.json({ event_id: `$bc_${sentBroadcasts.length}` });
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    const updates: AgentUpdateItem[] = [
+      {
+        updateKey: 'upd_1',
+        roomId: roomMatch,
+        text: 'Check summary at [Ledger](https://app.manyfold.ai/r/1)',
+      },
+      {
+        updateKey: 'upd_2',
+        roomId: roomOutsideName,
+        text: 'Outside stagger window item',
+      },
+      {
+        updateKey: 'upd_3',
+        roomId: roomAgentOnly,
+        text: 'Should skip agent-only room',
+      },
+    ];
+
+    // Custom subclassing pattern (matches consumer Worker static DO export)
+    let env!: NarraGatewayEnv;
+    const cfg: NarraGatewayConfig<NarraGatewayEnv> = {
+      spec: TEST_SPEC,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      now: () => nowMs,
+      fetchUpdates: async () => updates,
+    };
+
+    class LocalSync extends BaseNarraMatrixSync<NarraGatewayEnv> {
+      constructor(ctx: DurableObjectState, e: NarraGatewayEnv) {
+        super(ctx, e, cfg);
+      }
+    }
+    class LocalRoom extends BaseNarraRoomCoordinator<NarraGatewayEnv> {
+      constructor(ctx: DurableObjectState, e: NarraGatewayEnv) {
+        super(ctx, e, cfg);
+      }
+    }
+
+    const syncHandle = createFakeNamespace((ctx) => new LocalSync(ctx, env));
+    const roomHandle = createFakeNamespace((ctx) => new LocalRoom(ctx, env));
+
+    env = {
+      DB: db,
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'on',
+      NARRA_AGENT_TOKEN: NARRA_SECRET,
+      MATRIX_ACCESS_TOKEN: MATRIX_SECRET,
+      MANYFOLD_A2A_TOKEN: A2A_SECRET,
+      NARRA_SYNC_DO: syncHandle.namespace,
+      NARRA_ROOM_DO: roomHandle.namespace,
+    };
+
+    // Pre-populate agent-only room with 2 trailing @agent-* turns
+    const agentRoomStub = roomHandle.namespace.get(roomHandle.namespace.idFromName(roomAgentOnly));
+    await agentRoomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId: roomAgentOnly,
+        chatType: 'group',
+        events: [
+          {
+            event_id: '$bot_a',
+            sender: '@agent-1111aaaa:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs - 2_000,
+            content: { msgtype: 'm.text', body: 'Bot 1 spoke' },
+          },
+          {
+            event_id: '$bot_b',
+            sender: '@agent-2222bbbb:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs - 1_000,
+            content: { msgtype: 'm.text', body: 'Bot 2 spoke' },
+          },
+        ],
+      }),
+    });
+
+    // Ensure sync DO tracks roomMatch in roomIds so status includes it
+    const syncDo = syncHandle.namespace.get(syncHandle.namespace.idFromName('narra'));
+    await syncDo.fetch('https://narra-sync/kick', { method: 'POST' });
+    await syncHandle.instances.get('narra')!.storage.put('roomIds', [roomMatch, roomAgentOnly]);
+
+    const kick1 = await kickNarraGateway(env, cfg);
+    expect(kick1.enabled).toBe(true);
+    expect(kick1.syncKicked).toBe(true);
+    expect(kick1.syncRunning).toBe(true);
+    expect(kick1.broadcast?.sent).toHaveLength(1);
+    expect(kick1.broadcast?.sent[0].roomId).toBe(roomMatch);
+    expect(sentBroadcasts).toEqual([
+      { roomId: roomMatch, body: 'Check summary at Ledger: https://app.manyfold.ai/r/1' },
+    ]);
+    expect(kick1.broadcast?.skipped).toEqual(
+      expect.arrayContaining([
+        { roomId: roomOutsideName, updateKey: 'upd_2', reason: 'outside_stagger_window' },
+      ]),
+    );
+
+    // Second kick dedupes upd_1 via D1 narra_broadcast_log
+    const kick2 = await kickNarraGateway(env, cfg);
+    expect(kick2.broadcast?.sent).toHaveLength(0);
+    expect(kick2.broadcast?.skipped).toEqual(
+      expect.arrayContaining([
+        { roomId: roomMatch, updateKey: 'upd_1', reason: 'duplicate_update_key' },
+      ]),
+    );
+
+    // Status JSON NEVER leaks any token/secret!
+    const status = await getNarraGatewayStatus(env, cfg);
+    expect(status.enabled).toBe(true);
+    expect(status.syncEnabled).toBe(true);
+    expect(status.config.hasNarraAgentToken).toBe(true);
+    expect(status.config.hasMatrixAccessToken).toBe(true);
+    expect(status.rooms[roomAgentOnly]).toBeDefined();
+
+    const statusJson = JSON.stringify(status);
+    expect(statusJson).not.toContain(NARRA_SECRET);
+    expect(statusJson).not.toContain(MATRIX_SECRET);
+    expect(statusJson).not.toContain(A2A_SECRET);
+
+    // Also verify pluggable TriageModel hook works inside RoomCoordinator
+    let triageCalled = false;
+    const customTriage: TriageModel = {
+      name: 'mock-triage',
+      async score() {
+        triageCalled = true;
+        return { score: 0.9, reason: 'custom_triage_hit' };
+      },
+    };
+    const { state: triState } = createFakeDOState();
+    const triRoom = new NarraRoomCoordinator(triState, env, {
+      spec: { ...TEST_SPEC, silenceThreshold: 0.8 },
+      triageModel: () => customTriage,
+      fastRespond: async (_e, _ev, decision) => `triage=${decision.reason}`,
+      now: () => nowMs,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+    await triRoom.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId: roomMatch,
+          chatType: 'group',
+          events: [
+            {
+              event_id: '$tri_1',
+              sender: '@alice:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: { msgtype: 'm.text', body: 'unrelated words' },
+            },
+          ],
+        }),
+      }),
+    );
+    await triRoom.alarm();
+    expect(triageCalled).toBe(false); // still buffered at t=nowMs
+    const triCfgRoom = new NarraRoomCoordinator(triState, env, {
+      spec: { ...TEST_SPEC, silenceThreshold: 0.8 },
+      triageModel: () => customTriage,
+      fastRespond: async (_e, _ev, decision) => `triage=${decision.reason}`,
+      now: () => nowMs + 2_000,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+    await triCfgRoom.alarm();
+    expect(triageCalled).toBe(true);
+  });
+
+  it('6. polite yield on peer answer, @agent-* never @mentioned, DO hibernation survival, and 3rd 403 retry (+120s)', async () => {
+    let nowMs = 1_760_200_000_000;
+    const db = createD1();
+    const sentPayloads: Array<Record<string, unknown>> = [];
+    let sendCount = 0;
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith('/api/agent-runtime/matrix-credential')) {
+        return Response.json({
+          status: 'ok',
+          data: {
+            homeserver_url: 'https://matrix.netmind.chat',
+            matrix_user_id: TEST_SPEC.matrixId,
+            access_token: 'syt_yield_tok',
+          },
+        });
+      }
+      if (url.includes('/typing/') || url.includes('/receipt/')) {
+        return Response.json({});
+      }
+      if (url.includes('/send/')) {
+        sendCount++;
+        // First 3 attempts hit Synapse 403 agent_chain_exhausted (15s, 45s, 120s), 4th succeeds!
+        if (sendCount <= 3) {
+          return Response.json({ errcode: 'M_FORBIDDEN', narra_error_code: 'agent_chain_exhausted' }, { status: 403 });
+        }
+        const content = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        sentPayloads.push(content);
+        return Response.json({ event_id: `$sent_ok_${sentPayloads.length}` });
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    const gateway = createNarraWorkerGateway({
+      spec: { ...TEST_SPEC, politeYieldDelayMs: 25 },
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      now: () => nowMs,
+      sleep: async (ms) => {
+        nowMs += ms;
+      },
+      fastRespond: async () =>
+        'Hey [@Alice](@alice:matrix.netmind.chat) and [@QuidPaw](@agent-2222bbbb:matrix.netmind.chat), got your split!',
+    });
+
+    let env!: NarraGatewayEnv;
+    const syncHandle = createFakeNamespace((ctx) => new gateway.BaseNarraMatrixSync(ctx, env));
+    const roomHandle = createFakeNamespace((ctx) => new gateway.BaseNarraRoomCoordinator(ctx, env));
+
+    env = {
+      DB: db,
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'on',
+      NARRA_AGENT_TOKEN: 'narra_tok_yield_test',
+      NARRA_SYNC_DO: syncHandle.namespace,
+      NARRA_ROOM_DO: roomHandle.namespace,
+    };
+
+    const roomId = '!grp_yield:matrix.netmind.chat';
+    let roomStub = roomHandle.namespace.get(roomHandle.namespace.idFromName(roomId));
+
+    // 1. Polite yield: unmentioned domain hit when peer @agent-* is present and already replied after event
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        chatType: 'group',
+        members: [
+          { matrixId: '@alice:matrix.netmind.chat', displayName: 'Alice', isAgent: false },
+          { matrixId: '@agent-2222bbbb:matrix.netmind.chat', displayName: 'QuidPaw', isAgent: true },
+          { matrixId: TEST_SPEC.matrixId!, displayName: 'Penny', isAgent: true },
+        ],
+        events: [
+          {
+            event_id: '$u_domain',
+            sender: '@alice:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: { msgtype: 'm.text', body: 'Who paid for the split expense?' },
+          },
+          {
+            event_id: '$peer_replied',
+            sender: '@agent-2222bbbb:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs + 100,
+            content: { msgtype: 'm.text', body: 'Already answered!' },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    await roomHandle.instances.get(roomId)!.instance.alarm();
+    expect(sendCount).toBe(0);
+
+    // 2. Explicit mention -> 3x Synapse 403 retries across DO hibernation evictions (+15s, +45s, +120s),
+    //    and output mentions ONLY @alice (never @agent-2222bbbb)!
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        events: [
+          {
+            event_id: '$m_direct',
+            sender: '@alice:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: {
+              msgtype: 'm.text',
+              body: '@Penny summarize this',
+              'm.mentions': { user_ids: [TEST_SPEC.matrixId!] },
+            },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    await roomHandle.instances.get(roomId)!.instance.alarm();
+    expect(roomHandle.instances.get(roomId)!.storage.alarmAt).toBe(nowMs + 15_000);
+
+    // Simulate DO hibernation/eviction between retries
+    roomHandle.resetInstances();
+    syncHandle.resetInstances();
+
+    nowMs += 15_000;
+    roomStub = roomHandle.namespace.get(roomHandle.namespace.idFromName(roomId));
+    await roomStub.fetch('https://narra-room/status'); // instantiate fresh DO from storage
+    await roomHandle.instances.get(roomId)!.instance.alarm();
+    expect(roomHandle.instances.get(roomId)!.storage.alarmAt).toBe(nowMs + 45_000);
+
+    nowMs += 45_000;
+    await roomHandle.instances.get(roomId)!.instance.alarm();
+    expect(roomHandle.instances.get(roomId)!.storage.alarmAt).toBe(nowMs + 120_000);
+
+    nowMs += 120_000;
+    await roomHandle.instances.get(roomId)!.instance.alarm();
+    expect(sentPayloads).toHaveLength(1);
+    expect(sentPayloads[0].body).toBe('Hey @Alice and QuidPaw, got your split!');
+    expect((sentPayloads[0]['m.mentions'] as { user_ids?: string[] }).user_ids).toEqual([
+      '@alice:matrix.netmind.chat',
+    ]);
+  });
+});
