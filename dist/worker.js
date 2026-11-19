@@ -439,12 +439,14 @@ export class BaseNarraMatrixSync {
             }
             const members = [...memberMap.values()];
             const inferredChatType = existing?.chatType ?? (members.length === 2 && !roomName ? 'dm' : 'group');
+            const isProvisional = existing ? Boolean(existing.provisional) : true;
             await this.ctx.storage.put(`roomMeta:${roomId}`, {
                 roomId,
                 ...(roomName ? { roomName } : {}),
                 chatType: inferredChatType,
                 members,
                 updatedAtMs: nowMs,
+                ...(isProvisional ? { provisional: true } : {}),
             });
         }
         await this.ctx.storage.put('roomIds', [...knownRoomIds].slice(-100));
@@ -452,10 +454,10 @@ export class BaseNarraMatrixSync {
     async refreshNarraRoomsMeta(nowMs, force = false) {
         const lastRefreshed = (await this.ctx.storage.get('roomsMetaRefreshedAt')) ?? 0;
         if (!force && nowMs - lastRefreshed < ROOM_META_REFRESH_MS)
-            return;
+            return false;
         const token = (this.env.NARRA_AGENT_TOKEN ?? '').trim();
         if (!token)
-            return;
+            return false;
         const cfg = this.getConfig();
         const doFetch = cfg.fetchImpl ?? fetch;
         try {
@@ -467,11 +469,11 @@ export class BaseNarraMatrixSync {
                 signal: AbortSignal.timeout(10_000),
             });
             if (!res.ok)
-                return;
+                return false;
             const body = (await res.json().catch(() => null));
             const data = (body && typeof body.data === 'object' && body.data ? body.data : body);
             if (!data)
-                return;
+                return false;
             const agent = (data.agent ?? {});
             if (typeof agent.matrix_user_id === 'string' && agent.matrix_user_id.startsWith('@')) {
                 await this.ctx.storage.put('matrixUserId', agent.matrix_user_id);
@@ -506,9 +508,11 @@ export class BaseNarraMatrixSync {
             }
             await this.ctx.storage.put('roomIds', [...roomIds].slice(-100));
             await this.ctx.storage.put('roomsMetaRefreshedAt', nowMs);
+            return true;
         }
         catch {
             // Non-fatal: sync falls back cleanly to /sync m.room.member state events.
+            return false;
         }
     }
     async fetch(request) {
@@ -581,14 +585,20 @@ export class BaseNarraMatrixSync {
                     cfg.spec.matrixId;
                 if (this.env.NARRA_ROOM_DO) {
                     let forcedRefresh = false;
+                    let forcedRefreshOk = false;
                     for (const room of rooms) {
                         if (room.events.length === 0)
                             continue;
                         let meta = await storage.get(`roomMeta:${room.roomId}`);
-                        if (!meta && !forcedRefresh) {
+                        if ((!meta || meta.provisional) && !forcedRefresh) {
                             forcedRefresh = true;
-                            await this.refreshNarraRoomsMeta(this.nowMs(), true);
+                            forcedRefreshOk = await this.refreshNarraRoomsMeta(this.nowMs(), true);
                             meta = await storage.get(`roomMeta:${room.roomId}`);
+                        }
+                        if (forcedRefreshOk && meta?.provisional) {
+                            const { provisional: _drop, ...settled } = meta;
+                            meta = settled;
+                            await storage.put(`roomMeta:${room.roomId}`, settled);
                         }
                         const mergedMembers = meta?.members?.length ? meta.members : room.members ?? [];
                         const stub = this.env.NARRA_ROOM_DO.get(this.env.NARRA_ROOM_DO.idFromName(room.roomId));
@@ -675,6 +685,15 @@ export class BaseNarraRoomCoordinator {
         const storedMatrixId = await this.ctx.storage.get('selfMatrixId');
         const matrixId = cfg.spec.matrixId ?? storedMatrixId ?? this.env.MATRIX_USER_ID;
         return matrixId ? { ...cfg.spec, matrixId } : cfg.spec;
+    }
+    async markEventHandled(eventId) {
+        if (!eventId)
+            return;
+        const handledList = (await this.ctx.storage.get('handledIds')) ?? [];
+        if (!handledList.includes(eventId)) {
+            handledList.push(eventId);
+            await this.ctx.storage.put('handledIds', handledList.slice(-MAX_HANDLED_IDS));
+        }
     }
     async getMemoryStore() {
         if (!isNarraGatewayEnabled(this.env) || !this.env.DB)
@@ -923,6 +942,7 @@ export class BaseNarraRoomCoordinator {
                 await this.ctx.storage.put('consecutiveAgentMessages', consec);
                 if (eventId)
                     await this.ctx.storage.put('latestEventId', eventId);
+                await this.markEventHandled(body.eventId);
             });
             return Response.json({ ok: true });
         }
@@ -1058,6 +1078,14 @@ export class BaseNarraRoomCoordinator {
                                     mentions: ev.mentions.length ? ev.mentions : turn.event.mentions,
                                 };
                             }
+                        }
+                        const editIsAgent = Boolean(selfMatrixId && ev.senderId === selfMatrixId) || isNarraAgent(ev.senderId);
+                        if (!editIsAgent && hasExplicitLangSignal(ev.text, mentionNames)) {
+                            const explicit = detectLang(ev.text, undefined, undefined, {
+                                extraMentionNames: mentionNames,
+                            });
+                            userLanguageHints[ev.senderId] = explicit;
+                            roomLanguageHint = explicit;
                         }
                         continue;
                     }
@@ -1528,6 +1556,7 @@ export class BaseNarraRoomCoordinator {
                     await this.ctx.storage.put('consecutiveAgentMessages', consec);
                     if (posted.eventId) {
                         await this.ctx.storage.put('latestEventId', posted.eventId);
+                        await this.markEventHandled(posted.eventId);
                     }
                     if (nextTurn.event.senderId) {
                         const sessions = (await this.ctx.storage.get('sessions')) ?? {};

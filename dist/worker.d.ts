@@ -158,6 +158,7 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
     private runLocked;
     private createCoalescer;
     private getEffectiveSpec;
+    private markEventHandled;
     private getMemoryStore;
     private matrixOp;
     private hydrateReplyTarget;

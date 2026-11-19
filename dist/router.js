@@ -73,7 +73,7 @@ export function isSelfMentioned(event, spec) {
         return true;
     if (spec.matrixId && event.text.includes(spec.matrixId))
         return true;
-    return nameMentionedInText(event.text, allNamesFor(spec.name, spec.aliases), false);
+    return nameMentionedInText(event.text, allNamesFor(spec.name, spec.aliases), true);
 }
 export function findMentionedPeers(event, spec, peers = []) {
     const found = [];
@@ -117,8 +117,12 @@ export function isAimedElsewhere(event, context, spec) {
     // Starts with `@Human` (non-agent) while mentioning self only later as a reference
     // (e.g., "@Alice look at what @Penny said").
     const otherHumans = otherMentionIds.filter((id) => !isNarraAgent(id));
+    const nonAgentMemberNames = context.members
+        .filter((m) => !m.isAgent && !isNarraAgent(m.matrixId))
+        .flatMap((m) => (m.displayName ? [m.displayName.trim()] : []))
+        .filter(Boolean);
     if (selfMentioned &&
-        otherHumans.length > 0 &&
+        (otherHumans.length > 0 || textStartsWithName(event.text, nonAgentMemberNames)) &&
         mentionedPeers.length === 0 &&
         !textStartsWithName(event.text, allNamesFor(spec.name, spec.aliases), spec.matrixId)) {
         return true;
