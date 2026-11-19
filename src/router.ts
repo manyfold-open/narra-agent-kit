@@ -664,12 +664,22 @@ export function createWorkersAiTriageModel(
       if (sig.keywordHits === 0 && !sig.hasNeedCue) {
         return { score: 0.1, reason: 'triage_no_need_cue' };
       }
-      const hasBackdropOrPivot = PAST_ANECDOTE_RE.test(sig.text) || TOPIC_PIVOT_RE.test(sig.text);
+      const pivotMatch = TOPIC_PIVOT_RE.exec(sig.text);
+      const prePivot = pivotMatch ? sig.text.slice(0, pivotMatch.index).trim() : '';
+      const postPivot = pivotMatch ? sig.text.slice(pivotMatch.index + pivotMatch[0].length).trim() : '';
+      const postPivotDirectMatch =
+        Boolean(pivotMatch) &&
+        Boolean(postPivot) &&
+        !REQUEST_ACTION_RE.test(prePivot) &&
+        countKeywordMatches(postPivot, postPivot.toLowerCase(), spec.domainKeywords) >= 2 &&
+        countKeywordMatches(postPivot, postPivot.toLowerCase(), spec.antiKeywords) === 0 &&
+        (QUESTION_OR_INTENT_RE.test(postPivot) || IMPLICIT_NEED_CUE_RE.test(postPivot));
+      const hasBackdropOrPivot = PAST_ANECDOTE_RE.test(sig.text) || Boolean(pivotMatch);
       if (
         sig.keywordHits >= 2 &&
         sig.antiHits === 0 &&
         !sig.isAnecdote &&
-        !hasBackdropOrPivot &&
+        (!hasBackdropOrPivot || postPivotDirectMatch) &&
         sig.hasNeedCue
       ) {
         return { score: Math.max(0.9, sig.heuristic), reason: 'domain_match' };
@@ -699,7 +709,7 @@ export function createWorkersAiTriageModel(
         '- Default to LOW score <= 0.15 (stay silent) because the user did NOT @mention you.',
         '- Never stretch your domain to claim casual requests only tangentially related (e.g., do NOT claim general hunger/restaurant questions as pop-ups or datasets; do NOT claim casual weekend sightseeing/hanging out as hackathons or news).',
         '- If another peer agent in this group is a clearly better match for the user\'s primary intent, you MUST output score <= 0.15 so that specialist answers cleanly.',
-        '- If the user\'s primary ask belongs to another peer agent and your topic is only a secondary "by the way / 順便" add-on, output score <= 0.15 so only the primary specialist answers.',
+        '- If the user already asked a primary question for another peer agent AND your topic is only a secondary "by the way / 順便" add-on, output score <= 0.15. However, if the earlier clause is only casual chatter or a past-tense backdrop (no question) and the "by the way / 順便" clause IS the only actual question, treat that question as the primary ask.',
         '- If your domain words only appear in a past-tense backdrop clause (e.g., "just finished visiting Camden Market, btw any new OpenAI model?") while the actual question belongs to another peer agent, output score <= 0.15.',
         '- Output score <= 0.15 for: past-tense stories/anecdotes/venting/bragging even if domain words appear, personal stress statements with no question, human-to-human plans/banter, or questions already answered by another human in recent_history.',
         '- Output score 0.75-0.95 ONLY when a human has a genuine, unanswered current need, question, or implicit request directly served by YOUR exact domain.',

@@ -1802,10 +1802,14 @@ describe('narra-agent-kit simulation & unit suite', () => {
       expect(fallbackRes.score).toBeGreaterThan(0.55);
     });
 
-    it('createWorkersAiTriageModel defers past-tense backdrop + topic-pivot turns to Workers AI instead of 0ms domain_match', async () => {
-      const runMock = vi.fn(async () => ({
-        response: '{"score":0.1,"reason":"backdrop_belongs_to_peer"}',
-      }));
+    it('createWorkersAiTriageModel defers past-tense backdrop turns to Workers AI for backdrop agent, directly matches post-pivot specialist, and defers genuine dual-requests', async () => {
+      const runMock = vi.fn(async (_model: string, input: { messages: Array<{ content: string }> }) => {
+        const prompt = input.messages.map((m) => m.content).join('\n');
+        if (prompt.includes('火鍋')) {
+          return { response: '{"score":0.12,"reason":"secondary_by_the_way"}' };
+        }
+        return { response: '{"score":0.1,"reason":"backdrop_belongs_to_peer"}' };
+      });
       const model = createWorkersAiTriageModel({ run: runMock });
       const spottedSpec: AgentSpec = {
         ...SPOTTED_SPEC,
@@ -1814,23 +1818,60 @@ describe('narra-agent-kit simulation & unit suite', () => {
         domainKeywords: ['Camden', '市集', '快閃', '展覽'],
         antiKeywords: ['塔羅'],
       };
+      const ai5Spec: AgentSpec = {
+        id: 'ai5-chat',
+        matrixId: '@agent-3add8bb6:matrix.netmind.chat',
+        name: 'AI in 5',
+        domainDescription: 'Daily AI news briefing and model launches',
+        domainKeywords: ['anthropic', 'openai', '新模型'],
+        antiKeywords: ['快閃'],
+      };
       const ctx = groupCtx({
         peers: [
           { matrixId: '@agent-3add8bb6:matrix.netmind.chat', displayName: 'AI in 5' },
+          { matrixId: '@agent-f9388b28:matrix.netmind.chat', displayName: 'Spotted London' },
         ],
       });
 
-      const res = await model.score({
-        event: makeTextEvent({
-          text: '剛跟朋友逛完 Camden 市集超累，順便問一下大家今天 Anthropic 或 OpenAI 有發新模型嗎？',
-        }),
+      const msg = makeTextEvent({
+        text: '剛跟朋友逛完 Camden 市集超累，順便問一下大家今天 Anthropic 或 OpenAI 有發新模型嗎？',
+      });
+
+      // 1. Spotted London (backdrop clause) -> defers to Workers AI -> score 0.1
+      const spottedRes = await model.score({
+        event: msg,
         context: ctx,
         spec: spottedSpec,
         detectedLang: 'zh-Hant',
       });
-
       expect(runMock).toHaveBeenCalledTimes(1);
-      expect(res).toEqual({ score: 0.1, reason: 'backdrop_belongs_to_peer' });
+      expect(spottedRes).toEqual({ score: 0.1, reason: 'backdrop_belongs_to_peer' });
+
+      // 2. AI in 5 (post-pivot primary question) -> deterministic domain_match without extra AI call
+      const ai5Res = await model.score({
+        event: msg,
+        context: ctx,
+        spec: ai5Spec,
+        detectedLang: 'zh-Hant',
+      });
+      expect(runMock).toHaveBeenCalledTimes(1);
+      expect(ai5Res.reason).toBe('domain_match');
+      expect(ai5Res.score).toBeGreaterThanOrEqual(0.9);
+
+      // 3. Genuine dual-request (primary ask before "順便") -> secondary agent still defers to Workers AI
+      const dualRes = await model.score({
+        event: makeTextEvent({
+          text: '幫我找 Soho 火鍋，順便看下這週末展覽有沒有推薦？',
+        }),
+        context: ctx,
+        spec: {
+          ...spottedSpec,
+          domainKeywords: ['週末', '展覽', '快閃'],
+        },
+        detectedLang: 'zh-Hant',
+      });
+      expect(runMock).toHaveBeenCalledTimes(2);
+      expect(dualRes).toEqual({ score: 0.12, reason: 'secondary_by_the_way' });
     });
 
     it('sanitizeMobileLinks strips dead relative media/*.jpg markdown images, empty code fences, and orphan picture captions while keeping https URLs', () => {
