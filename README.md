@@ -319,6 +319,7 @@ await scheduler.run(updates);
 | Module | Exports |
 | --- | --- |
 | `src/types.ts` | `AgentSpec`, `InboundEvent`, `RoomContext`, `TriageDecision`, `MemoryEntry`, `PeerAgentInfo`, `LangCode`, `AgentUpdateItem`, `TriageModel`, `FastPathModel` |
+| `src/d1.ts` | `runSchemaStatements`, `splitSqlStatements`, `D1DatabaseLike`, `D1PreparedStatementLike` |
 | `src/lang.ts` | `detectLang`, `stripNoiseForLang` |
 | `src/guard.ts` | `isNarraAgent`, `defuse`, `parseMatrixEvent`, `stripReplyFallback`, `isSilence`, `stripLeakedNotes`, `sanitizeMobileLinks` |
 | `src/quote.ts` | `shouldQuote` |

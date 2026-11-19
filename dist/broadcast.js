@@ -1,3 +1,4 @@
+import { runSchemaStatements } from './d1.js';
 import { isNarraAgent, isSilence, sanitizeMobileLinks } from './guard.js';
 export const NARRA_BROADCAST_SCHEMA = `
 CREATE TABLE IF NOT EXISTS narra_broadcast_log (
@@ -14,7 +15,7 @@ export class D1BroadcastStore {
         this.db = db;
     }
     async ensureSchema() {
-        await this.db.exec(NARRA_BROADCAST_SCHEMA);
+        await runSchemaStatements(this.db, NARRA_BROADCAST_SCHEMA);
     }
     async hasSentKey(agentId, roomId, updateKey) {
         const row = await this.db

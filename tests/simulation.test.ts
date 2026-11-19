@@ -8,6 +8,8 @@ import {
   MemoryKVStore,
   MemoryRejectionError,
   MemoryStore,
+  NARRA_BROADCAST_SCHEMA,
+  NARRA_MEMORY_SCHEMA,
   ProactiveBroadcastScheduler,
   RoomRouter,
   SyncError,
@@ -30,12 +32,15 @@ import {
   renderMentions,
   routeEvent,
   runFastPathOrA2A,
+  runSchemaStatements,
   sanitizeMobileLinks,
   shouldQuote,
+  splitSqlStatements,
   staggerWindowMinute,
   stripLeakedNotes,
   syncOnce,
   type AgentSpec,
+  type D1DatabaseLike,
   type FastPathModel,
   type HistoryTurn,
   type InboundEvent,
@@ -1291,6 +1296,92 @@ describe('narra-agent-kit simulation & unit suite', () => {
       expect(a2aResult.envelope).toContain('room_members: Alice (@sp-alice:matrix.netmind.chat), Bob (@sp-bob:matrix.netmind.chat), Charlie (@sp-charlie:matrix.netmind.chat)');
       expect(a2aResult.envelope).toContain('Bob: 我喜歡辣的菜');
       expect(a2aResult.envelope).not.toContain('記帳沒問題');
+    });
+  });
+
+  describe('9. Cloudflare D1 batch schema init & strict single-line exec() semantics', () => {
+    it('rejects multi-line DDL passed to mock D1 exec() just like real Cloudflare D1', async () => {
+      const db = createD1();
+
+      await expect(db.exec(NARRA_MEMORY_SCHEMA)).rejects.toThrow(/D1_EXEC_ERROR.*incomplete input/);
+      await expect(db.exec(NARRA_BROADCAST_SCHEMA)).rejects.toThrow(/D1_EXEC_ERROR.*incomplete input/);
+
+      // Single-line statements on exec() still succeed, matching Cloudflare D1 behavior.
+      const singleLineRes = await db.exec('CREATE TABLE IF NOT EXISTS single_line_ok (id TEXT PRIMARY KEY);');
+      expect(singleLineRes.count).toBe(1);
+    });
+
+    it('initializes MemoryStore & D1BroadcastStore via batch() without calling exec()', async () => {
+      const db = createD1();
+      const execSpy = vi.spyOn(db, 'exec');
+      const batchSpy = vi.spyOn(db, 'batch');
+
+      const memory = new MemoryStore(db, QUIDPAW_SPEC.id);
+      await memory.ensureSchema();
+      const dedupeStore = new D1BroadcastStore(db);
+      await dedupeStore.ensureSchema();
+
+      expect(execSpy).not.toHaveBeenCalled();
+      expect(batchSpy).toHaveBeenCalledTimes(2);
+
+      const objects = await db
+        .prepare("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'index')")
+        .all<{ name: string; type: string }>();
+      const names = (objects.results ?? []).map((row) => row.name);
+      expect(names).toEqual(
+        expect.arrayContaining([
+          'narra_user_memory',
+          'narra_room_memory',
+          'narra_learning_log',
+          'narra_demand_log',
+          'narra_broadcast_log',
+          'idx_narra_user_memory_lookup',
+          'idx_narra_room_memory_lookup',
+          'idx_narra_learning_log_room',
+          'idx_narra_demand_log_room',
+        ]),
+      );
+    });
+
+    it('splitSqlStatements strips comments cleanly and runSchemaStatements falls back to sequential run() when batch is absent', async () => {
+      const sqlWithComments = `
+        -- Leading comment; ignored semicolon
+        /* Multi-line
+           block comment */
+        CREATE TABLE IF NOT EXISTS demo_cfg (
+          id TEXT PRIMARY KEY, -- trailing comment; ignored
+          marker TEXT NOT NULL DEFAULT '-- keep;me'
+        );
+        ;
+        CREATE INDEX IF NOT EXISTS idx_demo_cfg_marker
+          ON demo_cfg (marker)
+      `;
+
+      const stmts = splitSqlStatements(sqlWithComments);
+      expect(stmts).toEqual([
+        "CREATE TABLE IF NOT EXISTS demo_cfg ( id TEXT PRIMARY KEY, marker TEXT NOT NULL DEFAULT '-- keep;me' )",
+        'CREATE INDEX IF NOT EXISTS idx_demo_cfg_marker ON demo_cfg (marker)',
+      ]);
+
+      const executed: string[] = [];
+      const minimalMockDb: D1DatabaseLike = {
+        prepare(query: string) {
+          return {
+            async run() {
+              executed.push(query);
+              return { success: true };
+            },
+          };
+        },
+      };
+
+      await runSchemaStatements(minimalMockDb, sqlWithComments);
+      expect(executed).toEqual(stmts);
+
+      // Comment-only or whitespace-only scripts do not call prepare/batch at all.
+      const noopPrepare = vi.fn();
+      await runSchemaStatements({ prepare: noopPrepare }, '  -- nothing here\n/* empty */  ');
+      expect(noopPrepare).not.toHaveBeenCalled();
     });
   });
 });

@@ -1,3 +1,4 @@
+import { runSchemaStatements } from './d1.js';
 import { isNarraAgent, isSilence, sanitizeMobileLinks } from './guard.js';
 import type { MemoryStore } from './memory.js';
 import type { AgentUpdateItem, HistoryTurn } from './types.js';
@@ -25,7 +26,7 @@ export class D1BroadcastStore implements BroadcastDedupeStore {
   }
 
   async ensureSchema(): Promise<void> {
-    await this.db.exec(NARRA_BROADCAST_SCHEMA);
+    await runSchemaStatements(this.db, NARRA_BROADCAST_SCHEMA);
   }
 
   async hasSentKey(agentId: string, roomId: string, updateKey: string): Promise<boolean> {

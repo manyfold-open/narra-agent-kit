@@ -61,8 +61,22 @@ export function createD1(): D1Database {
       }
     },
     exec: async (sql: string) => {
-      sqlite.exec(sql);
-      return { count: 0, duration: 0 };
+      // Mirror Cloudflare D1's real `exec()` semantics: split on newlines and execute
+      // each non-empty, non-comment line independently, rejecting multi-line DDL.
+      const lines = sql.split(/\r?\n/);
+      let count = 0;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line || line.startsWith('--')) continue;
+        try {
+          sqlite.exec(line);
+          count++;
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          throw new Error(`D1_EXEC_ERROR: Error in line ${i + 1}: ${line}: ${msg}: SQLITE_ERROR`);
+        }
+      }
+      return { count, duration: 0 };
     },
   } as unknown as D1Database;
 }

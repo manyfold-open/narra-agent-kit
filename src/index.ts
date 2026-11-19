@@ -1,4 +1,5 @@
 export * from './types.js';
+export * from './d1.js';
 export * from './lang.js';
 export * from './guard.js';
 export * from './quote.js';

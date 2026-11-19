@@ -1,3 +1,4 @@
+import { runSchemaStatements } from './d1.js';
 export const NARRA_MEMORY_SCHEMA = `
 CREATE TABLE IF NOT EXISTS narra_user_memory (
   id TEXT PRIMARY KEY,
@@ -164,7 +165,7 @@ export class MemoryStore {
         this.now = options.now ?? (() => new Date());
     }
     async ensureSchema() {
-        await this.db.exec(NARRA_MEMORY_SCHEMA);
+        await runSchemaStatements(this.db, NARRA_MEMORY_SCHEMA);
     }
     clampThreshold(value) {
         const rounded = Math.round(value * 1000) / 1000;
