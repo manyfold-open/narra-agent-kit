@@ -19,6 +19,11 @@ export declare function stripNoiseForLang(text: string, extraMentionNames?: read
  * before classifying so Chinese conversations never accidentally flip to English.
  */
 export declare function detectLang(text: string, userHint?: LangCode, roomHint?: LangCode, options?: DetectLangOptions): LangCode;
+/**
+ * Detects an explicit user request to switch reply script/language (works regardless of whether
+ * the request itself is written in Traditional or Simplified characters, e.g. `請用簡體` / `请用繁体`).
+ */
+export declare function detectExplicitLangSwitch(text: string): LangCode | null;
 /** Converts Simplified Chinese prose into pure Traditional Chinese with phrase disambiguation. */
 export declare function toZhHant(text: string): string;
 //# sourceMappingURL=lang.d.ts.map

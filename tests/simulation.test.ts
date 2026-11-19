@@ -16,6 +16,7 @@ import {
   authorizeEvent,
   buildPromptEnvelope,
   defuse,
+  detectExplicitLangSwitch,
   detectLang,
   editContent,
   executePoliteYield,
@@ -1590,6 +1591,16 @@ describe('narra-agent-kit simulation & unit suite', () => {
       expect(activeEnv).toContain('unmentioned_group_turn: true');
       expect(mentionEnv).not.toContain('unmentioned_group_turn: true');
       expect(dmEnv).not.toContain('unmentioned_group_turn: true');
+    });
+
+    it('detectExplicitLangSwitch handles cross-script switches cleanly', () => {
+      expect(detectExplicitLangSwitch('請用簡體')).toBe('zh-Hans');
+      expect(detectExplicitLangSwitch('请用简体中文')).toBe('zh-Hans');
+      expect(detectExplicitLangSwitch('请用繁体')).toBe('zh-Hant');
+      expect(detectExplicitLangSwitch('請用繁體中文')).toBe('zh-Hant');
+      expect(detectExplicitLangSwitch('用英文')).toBe('en');
+      expect(detectExplicitLangSwitch('speak English')).toBe('en');
+      expect(detectExplicitLangSwitch('每日一牌')).toBeNull();
     });
   });
 });

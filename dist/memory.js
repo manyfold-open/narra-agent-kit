@@ -1,5 +1,5 @@
 import { runSchemaStatements } from './d1.js';
-import { stripAgentMentions } from './lang.js';
+import { detectExplicitLangSwitch, stripAgentMentions } from './lang.js';
 export const NARRA_MEMORY_SCHEMA = `
 CREATE TABLE IF NOT EXISTS narra_user_memory (
   id TEXT PRIMARY KEY,
@@ -502,6 +502,23 @@ export class MemoryStore {
         const { results } = await stmt.all();
         return results ?? [];
     }
+    async getPreferredLang(userId, chatType) {
+        if (!userId)
+            return undefined;
+        const sql = chatType === 'group'
+            ? `SELECT memory_value FROM narra_user_memory
+           WHERE agent_id = ? AND user_id = ? AND origin_chat_type = 'group' AND memory_key = 'lang'
+           ORDER BY updated_at DESC LIMIT 1`
+            : `SELECT memory_value FROM narra_user_memory
+           WHERE agent_id = ? AND user_id = ? AND memory_key = 'lang'
+           ORDER BY CASE WHEN origin_chat_type = 'dm' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1`;
+        const row = await this.db
+            .prepare(sql)
+            .bind(this.agentId, userId)
+            .first();
+        const v = row?.memory_value;
+        return v === 'zh-Hant' || v === 'zh-Hans' || v === 'en' ? v : undefined;
+    }
 }
 const GROUP_MUTE_RE = /^(?:先安靜|先安静|靜音|静音|先別插嘴|先别插嘴|安靜一下|安静一下|先閉嘴|先闭嘴|mute(?:\s+(?:room|group|for\s+now))?|be\s+quiet|stay\s+quiet)[!！。.~～?？\s]*$/i;
 const GROUP_UNMUTE_RE = /^(?:恢復|恢复|取消靜音|取消静音|解除靜音|解除静音|恢復主動回覆|恢复主动回复|可以說話了|可以说话了|unmute(?:\s+(?:room|group))?)[!！。.~～?？\s]*$/i;
@@ -565,6 +582,23 @@ export async function handleStandardMemoryCommand(input) {
             }
             return 'Back on — I will chime in naturally on relevant topics in this group again.';
         }
+    }
+    // 1b. Explicit language switch persistence
+    const switchedLang = detectExplicitLangSwitch(cleaned);
+    if (switchedLang) {
+        await store.rememberUser({
+            userId: event.senderId,
+            key: 'lang',
+            value: switchedLang,
+            kind: 'language',
+            originChatType: context.chatType,
+            originRoomId: event.roomId,
+        });
+        if (switchedLang === 'zh-Hant')
+            return '好的，接下來我會用繁體中文回覆你。';
+        if (switchedLang === 'zh-Hans')
+            return '好的，接下来我会用简体中文回复你。';
+        return 'Got it — I will reply in English from now on.';
     }
     // 2. Forget
     if (FORGET_CMD_RE.test(cleaned)) {

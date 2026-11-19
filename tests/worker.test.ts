@@ -1859,4 +1859,107 @@ describe('worker runtime layer (src/worker.ts)', () => {
     expect(postedBodies.at(-1)).not.toContain('UCL');
     expect(postedBodies.at(-1)).toContain('還沒有');
   });
+
+  it('11. bidirectional language switch persistence (@Bot 請用簡體 -> @Bot 每日一牌 -> @Bot 请用繁体) survives DO eviction', async () => {
+    let nowMs = 1_760_700_000_000;
+    const fastLangs: string[] = [];
+    const postedBodies: string[] = [];
+    const roomId = '!grp_lang_switch:matrix.netmind.chat';
+    const zackId = '@zack:matrix.netmind.chat';
+    const db = createD1();
+
+    const gatewayConfig: NarraGatewayConfig<NarraGatewayEnv> = {
+      spec: { ...TEST_SPEC, name: 'AI Tarot' },
+      now: () => nowMs,
+      fastRespond: async (_env, _ev, decision) => {
+        fastLangs.push(decision.detectedLang);
+        return `LANG:${decision.detectedLang}`;
+      },
+      fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { text?: string };
+        postedBodies.push(body.text ?? '');
+        return Response.json({ status: 'ok', data: { event_id: `$lang_ev_${postedBodies.length}` } });
+      }) as unknown as typeof fetch,
+    };
+
+    const env: NarraGatewayEnv = {
+      DB: db,
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'off',
+      NARRA_AGENT_TOKEN: 'narra_tok_lang_persist',
+    };
+
+    const { state } = createFakeDOState();
+    let grpDo = new (createNarraWorkerGateway(gatewayConfig).BaseNarraRoomCoordinator)(state, env);
+
+    const post = async (eventId: string, body: string) => {
+      nowMs += 5_000;
+      await grpDo.fetch(
+        new Request('https://narra-room/events', {
+          method: 'POST',
+          body: JSON.stringify({
+            roomId,
+            chatType: 'group',
+            members: [
+              { matrixId: zackId, displayName: 'Zack', isAgent: false },
+              { matrixId: TEST_SPEC.matrixId!, displayName: 'AI Tarot', isAgent: true },
+            ],
+            events: [
+              {
+                event_id: eventId,
+                sender: zackId,
+                type: 'm.room.message',
+                origin_server_ts: nowMs,
+                content: {
+                  msgtype: 'm.text',
+                  body,
+                  'm.mentions': { user_ids: [TEST_SPEC.matrixId!] },
+                },
+              },
+            ],
+          }),
+        }),
+      );
+      nowMs += 2_000;
+      await grpDo.alarm();
+    };
+
+    // Start in zh-Hant context
+    await post('$ls_0', '@AI Tarot 我想問工作的事');
+    expect(fastLangs.at(-1)).toBe('zh-Hant');
+
+    // Cross-script switch to zh-Hans ("請用簡體" written in Traditional Chinese!)
+    await post('$ls_1', '@AI Tarot 請用簡體');
+    expect(postedBodies.at(-1)).toContain('简体中文');
+
+    // Script-neutral "每日一牌" immediately follows -> MUST be zh-Hans!
+    await post('$ls_2', '@AI Tarot 每日一牌');
+    expect(fastLangs.at(-1)).toBe('zh-Hans');
+
+    // Cross-script switch to zh-Hant ("请用繁体" written in Simplified Chinese!)
+    await post('$ls_3', '@AI Tarot 请用繁体');
+    expect(postedBodies.at(-1)).toContain('繁體中文');
+
+    // Script-neutral "每日一牌" -> MUST be zh-Hant!
+    await post('$ls_4', '@AI Tarot 每日一牌');
+    expect(fastLangs.at(-1)).toBe('zh-Hant');
+
+    // DO eviction after zh-Hans switch still preserves zh-Hans for script-neutral CJK ("每日一牌")
+    await post('$ls_5', '@AI Tarot 請用簡體');
+    const { state: evictedHansState } = createFakeDOState();
+    grpDo = new (createNarraWorkerGateway(gatewayConfig).BaseNarraRoomCoordinator)(evictedHansState, env);
+    await post('$ls_6', '@AI Tarot 每日一牌');
+    expect(fastLangs.at(-1)).toBe('zh-Hans');
+
+    // Switch to English ("用英文") -> preserved across DO eviction for neutral tokens ("ok" / "?")
+    await post('$ls_7', '@AI Tarot 用英文');
+    expect(postedBodies.at(-1)).toContain('English');
+    await post('$ls_8', '@AI Tarot ok');
+    expect(fastLangs.at(-1)).toBe('en');
+
+    const { state: freshState } = createFakeDOState();
+    grpDo = new (createNarraWorkerGateway(gatewayConfig).BaseNarraRoomCoordinator)(freshState, env);
+    await post('$ls_9', '@AI Tarot ?');
+    expect(fastLangs.at(-1)).toBe('en');
+  });
 });

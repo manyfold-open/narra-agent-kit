@@ -536,6 +536,33 @@ const ZH_HANT_CHARS: Readonly<Record<string, string>> = {
   阁: '閣', 厨: '廚', 咸: '鹹', 冻: '凍',
 };
 
+/**
+ * Detects an explicit user request to switch reply script/language (works regardless of whether
+ * the request itself is written in Traditional or Simplified characters, e.g. `請用簡體` / `请用繁体`).
+ */
+export function detectExplicitLangSwitch(text: string): LangCode | null {
+  const clean = (text ?? '')
+    .trim()
+    .replace(/^[\s,，.。!！?？:：;；"'「」『』()（）]+|[\s,，.。!！?？:：;；"'「」『』()（）]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!clean) return null;
+  if (/^(?:請|请)?(?:改用|切換成|切换成|換成|换成|用|說|说)?(?:繁體|繁体|正體|正体)(?:中文)?$/i.test(clean)) {
+    return 'zh-Hant';
+  }
+  if (/^(?:請|请)?(?:改用|切換成|切换成|換成|换成|用|說|说)?(?:簡體|简体)(?:中文)?$/i.test(clean)) {
+    return 'zh-Hans';
+  }
+  if (
+    /^(?:(?:please\s+)?(?:switch\s+to|use|speak|reply\s+in|in)\s+english|english\s+please|english|(?:請|请)?(?:改用|切換成|切换成|換成|换成|用|說|说)英[文語语])$/i.test(
+      clean,
+    )
+  ) {
+    return 'en';
+  }
+  return null;
+}
+
 /** Converts Simplified Chinese prose into pure Traditional Chinese with phrase disambiguation. */
 export function toZhHant(text: string): string {
   const input = text ?? '';

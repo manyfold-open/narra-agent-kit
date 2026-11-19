@@ -3,11 +3,11 @@ import { D1BroadcastStore, InMemoryBroadcastStore, ProactiveBroadcastScheduler, 
 import { runSchemaStatements } from './d1.js';
 import { BurstCoalescer } from './debounce.js';
 import { isNarraAgent, isSilence, parseMatrixEvent, sanitizeMobileLinks, stripLeakedNotes, } from './guard.js';
-import { detectLang } from './lang.js';
+import { detectExplicitLangSwitch, detectLang, stripAgentMentions } from './lang.js';
 import { MemoryStore, handleStandardMemoryCommand, } from './memory.js';
 import { editContent, messageContent, plainMentions } from './mentions.js';
 import { shouldQuote } from './quote.js';
-import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSION_WINDOW_MS, executePoliteYield, hasPeerRepliedAfter, inspectRoomPeers, isChainExhaustedError, routeEvent, } from './router.js';
+import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSION_WINDOW_MS, executePoliteYield, hasPeerRepliedAfter, inspectRoomPeers, isChainExhaustedError, isSelfMentioned, routeEvent, } from './router.js';
 import { fetchEventContext, fetchMatrixCredential, fetchRoomMessagesBackstop, matrixSyncRequest, redactSecrets, SyncError, syncOnce, } from './sync.js';
 const DEFAULT_NARRA_API_ENDPOINT = 'https://api.netmind.chat';
 const DEFAULT_MATRIX_HOMESERVER = 'https://matrix.netmind.chat';
@@ -146,6 +146,23 @@ function hasExplicitLangSignal(text, extraMentionNames) {
     const b = detectLang(trimmed, 'zh-Hans', 'zh-Hans', options);
     const c = detectLang(trimmed, 'en', 'en', options);
     return a === b && b === c;
+}
+function detectUpdatedUserLang(ev, effectiveSpec, mentionNames) {
+    const stripped = stripAgentMentions(ev.text, mentionNames).trim();
+    const explicitSwitch = detectExplicitLangSwitch(stripped);
+    if (explicitSwitch) {
+        if (ev.chatType === 'dm' || isSelfMentioned(ev, effectiveSpec)) {
+            return { lang: explicitSwitch, isSwitch: true };
+        }
+        return null;
+    }
+    if (hasExplicitLangSignal(ev.text, mentionNames)) {
+        const explicit = detectLang(ev.text, undefined, undefined, {
+            extraMentionNames: [...mentionNames],
+        });
+        return { lang: explicit, isSwitch: false };
+    }
+    return null;
 }
 function isNormalizedInboundEvent(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw))
@@ -1080,12 +1097,14 @@ export class BaseNarraRoomCoordinator {
                             }
                         }
                         const editIsAgent = Boolean(selfMatrixId && ev.senderId === selfMatrixId) || isNarraAgent(ev.senderId);
-                        if (!editIsAgent && hasExplicitLangSignal(ev.text, mentionNames)) {
-                            const explicit = detectLang(ev.text, undefined, undefined, {
-                                extraMentionNames: mentionNames,
-                            });
-                            userLanguageHints[ev.senderId] = explicit;
-                            roomLanguageHint = explicit;
+                        if (!editIsAgent) {
+                            const langUpdate = detectUpdatedUserLang(ev, effectiveSpec, mentionNames);
+                            if (langUpdate) {
+                                userLanguageHints[ev.senderId] = langUpdate.lang;
+                                if (!langUpdate.isSwitch) {
+                                    roomLanguageHint = langUpdate.lang;
+                                }
+                            }
                         }
                         continue;
                     }
@@ -1169,12 +1188,12 @@ export class BaseNarraRoomCoordinator {
                             text: ev.text.slice(0, 1000),
                             timestampMs: ev.timestampMs,
                         };
-                        if (hasExplicitLangSignal(ev.text, mentionNames)) {
-                            const explicit = detectLang(ev.text, undefined, undefined, {
-                                extraMentionNames: mentionNames,
-                            });
-                            userLanguageHints[ev.senderId] = explicit;
-                            roomLanguageHint = explicit;
+                        const langUpdate = detectUpdatedUserLang(ev, effectiveSpec, mentionNames);
+                        if (langUpdate) {
+                            userLanguageHints[ev.senderId] = langUpdate.lang;
+                            if (!langUpdate.isSwitch) {
+                                roomLanguageHint = langUpdate.lang;
+                            }
                         }
                     }
                     const pushed = await coalescer.push(ev);
@@ -1284,9 +1303,16 @@ export class BaseNarraRoomCoordinator {
             : { active: false };
         let roomMuted = false;
         let roomThreshold;
+        const contextChatType = meta.chatType ?? turn.event.chatType;
+        let storedUserLang = turn.event.senderId ? userLanguageHints[turn.event.senderId] : undefined;
         if (memoryStore) {
             roomMuted = await memoryStore.isRoomMuted(turn.event.roomId);
             roomThreshold = await memoryStore.getRoomThreshold(turn.event.roomId);
+            if (!storedUserLang && turn.event.senderId) {
+                storedUserLang = await memoryStore
+                    .getPreferredLang(turn.event.senderId, contextChatType)
+                    .catch(() => undefined);
+            }
         }
         const coalescedSet = new Set(turn.event.coalescedEventIds ?? [turn.event.eventId]);
         const subsequentEvents = findSubsequentHistory(recentHistory, turn.event).map((h) => ({
@@ -1302,16 +1328,14 @@ export class BaseNarraRoomCoordinator {
         return {
             roomId: turn.event.roomId,
             roomName: turn.event.roomName ?? meta.roomName,
-            chatType: meta.chatType ?? turn.event.chatType,
+            chatType: contextChatType,
             members,
             peers,
             recentHistory,
             ...(replyToTarget ? { replyToTarget } : {}),
             consecutiveAgentMessages,
             ...(roomLanguageHint ? { roomLanguageHint } : {}),
-            ...(userLanguageHints[turn.event.senderId]
-                ? { userLanguageHint: userLanguageHints[turn.event.senderId] }
-                : {}),
+            ...(storedUserLang ? { userLanguageHint: storedUserLang } : {}),
             roomMuted,
             ...(roomThreshold !== undefined ? { roomThreshold } : {}),
             activeSession,
@@ -1489,6 +1513,20 @@ export class BaseNarraRoomCoordinator {
                                 if (memReply !== null) {
                                     rawAnswer = memReply;
                                     handledFast = true;
+                                    const switchNames = [
+                                        effectiveSpec.name,
+                                        ...(effectiveSpec.aliases ?? []),
+                                        ...context.members.flatMap((m) => (m.displayName ? [m.displayName] : [])),
+                                    ];
+                                    const switched = detectExplicitLangSwitch(stripAgentMentions(nextTurn.event.text ?? '', switchNames));
+                                    if (switched && nextTurn.event.senderId) {
+                                        await this.runLocked(async () => {
+                                            const hints = (await this.ctx.storage.get('userLanguageHints')) ??
+                                                {};
+                                            hints[nextTurn.event.senderId] = switched;
+                                            await this.ctx.storage.put('userLanguageHints', hints);
+                                        });
+                                    }
                                 }
                             }
                             catch {

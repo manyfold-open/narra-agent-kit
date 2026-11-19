@@ -1,5 +1,5 @@
 import { runSchemaStatements } from './d1.js';
-import { stripAgentMentions } from './lang.js';
+import { detectExplicitLangSwitch, stripAgentMentions } from './lang.js';
 import type {
   AgentSpec,
   ChatType,
@@ -756,6 +756,24 @@ export class MemoryStore {
     }>();
     return results ?? [];
   }
+
+  async getPreferredLang(userId: string, chatType: ChatType): Promise<LangCode | undefined> {
+    if (!userId) return undefined;
+    const sql =
+      chatType === 'group'
+        ? `SELECT memory_value FROM narra_user_memory
+           WHERE agent_id = ? AND user_id = ? AND origin_chat_type = 'group' AND memory_key = 'lang'
+           ORDER BY updated_at DESC LIMIT 1`
+        : `SELECT memory_value FROM narra_user_memory
+           WHERE agent_id = ? AND user_id = ? AND memory_key = 'lang'
+           ORDER BY CASE WHEN origin_chat_type = 'dm' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1`;
+    const row = await this.db
+      .prepare(sql)
+      .bind(this.agentId, userId)
+      .first<{ memory_value: string }>();
+    const v = row?.memory_value;
+    return v === 'zh-Hant' || v === 'zh-Hans' || v === 'en' ? v : undefined;
+  }
 }
 
 export interface StandardMemoryCommandInput {
@@ -844,6 +862,22 @@ export async function handleStandardMemoryCommand(
       }
       return 'Back on — I will chime in naturally on relevant topics in this group again.';
     }
+  }
+
+  // 1b. Explicit language switch persistence
+  const switchedLang = detectExplicitLangSwitch(cleaned);
+  if (switchedLang) {
+    await store.rememberUser({
+      userId: event.senderId,
+      key: 'lang',
+      value: switchedLang,
+      kind: 'language',
+      originChatType: context.chatType,
+      originRoomId: event.roomId,
+    });
+    if (switchedLang === 'zh-Hant') return '好的，接下來我會用繁體中文回覆你。';
+    if (switchedLang === 'zh-Hans') return '好的，接下来我会用简体中文回复你。';
+    return 'Got it — I will reply in English from now on.';
   }
 
   // 2. Forget

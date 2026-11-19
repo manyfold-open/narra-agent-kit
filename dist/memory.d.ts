@@ -132,6 +132,7 @@ export declare class MemoryStore {
         lang: string | null;
         createdAt: string;
     }>>;
+    getPreferredLang(userId: string, chatType: ChatType): Promise<LangCode | undefined>;
 }
 export interface StandardMemoryCommandInput {
     store: MemoryStore;

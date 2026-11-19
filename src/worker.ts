@@ -14,7 +14,7 @@ import {
   sanitizeMobileLinks,
   stripLeakedNotes,
 } from './guard.js';
-import { detectLang } from './lang.js';
+import { detectExplicitLangSwitch, detectLang, stripAgentMentions } from './lang.js';
 import {
   MemoryStore,
   handleStandardMemoryCommand,
@@ -31,6 +31,7 @@ import {
   hasPeerRepliedAfter,
   inspectRoomPeers,
   isChainExhaustedError,
+  isSelfMentioned,
   routeEvent,
 } from './router.js';
 import {
@@ -369,6 +370,28 @@ function hasExplicitLangSignal(text: string, extraMentionNames?: readonly string
   const b = detectLang(trimmed, 'zh-Hans', 'zh-Hans', options);
   const c = detectLang(trimmed, 'en', 'en', options);
   return a === b && b === c;
+}
+
+function detectUpdatedUserLang(
+  ev: InboundEvent,
+  effectiveSpec: AgentSpec,
+  mentionNames: readonly string[],
+): { lang: LangCode; isSwitch: boolean } | null {
+  const stripped = stripAgentMentions(ev.text, mentionNames).trim();
+  const explicitSwitch = detectExplicitLangSwitch(stripped);
+  if (explicitSwitch) {
+    if (ev.chatType === 'dm' || isSelfMentioned(ev, effectiveSpec)) {
+      return { lang: explicitSwitch, isSwitch: true };
+    }
+    return null;
+  }
+  if (hasExplicitLangSignal(ev.text, mentionNames)) {
+    const explicit = detectLang(ev.text, undefined, undefined, {
+      extraMentionNames: [...mentionNames],
+    });
+    return { lang: explicit, isSwitch: false };
+  }
+  return null;
 }
 
 function isNormalizedInboundEvent(raw: unknown): raw is InboundEvent {
@@ -1451,12 +1474,14 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
               }
             }
             const editIsAgent = Boolean(selfMatrixId && ev.senderId === selfMatrixId) || isNarraAgent(ev.senderId);
-            if (!editIsAgent && hasExplicitLangSignal(ev.text, mentionNames)) {
-              const explicit = detectLang(ev.text, undefined, undefined, {
-                extraMentionNames: mentionNames,
-              });
-              userLanguageHints[ev.senderId] = explicit;
-              roomLanguageHint = explicit;
+            if (!editIsAgent) {
+              const langUpdate = detectUpdatedUserLang(ev, effectiveSpec, mentionNames);
+              if (langUpdate) {
+                userLanguageHints[ev.senderId] = langUpdate.lang;
+                if (!langUpdate.isSwitch) {
+                  roomLanguageHint = langUpdate.lang;
+                }
+              }
             }
             continue;
           }
@@ -1544,12 +1569,12 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
               text: ev.text.slice(0, 1000),
               timestampMs: ev.timestampMs,
             };
-            if (hasExplicitLangSignal(ev.text, mentionNames)) {
-              const explicit = detectLang(ev.text, undefined, undefined, {
-                extraMentionNames: mentionNames,
-              });
-              userLanguageHints[ev.senderId] = explicit;
-              roomLanguageHint = explicit;
+            const langUpdate = detectUpdatedUserLang(ev, effectiveSpec, mentionNames);
+            if (langUpdate) {
+              userLanguageHints[ev.senderId] = langUpdate.lang;
+              if (!langUpdate.isSwitch) {
+                roomLanguageHint = langUpdate.lang;
+              }
             }
           }
 
@@ -1681,9 +1706,16 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
 
     let roomMuted = false;
     let roomThreshold: number | undefined;
+    const contextChatType = meta.chatType ?? turn.event.chatType;
+    let storedUserLang = turn.event.senderId ? userLanguageHints[turn.event.senderId] : undefined;
     if (memoryStore) {
       roomMuted = await memoryStore.isRoomMuted(turn.event.roomId);
       roomThreshold = await memoryStore.getRoomThreshold(turn.event.roomId);
+      if (!storedUserLang && turn.event.senderId) {
+        storedUserLang = await memoryStore
+          .getPreferredLang(turn.event.senderId, contextChatType)
+          .catch(() => undefined);
+      }
     }
 
     const coalescedSet = new Set(turn.event.coalescedEventIds ?? [turn.event.eventId]);
@@ -1705,16 +1737,14 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     return {
       roomId: turn.event.roomId,
       roomName: turn.event.roomName ?? meta.roomName,
-      chatType: meta.chatType ?? turn.event.chatType,
+      chatType: contextChatType,
       members,
       peers,
       recentHistory,
       ...(replyToTarget ? { replyToTarget } : {}),
       consecutiveAgentMessages,
       ...(roomLanguageHint ? { roomLanguageHint } : {}),
-      ...(userLanguageHints[turn.event.senderId]
-        ? { userLanguageHint: userLanguageHints[turn.event.senderId] }
-        : {}),
+      ...(storedUserLang ? { userLanguageHint: storedUserLang } : {}),
       roomMuted,
       ...(roomThreshold !== undefined ? { roomThreshold } : {}),
       activeSession,
@@ -1943,6 +1973,23 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                 if (memReply !== null) {
                   rawAnswer = memReply;
                   handledFast = true;
+                  const switchNames = [
+                    effectiveSpec.name,
+                    ...(effectiveSpec.aliases ?? []),
+                    ...context.members.flatMap((m) => (m.displayName ? [m.displayName] : [])),
+                  ];
+                  const switched = detectExplicitLangSwitch(
+                    stripAgentMentions(nextTurn.event.text ?? '', switchNames),
+                  );
+                  if (switched && nextTurn.event.senderId) {
+                    await this.runLocked(async () => {
+                      const hints =
+                        (await this.ctx.storage.get<Record<string, LangCode>>('userLanguageHints')) ??
+                        {};
+                      hints[nextTurn.event.senderId] = switched;
+                      await this.ctx.storage.put('userLanguageHints', hints);
+                    });
+                  }
                 }
               } catch {
                 // Fall back cleanly if memory command fails unexpectedly.
