@@ -1,0 +1,379 @@
+import { parseMatrixEvent } from './guard.js';
+export const DEFAULT_SYNC_TIMEOUT_MS = 25_000;
+const MAX_BACKOFF_MS = 60_000;
+const DEFAULT_NARRA_BASE = 'https://api.netmind.chat';
+const SEEN_LIMIT_PER_ROOM = 400;
+export class SyncError extends Error {
+    unauthorized;
+    constructor(message, unauthorized = false) {
+        super(redactSecrets(message));
+        this.name = 'SyncError';
+        this.unauthorized = unauthorized;
+    }
+}
+export function redactSecrets(value) {
+    return String(value ?? '')
+        .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
+        .replace(/\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{8,}\b/g, '[redacted-jwt]')
+        .replace(/\bsyt_[A-Za-z0-9_.-]+/g, '[redacted-matrix-token]')
+        .replace(/([?&](?:token|access_token|key|secret)=)[^&\s]+/gi, '$1[redacted]')
+        .slice(0, 600);
+}
+export const SYNC_FILTER = JSON.stringify({
+    presence: { types: [] },
+    account_data: { types: [] },
+    room: {
+        timeline: {
+            limit: 50,
+            types: ['m.room.message', 'm.reaction', 'm.room.redaction'],
+        },
+        state: { types: ['m.room.member'] },
+        ephemeral: { types: [] },
+        account_data: { types: [] },
+    },
+});
+function isAllowedHomeserver(url, extraAllowed = []) {
+    if (url.protocol !== 'https:')
+        return false;
+    const host = url.hostname.toLowerCase();
+    if (host === 'netmind.chat' || host.endsWith('.netmind.chat'))
+        return true;
+    return extraAllowed.some((allowed) => {
+        const clean = allowed.toLowerCase();
+        return host === clean || (clean.startsWith('.') && host.endsWith(clean));
+    });
+}
+/**
+ * Fetches Matrix login credentials from Narra (`POST /api/agent-runtime/matrix-credential`)
+ * using `NARRA_AGENT_TOKEN`, or delegates to `loginProvider`.
+ * Credentials stay strictly in memory and are never logged or persisted.
+ */
+export async function fetchMatrixCredential(config, cache) {
+    if (cache?.login)
+        return cache.login;
+    let login;
+    if (config.loginProvider) {
+        login = await config.loginProvider();
+    }
+    else {
+        const token = (config.narraAgentToken ?? '').trim();
+        if (!token)
+            throw new SyncError('NARRA_AGENT_TOKEN is not set.');
+        const base = (config.narraApiEndpoint ?? DEFAULT_NARRA_BASE).replace(/\/+$/, '');
+        const doFetch = config.fetchImpl ?? fetch;
+        let response;
+        try {
+            response = await doFetch(`${base}/api/agent-runtime/matrix-credential`, {
+                method: 'POST',
+                headers: { authorization: `Bearer ${token}` },
+                signal: AbortSignal.timeout(15_000),
+            });
+        }
+        catch (error) {
+            throw new SyncError(`Narra unreachable: ${redactSecrets(error instanceof Error ? error.message : error)}`);
+        }
+        const body = (await response.json().catch(() => null));
+        const data = (body && typeof body.data === 'object' && body.data ? body.data : body);
+        const homeserverUrl = typeof data?.homeserver_url === 'string' ? data.homeserver_url : '';
+        const userId = typeof data?.matrix_user_id === 'string' ? data.matrix_user_id : '';
+        const accessToken = typeof data?.access_token === 'string' ? data.access_token : '';
+        if (!response.ok || !accessToken || !userId) {
+            // Never echo response body because on success/partial responses it could hold tokens.
+            throw new SyncError(`Narra matrix-credential failed: HTTP ${response.status}`, response.status === 401);
+        }
+        let url;
+        try {
+            url = new URL(homeserverUrl);
+        }
+        catch {
+            throw new SyncError('Narra returned an invalid homeserver URL.');
+        }
+        if (!isAllowedHomeserver(url, config.allowedHomeserverHosts)) {
+            throw new SyncError(`Unexpected Matrix homeserver host (${url.hostname}).`);
+        }
+        login = { homeserverUrl: url.origin, userId, accessToken };
+    }
+    if (cache)
+        cache.login = login;
+    return login;
+}
+/**
+ * Calls Narra's `POST /api/agent-runtime/matrix/authorize-event` fail-closed.
+ * Any network failure, non-2xx response, or non-true `allow` returns `{ allow: false }`.
+ */
+export async function authorizeEvent(config, input) {
+    const token = (config.narraAgentToken ?? '').trim();
+    if (!token)
+        return { allow: false, reason: 'missing_token' };
+    const base = (config.narraApiEndpoint ?? DEFAULT_NARRA_BASE).replace(/\/+$/, '');
+    const doFetch = config.fetchImpl ?? fetch;
+    try {
+        const response = await doFetch(`${base}/api/agent-runtime/matrix/authorize-event`, {
+            method: 'POST',
+            headers: {
+                authorization: `Bearer ${token}`,
+                'content-type': 'application/json',
+            },
+            body: JSON.stringify(input),
+            signal: AbortSignal.timeout(10_000),
+        });
+        if (!response.ok) {
+            return { allow: false, reason: `http_${response.status}` };
+        }
+        const parsed = (await response.json().catch(() => null));
+        const data = (parsed && typeof parsed.data === 'object' && parsed.data ? parsed.data : parsed);
+        if (data?.allow !== true) {
+            return {
+                allow: false,
+                roomKind: data?.roomKind === 'dm' ? 'dm' : data?.roomKind === 'group' ? 'group' : undefined,
+                notice: data?.notice,
+                reason: 'denied',
+            };
+        }
+        return {
+            allow: true,
+            roomKind: data.roomKind === 'dm' ? 'dm' : data.roomKind === 'group' ? 'group' : undefined,
+        };
+    }
+    catch {
+        return { allow: false, reason: 'network_error' };
+    }
+}
+/** Executes one Matrix `/_matrix/client/v3/sync` call. */
+export async function matrixSyncRequest(login, since, timeoutMs, fetchImpl = fetch) {
+    const url = new URL(`${login.homeserverUrl}/_matrix/client/v3/sync`);
+    url.searchParams.set('filter', SYNC_FILTER);
+    url.searchParams.set('timeout', String(timeoutMs));
+    url.searchParams.set('set_presence', 'offline');
+    if (since)
+        url.searchParams.set('since', since);
+    let response;
+    try {
+        response = await fetchImpl(url.toString(), {
+            headers: { authorization: `Bearer ${login.accessToken}` },
+            signal: AbortSignal.timeout(timeoutMs + 20_000),
+        });
+    }
+    catch (error) {
+        throw new SyncError(`Homeserver unreachable: ${redactSecrets(error instanceof Error ? error.message : error)}`);
+    }
+    if (response.status === 401) {
+        throw new SyncError('Homeserver refused Matrix token (401).', true);
+    }
+    const body = (await response.json().catch(() => null));
+    if (!response.ok || !body || typeof body.next_batch !== 'string') {
+        throw new SyncError(`/sync failed: HTTP ${response.status}`);
+    }
+    return body;
+}
+/**
+ * Fetches `/messages` backstop directly from Matrix homeserver (or Narra chat API fallback)
+ * to recover events skipped by `withheld_gap` / `limited: true` sync batches or delivery filters.
+ */
+export async function fetchRoomMessagesBackstop(login, roomId, options = {}, fetchImpl = fetch) {
+    const url = new URL(`${login.homeserverUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages`);
+    url.searchParams.set('dir', options.dir ?? 'b');
+    url.searchParams.set('limit', String(options.limit ?? 50));
+    if (options.from)
+        url.searchParams.set('from', options.from);
+    const response = await fetchImpl(url.toString(), {
+        headers: { authorization: `Bearer ${login.accessToken}` },
+        signal: AbortSignal.timeout(15_000),
+    });
+    if (response.status === 401) {
+        throw new SyncError('Homeserver refused Matrix token on /messages (401).', true);
+    }
+    if (!response.ok) {
+        throw new SyncError(`/messages failed: HTTP ${response.status}`);
+    }
+    const parsed = (await response.json().catch(() => ({})));
+    const chunk = Array.isArray(parsed.chunk) ? parsed.chunk : [];
+    // Matrix dir=b returns newest first; sort chronological oldest-first.
+    const ordered = (options.dir ?? 'b') === 'b' ? [...chunk].reverse() : chunk;
+    const events = [];
+    for (const raw of ordered) {
+        const parsedEv = parseMatrixEvent(raw, { roomId });
+        if (parsedEv)
+            events.push(parsedEv);
+    }
+    return {
+        events,
+        nextBatch: typeof parsed.end === 'string' ? parsed.end : undefined,
+        prevBatch: typeof parsed.start === 'string' ? parsed.start : undefined,
+    };
+}
+/**
+ * Fetches Narra's `/api/agent-runtime/chat/messages` backstop when using `NARRA_AGENT_TOKEN`
+ * (bypasses Synapse `delivery_filter_mode` because it reads via chat API cursor).
+ */
+export async function fetchNarraChatMessagesBackstop(config, roomId, options = {}) {
+    const token = (config.narraAgentToken ?? '').trim();
+    if (!token)
+        throw new SyncError('NARRA_AGENT_TOKEN is not set.');
+    const base = (config.narraApiEndpoint ?? DEFAULT_NARRA_BASE).replace(/\/+$/, '');
+    const doFetch = config.fetchImpl ?? fetch;
+    const url = new URL(`${base}/api/agent-runtime/chat/messages`);
+    url.searchParams.set('room_id', roomId);
+    url.searchParams.set('dir', options.dir ?? 'f');
+    url.searchParams.set('limit', String(options.limit ?? 50));
+    if (options.from)
+        url.searchParams.set('from', options.from);
+    const response = await doFetch(url.toString(), {
+        headers: { authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) {
+        throw new SyncError(`Narra chat/messages failed: HTTP ${response.status}`);
+    }
+    const body = (await response.json().catch(() => null));
+    const data = (body?.data ?? {});
+    const messages = Array.isArray(data.messages) ? data.messages : [];
+    const pagination = (data.pagination ?? {});
+    const events = [];
+    for (const raw of messages) {
+        const parsedEv = parseMatrixEvent(raw, { roomId });
+        if (parsedEv)
+            events.push(parsedEv);
+    }
+    return {
+        events,
+        nextBatch: typeof pagination.next_batch === 'string' ? pagination.next_batch : undefined,
+        prevBatch: typeof pagination.prev_batch === 'string' ? pagination.prev_batch : undefined,
+    };
+}
+/** Fetches a single Matrix event by ID so replies to older messages hydrate parent text (`in_reply_to_other`). */
+export async function fetchEventContext(login, roomId, eventId, fetchImpl = fetch) {
+    const url = `${login.homeserverUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/event/${encodeURIComponent(eventId)}`;
+    try {
+        const response = await fetchImpl(url, {
+            headers: { authorization: `Bearer ${login.accessToken}` },
+            signal: AbortSignal.timeout(10_000),
+        });
+        if (!response.ok)
+            return null;
+        const raw = (await response.json().catch(() => null));
+        return parseMatrixEvent(raw, { roomId });
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Runs one Matrix `/sync` cycle with:
+ * - In-memory login cache (never persisted to store)
+ * - Automatic `withheld_gap` (`limited: true`) `/messages` backstop
+ * - Event deduplication per room
+ * - `edit` (`m.replace`) and `redaction` (`m.room.redaction`) dispatch
+ * - Exponential backoff on errors & 401 credential refresh
+ */
+export async function syncOnce(store, deps, cache, options = {}) {
+    const state = (await store.get('sync')) ?? { since: null, failures: 0 };
+    const timeoutMs = options.timeoutMs ?? DEFAULT_SYNC_TIMEOUT_MS;
+    try {
+        cache.login ??= await deps.login();
+        const isInitial = state.since === null;
+        const response = await deps.sync(cache.login, state.since, isInitial && !options.replayInitial ? 0 : timeoutMs);
+        const batches = [];
+        if (!isInitial || options.replayInitial) {
+            for (const [roomId, joined] of Object.entries(response.rooms?.join ?? {})) {
+                const limited = joined.timeline?.limited === true;
+                const prevBatch = joined.timeline?.prev_batch;
+                const seenKey = `seen:${roomId}`;
+                const seen = new Set((await store.get(seenKey)) ?? []);
+                const members = [];
+                for (const st of joined.state?.events ?? []) {
+                    if (st.type === 'm.room.member' && typeof st.state_key === 'string') {
+                        const c = (st.content ?? {});
+                        if (c.membership === 'join') {
+                            members.push({
+                                matrixId: st.state_key,
+                                displayName: typeof c.displayname === 'string' ? c.displayname : undefined,
+                                isAgent: /^@agent-[0-9a-f]+:/i.test(st.state_key),
+                            });
+                        }
+                    }
+                }
+                const collected = [];
+                let backstopped = false;
+                if (limited && deps.backstop) {
+                    const backstopEvents = await deps.backstop(cache.login, roomId, prevBatch);
+                    backstopped = true;
+                    for (const ev of backstopEvents) {
+                        if (!seen.has(ev.eventId)) {
+                            seen.add(ev.eventId);
+                            collected.push(ev);
+                        }
+                    }
+                }
+                for (const raw of joined.timeline?.events ?? []) {
+                    const parsed = parseMatrixEvent(raw, { roomId });
+                    if (!parsed)
+                        continue;
+                    if (seen.has(parsed.eventId))
+                        continue;
+                    seen.add(parsed.eventId);
+                    collected.push(parsed);
+                }
+                for (const ev of collected) {
+                    if (ev.kind === 'edit' && deps.onEdit)
+                        await deps.onEdit(ev);
+                    if (ev.kind === 'redaction' && deps.onRedaction)
+                        await deps.onRedaction(ev);
+                }
+                await store.put(seenKey, [...seen].slice(-SEEN_LIMIT_PER_ROOM));
+                if (collected.length > 0 || limited) {
+                    batches.push({
+                        roomId,
+                        events: collected,
+                        limited,
+                        withheldGap: limited,
+                        ...(prevBatch ? { prevBatch } : {}),
+                        ...(members.length ? { members } : {}),
+                        ...(backstopped ? { backstopped } : {}),
+                    });
+                }
+            }
+        }
+        else {
+            deps.log?.('sync initialized at live timeline head');
+        }
+        await deps.onBatch(batches);
+        await store.put('sync', { since: response.next_batch, failures: 0 });
+        return 0;
+    }
+    catch (error) {
+        if (error instanceof SyncError && error.unauthorized) {
+            cache.login = undefined;
+        }
+        const failures = state.failures + 1;
+        await store.put('sync', { ...state, failures });
+        deps.log?.(`sync failed (${failures}): ${redactSecrets(error instanceof Error ? error.message : error)}`);
+        return Math.min(MAX_BACKOFF_MS, 2_000 * 2 ** (failures - 1));
+    }
+}
+/**
+ * Convenience in-memory `KeyValueStore` implementation for tests or ephemeral runtimes.
+ */
+export class MemoryKVStore {
+    map = new Map();
+    async get(key) {
+        return this.map.get(key);
+    }
+    async put(key, value) {
+        this.map.set(key, value);
+    }
+    async delete(key) {
+        return this.map.delete(key);
+    }
+    async list(options) {
+        const out = new Map();
+        const keys = [...this.map.keys()].filter((k) => k.startsWith(options.prefix)).sort();
+        for (const k of keys) {
+            if (options.limit && out.size >= options.limit)
+                break;
+            out.set(k, this.map.get(k));
+        }
+        return out;
+    }
+}
+//# sourceMappingURL=sync.js.map
