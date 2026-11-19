@@ -1802,6 +1802,37 @@ describe('narra-agent-kit simulation & unit suite', () => {
       expect(fallbackRes.score).toBeGreaterThan(0.55);
     });
 
+    it('createWorkersAiTriageModel defers past-tense backdrop + topic-pivot turns to Workers AI instead of 0ms domain_match', async () => {
+      const runMock = vi.fn(async () => ({
+        response: '{"score":0.1,"reason":"backdrop_belongs_to_peer"}',
+      }));
+      const model = createWorkersAiTriageModel({ run: runMock });
+      const spottedSpec: AgentSpec = {
+        ...SPOTTED_SPEC,
+        matrixId: '@agent-f9388b28:matrix.netmind.chat',
+        domainDescription: 'London pop-ups, markets, exhibitions, and sample sales',
+        domainKeywords: ['Camden', '市集', '快閃', '展覽'],
+        antiKeywords: ['塔羅'],
+      };
+      const ctx = groupCtx({
+        peers: [
+          { matrixId: '@agent-3add8bb6:matrix.netmind.chat', displayName: 'AI in 5' },
+        ],
+      });
+
+      const res = await model.score({
+        event: makeTextEvent({
+          text: '剛跟朋友逛完 Camden 市集超累，順便問一下大家今天 Anthropic 或 OpenAI 有發新模型嗎？',
+        }),
+        context: ctx,
+        spec: spottedSpec,
+        detectedLang: 'zh-Hant',
+      });
+
+      expect(runMock).toHaveBeenCalledTimes(1);
+      expect(res).toEqual({ score: 0.1, reason: 'backdrop_belongs_to_peer' });
+    });
+
     it('sanitizeMobileLinks strips dead relative media/*.jpg markdown images, empty code fences, and orphan picture captions while keeping https URLs', () => {
       const dirty = [
         'Soho 這週末有幾個快閃：',
