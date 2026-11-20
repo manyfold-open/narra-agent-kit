@@ -428,6 +428,13 @@ const ZH_HANT_PHRASES: ReadonlyArray<readonly [string, string]> = [
   ['硬件', '硬體'],
   ['面条', '麵條'],
   ['里脊', '里脊'],
+  ['基础', '基礎'],
+  ['监控', '監控'],
+  ['诉讼', '訴訟'],
+  ['遭袭', '遭襲'],
+  ['账单', '帳單'],
+  ['旗舰', '旗艦'],
+  ['旗舰店', '旗艦店'],
 ];
 
 const PHRASES_BY_LEN = [...ZH_HANT_PHRASES].sort((a, b) => b[0].length - a[0].length);
@@ -534,7 +541,31 @@ const ZH_HANT_CHARS: Readonly<Record<string, string>> = {
   见: '見', 满: '滿', 滞: '滯',
   络: '絡', 鹅: '鵝', 腊: '臘', 虾: '蝦', 猪: '豬', 饺: '餃', 轩: '軒',
   阁: '閣', 厨: '廚', 咸: '鹹', 冻: '凍',
+  监: '監', 讼: '訟', 袭: '襲', 础: '礎', 账: '賬', 舰: '艦', 档: '檔',
+  筹: '籌', 赋: '賦', 触: '觸', 颖: '穎', 腾: '騰', 罢: '罷', 惩: '懲',
+  讽: '諷',
 };
+
+const LANG_SWITCH_CONTENT_GUARD_RE =
+  /\b(?:menu|breakfast|tea|class|lesson|teacher|song|movie|book|subtitle|subtitles|name|version|title|paper|article|exam)\b|菜單|菜单|早餐|茶|課|课|老師|老师|歌|電影|电影|書|书|字幕|名字|標題|标题/i;
+const LANG_SWITCH_ZH_PREFIX =
+  '(?:(?:從|从)?現在開始|(?:從|从)现在开始|接下來|接下来|以後|以后|之後|之后|後面|后面|麻煩(?:你|您)?|麻烦(?:你|您)?|請|请|可以|能否|幫我|帮我|都)';
+const LANG_SWITCH_ZH_SUFFIX =
+  '(?:來|来)?(?:回覆|回复|回|聊天|溝通|沟通|對話|对话|說|说|講|讲|聊)?(?:我|一下|吧|好嗎|好吗|可以嗎|可以吗|喔|哦|呀|謝謝|谢谢)?';
+const LANG_SWITCH_HANT_RE = new RegExp(
+  `^(?:${LANG_SWITCH_ZH_PREFIX}[\\s,，]*){0,4}(?:改用|切換成|切换成|換成|换成|用|說|说|講|讲|回覆|回复|回)?(?:繁體|繁体|正體|正体)(?:中文)?(?:[\\s,，]*${LANG_SWITCH_ZH_SUFFIX}){0,3}$`,
+  'i',
+);
+const LANG_SWITCH_HANS_RE = new RegExp(
+  `^(?:${LANG_SWITCH_ZH_PREFIX}[\\s,，]*){0,4}(?:改用|切換成|切换成|換成|换成|用|說|说|講|讲|回覆|回复|回)?(?:簡體|简体)(?:中文)?(?:[\\s,，]*${LANG_SWITCH_ZH_SUFFIX}){0,3}$`,
+  'i',
+);
+const LANG_SWITCH_ZH_EN_RE = new RegExp(
+  `^(?:${LANG_SWITCH_ZH_PREFIX}[\\s,，]*){0,4}(?:改用|切換成|切换成|換成|换成|用|說|说|講|讲|回覆|回复|回)英[文語语](?:[\\s,，]*${LANG_SWITCH_ZH_SUFFIX}){0,3}$`,
+  'i',
+);
+const LANG_SWITCH_EN_RE =
+  /^(?:(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?)?(?:(?:switch\s+to|use|speak|talk(?:\s+to\s+me)?\s+in|reply(?:\s+to\s+me)?\s+in|respond(?:\s+to\s+me)?\s+in|answer(?:\s+me)?\s+in|write(?:\s+to\s+me)?\s+in|in)\s+english|english(?:\s+only)?)(?:\s+(?:from\s+now\s+on|from\s+here(?:\s+on)?|going\s+forward|after\s+this|for\s+me|to\s+me|please|thank\s+you|thanks))*$/i;
 
 /**
  * Detects an explicit user request to switch reply script/language (works regardless of whether
@@ -546,18 +577,14 @@ export function detectExplicitLangSwitch(text: string): LangCode | null {
     .replace(/^[\s,，.。!！?？:：;；"'「」『』()（）]+|[\s,，.。!！?？:：;；"'「」『』()（）]+$/g, '')
     .replace(/\s+/g, ' ')
     .trim();
-  if (!clean) return null;
-  if (/^(?:請|请)?(?:改用|切換成|切换成|換成|换成|用|說|说)?(?:繁體|繁体|正體|正体)(?:中文)?$/i.test(clean)) {
+  if (!clean || clean.length > 60 || LANG_SWITCH_CONTENT_GUARD_RE.test(clean)) return null;
+  if (LANG_SWITCH_HANT_RE.test(clean)) {
     return 'zh-Hant';
   }
-  if (/^(?:請|请)?(?:改用|切換成|切换成|換成|换成|用|說|说)?(?:簡體|简体)(?:中文)?$/i.test(clean)) {
+  if (LANG_SWITCH_HANS_RE.test(clean)) {
     return 'zh-Hans';
   }
-  if (
-    /^(?:(?:please\s+)?(?:switch\s+to|use|speak|reply\s+in|in)\s+english|english\s+please|english|(?:請|请)?(?:改用|切換成|切换成|換成|换成|用|說|说)英[文語语])$/i.test(
-      clean,
-    )
-  ) {
+  if (LANG_SWITCH_EN_RE.test(clean) || LANG_SWITCH_ZH_EN_RE.test(clean)) {
     return 'en';
   }
   return null;

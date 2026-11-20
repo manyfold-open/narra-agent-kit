@@ -2122,6 +2122,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                 },
                 envelope,
                 eventId: nextTurn.event.eventId,
+                timeoutMs: 45_000,
                 fetchImpl: cfg.fetchImpl,
               });
             }
@@ -2304,6 +2305,11 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           failNow,
           this.env,
         );
+        // Do not head-of-line block later ready turns (e.g. local fastRespond or memory commands)
+        // when an un-answered turn fails upstream A2A and enters retry backoff.
+        if (error instanceof A2AError && !isChainExhaustedError(error) && nextTurn.answer === undefined) {
+          continue;
+        }
         // Stop draining this room so FIFO order is preserved until retry dueAtMs.
         break;
       }

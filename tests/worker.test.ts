@@ -2315,4 +2315,202 @@ describe('worker runtime layer (src/worker.ts)', () => {
     await roomInst().alarm();
     expect(postedPayloads).toHaveLength(1);
   });
+
+  it('15. RoomDO does not head-of-line block local fastRespond/memory turns behind an A2A outage retry', async () => {
+    let nowMs = 1_761_000_000_000;
+    const dmRoom = '!dm_no_hol_block:matrix.netmind.chat';
+    const zackId = '@zack:matrix.netmind.chat';
+    const postedBodies: string[] = [];
+    let a2aAttempts = 0;
+
+    const gateway = createNarraWorkerGateway({
+      spec: TEST_SPEC,
+      now: () => nowMs,
+      resolveA2ACredential: () => ({
+        url: 'https://api.manyfold.ai/a2a/test',
+        token: 'a2a_tok_test_hol',
+        label: 'Penny',
+      }),
+      fastRespond: async (_env, ev) => {
+        if (ev.text.includes('local fast query')) {
+          return 'LOCAL_FAST_OK';
+        }
+        return null;
+      },
+      fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.url;
+        if (url.includes('api.manyfold.ai/a2a/')) {
+          a2aAttempts += 1;
+          return new Response('upstream bad gateway', { status: 502 });
+        }
+        if (url.includes('/api/agent-runtime/chat/send')) {
+          const body = JSON.parse(String(init?.body ?? '{}')) as { text?: string };
+          postedBodies.push(body.text ?? '');
+          return Response.json({ status: 'ok', data: { event_id: `$hol_${postedBodies.length}` } });
+        }
+        return Response.json({ status: 'ok', data: {} });
+      }) as unknown as typeof fetch,
+    });
+
+    const env: NarraGatewayEnv = {
+      DB: createD1(),
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'off',
+      NARRA_AGENT_TOKEN: 'narra_tok_hol',
+    };
+
+    const { state } = createFakeDOState();
+    const dmDo = new gateway.BaseNarraRoomCoordinator(state, env);
+
+    // Enqueue 3 turns spaced >10s apart in burst clock? Wait: send two separate messages directly or spaced so BurstCoalescer flushes separately.
+    await dmDo.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId: dmRoom,
+          chatType: 'dm',
+          events: [
+            {
+              event_id: '$a2a_fail_1',
+              sender: zackId,
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: { msgtype: 'm.text', body: '需要 A2A 的開放問題' },
+            },
+            {
+              event_id: '$local_fast_2',
+              sender: zackId,
+              type: 'm.room.message',
+              origin_server_ts: nowMs + 10_000,
+              content: { msgtype: 'm.text', body: 'local fast query' },
+            },
+          ],
+        }),
+      }),
+    );
+
+    // Wait past burst window (default 1500ms after last msg) so both flush as separate turns.
+    nowMs += 15_000;
+    await dmDo.alarm();
+
+    expect(a2aAttempts).toBe(1);
+    expect(postedBodies).toEqual(['LOCAL_FAST_OK']);
+  });
+
+  it('16. targeted topic forget removes only matching memories, preserves lang, ignores non-memory text, and enforces DM isolation', async () => {
+    let nowMs = 1_761_100_000_000;
+    const dmRoomId = '!dm_targeted_forget:matrix.netmind.chat';
+    const grpRoomId = '!grp_targeted_forget:matrix.netmind.chat';
+    const zackId = '@zack:matrix.netmind.chat';
+    const db = createD1();
+    const postedBodies: string[] = [];
+
+    const gateway = createNarraWorkerGateway({
+      spec: TEST_SPEC,
+      now: () => nowMs,
+      fastRespond: async (_env, ev, dec) => `FAST(${dec.detectedLang}):${ev.text}`,
+      fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { text?: string };
+        postedBodies.push(body.text ?? '');
+        return Response.json({ status: 'ok', data: { event_id: `$tf_${postedBodies.length}` } });
+      }) as unknown as typeof fetch,
+    });
+
+    const env: NarraGatewayEnv = {
+      DB: db,
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'off',
+      NARRA_AGENT_TOKEN: 'narra_tok_tf',
+    };
+
+    const { state: dmState } = createFakeDOState();
+    const dmDo = new gateway.BaseNarraRoomCoordinator(dmState, env);
+    const { state: grpState } = createFakeDOState();
+    const grpDo = new gateway.BaseNarraRoomCoordinator(grpState, env);
+
+    const dmPost = async (eventId: string, body: string) => {
+      nowMs += 5_000;
+      await dmDo.fetch(
+        new Request('https://narra-room/events', {
+          method: 'POST',
+          body: JSON.stringify({
+            roomId: dmRoomId,
+            chatType: 'dm',
+            events: [
+              {
+                event_id: eventId,
+                sender: zackId,
+                type: 'm.room.message',
+                origin_server_ts: nowMs,
+                content: { msgtype: 'm.text', body },
+              },
+            ],
+          }),
+        }),
+      );
+      nowMs += 2_000;
+      await dmDo.alarm();
+    };
+
+    await dmPost('$tf_lang1', 'Please reply in English from now on');
+    expect(postedBodies.at(-1)).toContain('English');
+
+    await dmPost('$tf_lang2', '以後用繁體中文回我');
+    expect(postedBodies.at(-1)).toContain('繁體中文');
+
+    await dmPost('$tf_rem1', '記住我平常最關注 UK visa 簽證變化');
+    await dmPost('$tf_rem2', '記住我在 UCL 附近最愛吃川菜');
+
+    // Non-memory casual reminder MUST NOT trigger targeted forget
+    await dmPost('$tf_casual', '別忘了帶傘');
+    expect(postedBodies.at(-1)).toBe('FAST(zh-Hant):別忘了帶傘');
+
+    // Group targeted forget MUST NOT see or delete DM notes
+    nowMs += 5_000;
+    await grpDo.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId: grpRoomId,
+          chatType: 'group',
+          members: [
+            { matrixId: zackId, displayName: 'Zack', isAgent: false },
+            { matrixId: TEST_SPEC.matrixId!, displayName: 'Penny', isAgent: true },
+          ],
+          events: [
+            {
+              event_id: '$grp_tf',
+              sender: zackId,
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: {
+                msgtype: 'm.text',
+                body: '@Penny 忘掉關於簽證的記憶',
+                'm.mentions': { user_ids: [TEST_SPEC.matrixId!] },
+              },
+            },
+          ],
+        }),
+      }),
+    );
+    nowMs += 2_000;
+    await grpDo.alarm();
+    expect(postedBodies.at(-1)).toContain('沒有找到');
+
+    // DM targeted forget deletes ONLY visa memory, preserving UCL note & saved lang
+    await dmPost('$tf_del1', '忘掉關於簽證的記憶');
+    expect(postedBodies.at(-1)).toContain('簽證');
+
+    await dmPost('$tf_rec1', '你記得我什麼？');
+    expect(postedBodies.at(-1)).not.toContain('visa');
+    expect(postedBodies.at(-1)).not.toContain('簽證');
+    expect(postedBodies.at(-1)).toContain('UCL');
+
+    // English targeted forget deletes UCL note too
+    await dmPost('$tf_del2', 'forget about UCL');
+    expect(postedBodies.at(-1)).toContain('UCL');
+
+    await dmPost('$tf_rec2', '你記得什麼？');
+    expect(postedBodies.at(-1)).toContain('還沒有');
+  });
 });

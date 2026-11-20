@@ -1,5 +1,5 @@
 import { runSchemaStatements } from './d1.js';
-import { detectExplicitLangSwitch, stripAgentMentions } from './lang.js';
+import { detectExplicitLangSwitch, stripAgentMentions, toZhHant } from './lang.js';
 export const NARRA_MEMORY_SCHEMA = `
 CREATE TABLE IF NOT EXISTS narra_user_memory (
   id TEXT PRIMARY KEY,
@@ -523,6 +523,50 @@ export class MemoryStore {
 const GROUP_MUTE_RE = /^(?:先安靜|先安静|靜音|静音|先別插嘴|先别插嘴|安靜一下|安静一下|先閉嘴|先闭嘴|mute(?:\s+(?:room|group|for\s+now))?|be\s+quiet|stay\s+quiet)[!！。.~～?？\s]*$/i;
 const GROUP_UNMUTE_RE = /^(?:恢復|恢复|取消靜音|取消静音|解除靜音|解除静音|恢復主動回覆|恢复主动回复|可以說話了|可以说话了|unmute(?:\s+(?:room|group))?)[!！。.~～?？\s]*$/i;
 const FORGET_CMD_RE = /^(?:(?:請|请)?(?:幫我|帮我)?(?:(?:忘掉|忘記|忘记)(?:全部|所有|這[件些段]?事?|这[件些段]?事?|我的(?:記憶|记忆|偏好|資料|资料|設定|设置)?|之前(?:說|说|記|记)的(?:事|內容|内容)?|剛剛|刚刚)?|(?:清除|清空|刪掉|删掉|刪除|删除)(?:我的)?(?:全部|所有)?(?:記憶|记忆|偏好))|(?:please\s+)?forget\s+(?:everything|all(?:\s+(?:of\s+)?(?:my\s+)?(?:memories|preferences|notes|that|it))?|my\s+(?:memories|preferences|notes)|what\s+i\s+(?:said|told\s+you)))(?:\s*(?:吧|好嗎|好吗|喔|哦|呀|please))?[!！。.~～?？\s]*$/i;
+const TARGETED_FORGET_INTENT_RE = /(?:忘掉|記憶|记忆|偏好|筆記|笔记|紀錄|记录|關於|关于|\bforget\b|\bdelete\b|\bclear\b|\bremove\b)/i;
+const TARGETED_FORGET_ZH_RE = /^(?:請|请)?(?:幫我|帮我)?(?:忘掉|忘記|忘记|刪掉|删掉|刪除|删除|清除)(?:我在?(?:私[訊信]|群[組组])?(?:裡|里)?(?:之前)?(?:說|说|記|记)的?)?(?:關於|关于)?(.+?)(?:的?(?:記憶|记忆|偏好|筆記|笔记|紀錄|记录|資料|资料))?(?:吧|好嗎|好吗|喔|哦|呀)?[!！。.~～?？\s]*$/i;
+const TARGETED_FORGET_EN_RE = /^(?:please\s+)?(?:forget|delete|clear|remove)\s+(?:my\s+)?(?:(?:memory|memories|note|notes|preference|preferences)\s+)?(?:about|regarding|for|on)\s+(.+?)(?:\s+please)?[!！。.~～?？\s]*$/i;
+const FORGET_STOP_TOKENS = new Set(['之前', '平常', '關於', '关于', '那個', '那个', '這些', '这些', 'my', 'the', 'about', 'note', 'notes']);
+function extractForgetTopic(cleaned) {
+    if (!TARGETED_FORGET_INTENT_RE.test(cleaned))
+        return null;
+    const match = TARGETED_FORGET_EN_RE.exec(cleaned) ?? TARGETED_FORGET_ZH_RE.exec(cleaned);
+    if (!match?.[1])
+        return null;
+    const topic = match[1]
+        .replace(/^(?:關於|关于|我的?|the|a|an)\s*/i, '')
+        .replace(/[\s的「」"'()（）]+$/g, '')
+        .replace(/^[「」"'()（）\s]+/g, '')
+        .trim();
+    if (!topic || topic.length < 2)
+        return null;
+    if (/^(?:全部|所有|這件?事|这件事|一切|everything|all|it|that)$/i.test(topic))
+        return null;
+    return topic;
+}
+function extractForgetMatchTokens(topic) {
+    const norm = toZhHant(topic).toLowerCase();
+    const tokens = new Set();
+    const latinMatches = norm.match(/[a-z0-9]{2,}/g) ?? [];
+    for (const w of latinMatches) {
+        if (!FORGET_STOP_TOKENS.has(w))
+            tokens.add(w);
+    }
+    const cjkRuns = norm.match(/[\u3400-\u9fff]{2,}/g) ?? [];
+    for (const run of cjkRuns) {
+        if (FORGET_STOP_TOKENS.has(run))
+            continue;
+        tokens.add(run);
+        if (run.length >= 4) {
+            for (let i = 0; i <= run.length - 2; i += 1) {
+                const bi = run.slice(i, i + 2);
+                if (!FORGET_STOP_TOKENS.has(bi))
+                    tokens.add(bi);
+            }
+        }
+    }
+    return [...tokens];
+}
 const RECALL_CMD_RE = /(?:你記得什麼|你记得什么|你還記得什麼|你还记得什么|你記得我|你记得我|你還記得我|你还记得我|記得我(?:之前|私訊|私聊|平常|說過|说过)?|记得我(?:之前|私信|私聊|平常|说过)?|你記了什麼|你记了什么|查(?:看)?我的記憶|查(?:看)?我的记忆|\bwhat\s+do\s+you\s+remember\b|\bdo\s+you\s+remember\b)/i;
 const REMEMBER_CMD_RE = /^(?:(?:請|请)?(?:幫我|帮我)?(?:記住|记住|記一下|记一下|記下來|记下来)[：:，,\s]*|(?:please\s+)?remember(?:\s+that)?[：:,\s]+)/i;
 const PRIVATE_DM_SUFFIX_RE = /[,，。\s]+(?:這件?事)?(?:請)?(?:只|僅)?記在私[訊信](?:裡|里)?[，,]?(?:不要|別|勿)?在?群[組组]?(?:說|说|提(?:及)?)?[!！。.]*$/i;
@@ -600,7 +644,7 @@ export async function handleStandardMemoryCommand(input) {
             return '好的，接下来我会用简体中文回复你。';
         return 'Got it — I will reply in English from now on.';
     }
-    // 2. Forget
+    // 2. Forget (blanket, then targeted topic)
     if (FORGET_CMD_RE.test(cleaned)) {
         await store.forget({
             scope: 'user',
@@ -620,6 +664,39 @@ export async function handleStandardMemoryCommand(input) {
         return context.chatType === 'dm'
             ? 'Done — I have cleared your private DM preferences and notes.'
             : 'Done — I have cleared your group preferences (private DM notes remain separate).';
+    }
+    const targetedTopic = extractForgetTopic(cleaned);
+    if (targetedTopic) {
+        const scopeOrigin = context.chatType === 'group' ? 'group' : undefined;
+        const normTopic = toZhHant(targetedTopic).toLowerCase();
+        const tokens = extractForgetMatchTokens(targetedTopic);
+        const candidates = memories.userMemories.filter((m) => !isInternalMemoryKey(m.key) && (!scopeOrigin || m.originChatType === scopeOrigin));
+        const matched = candidates.filter((m) => {
+            const hay = `${toZhHant(m.key).toLowerCase()} ${toZhHant(m.value).toLowerCase()}`;
+            if (hay.includes(normTopic))
+                return true;
+            return tokens.some((tok) => hay.includes(tok));
+        });
+        for (const entry of matched) {
+            await store.forget({
+                scope: 'user',
+                userId: event.senderId,
+                key: entry.key,
+                originChatType: context.chatType === 'group' ? 'group' : entry.originChatType,
+            });
+        }
+        if (matched.length > 0) {
+            if (lang === 'zh-Hant')
+                return `好的，已忘掉關於「${targetedTopic}」的記憶紀錄。`;
+            if (lang === 'zh-Hans')
+                return `好的，已忘掉关于「${targetedTopic}」的记忆记录。`;
+            return `Done — I have forgotten your saved memory about "${targetedTopic}".`;
+        }
+        if (lang === 'zh-Hant')
+            return `目前沒有找到關於「${targetedTopic}」的記憶紀錄喔。`;
+        if (lang === 'zh-Hans')
+            return `目前没有找到关于「${targetedTopic}」的记忆记录哦。`;
+        return `I don't have any saved memory matching "${targetedTopic}".`;
     }
     // 3. Recall (strictly respecting DM-to-group privacy isolation from recallForTurn)
     if (RECALL_CMD_RE.test(cleaned)) {

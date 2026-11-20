@@ -1599,14 +1599,25 @@ describe('narra-agent-kit simulation & unit suite', () => {
       expect(dmEnv).not.toContain('unmentioned_group_turn: true');
     });
 
-    it('detectExplicitLangSwitch handles cross-script switches cleanly', () => {
+    it('detectExplicitLangSwitch handles cross-script and natural switches without false positives', () => {
       expect(detectExplicitLangSwitch('請用簡體')).toBe('zh-Hans');
       expect(detectExplicitLangSwitch('请用简体中文')).toBe('zh-Hans');
-      expect(detectExplicitLangSwitch('请用繁体')).toBe('zh-Hant');
+      expect(detectExplicitLangSwitch('之后请用简体中文回复')).toBe('zh-Hans');
       expect(detectExplicitLangSwitch('請用繁體中文')).toBe('zh-Hant');
+      expect(detectExplicitLangSwitch('请用繁体')).toBe('zh-Hant');
+      expect(detectExplicitLangSwitch('以後用繁體中文回我')).toBe('zh-Hant');
+      expect(detectExplicitLangSwitch('從現在開始用繁體中文回覆我吧')).toBe('zh-Hant');
       expect(detectExplicitLangSwitch('用英文')).toBe('en');
       expect(detectExplicitLangSwitch('speak English')).toBe('en');
+      expect(detectExplicitLangSwitch('Please reply in English from now on')).toBe('en');
+      expect(detectExplicitLangSwitch('can you speak English please?')).toBe('en');
       expect(detectExplicitLangSwitch('每日一牌')).toBeNull();
+      expect(detectExplicitLangSwitch('Do they have an English menu?')).toBeNull();
+      expect(detectExplicitLangSwitch('有沒有英文菜單')).toBeNull();
+    });
+
+    it('toZhHant converts newly added tech/legal/retail chars cleanly', () => {
+      expect(toZhHant('监控诉讼遭袭基础账单旗舰店')).toBe('監控訴訟遭襲基礎帳單旗艦店');
     });
   });
 
