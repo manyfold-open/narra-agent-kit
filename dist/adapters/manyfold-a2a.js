@@ -61,6 +61,24 @@ export function buildPromptEnvelope(input) {
             .slice(-3)
             .map((t) => `- [self] ${cleanInline(t.text).slice(0, 420)}`)
         : [];
+    const memberNameById = new Map();
+    for (const m of context.members) {
+        if (m.matrixId && m.displayName?.trim()) {
+            memberNameById.set(m.matrixId, cleanInline(m.displayName));
+        }
+    }
+    if (event.senderId && event.senderName?.trim()) {
+        memberNameById.set(event.senderId, cleanInline(event.senderName));
+    }
+    const RAW_MATRIX_ID_RE = /^@[^:\s]+:[^\s]+$/;
+    const resolveSpeakerLabel = (senderId, senderName) => {
+        const named = cleanInline(senderName || memberNameById.get(senderId) || '');
+        if (named && !RAW_MATRIX_ID_RE.test(named))
+            return named;
+        if (senderId === event.senderId)
+            return 'requester';
+        return 'member';
+    };
     const summaryTimeline = summaryMode
         ? context.recentHistory
             .filter((t) => t.eventId !== event.eventId && t.text.trim())
@@ -70,7 +88,7 @@ export function buildPromptEnvelope(input) {
             const roleTag = isSelf ? 'self' : t.isAgent || isNarraAgent(t.senderId) ? 'agent' : 'human';
             const hhmm = formatShortUtcTime(t.timestampMs);
             const tsPart = hhmm ? ` ${hhmm}` : '';
-            const speaker = cleanInline(t.senderName || t.senderId || 'member');
+            const speaker = isSelf ? cleanInline(spec?.name || 'self') : resolveSpeakerLabel(t.senderId, t.senderName);
             return `- [${roleTag}${tsPart}] ${speaker}: ${cleanInline(t.text).slice(0, 280)}`;
         })
         : [];
