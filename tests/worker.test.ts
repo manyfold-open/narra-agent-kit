@@ -2753,4 +2753,128 @@ describe('worker runtime layer (src/worker.ts)', () => {
     expect(postedBodies).toHaveLength(1);
     expect(postedBodies[0]).toContain('不好意思');
   });
+
+  it('19. summary turns use summary thinking wording and Workers AI resilience fallback edits thinking bubble in place when Manyfold A2A fails', async () => {
+    let nowMs = 1_761_400_000_000;
+    const roomId = '!grp_resilience:matrix.netmind.chat';
+    const zackId = '@zack:matrix.netmind.chat';
+    const members = [
+      { matrixId: zackId, displayName: 'Zack', isAgent: false },
+      { matrixId: TEST_SPEC.matrixId!, displayName: 'Spotted London', isAgent: true },
+    ];
+    const matrixSends: Array<Record<string, unknown>> = [];
+    let aiPromptSeen = '';
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith('/api/agent-runtime/matrix-credential')) {
+        return Response.json({
+          status: 'ok',
+          data: {
+            homeserver_url: 'https://matrix.netmind.chat',
+            access_token: 'mat_tok_res',
+            matrix_user_id: TEST_SPEC.matrixId,
+          },
+        });
+      }
+      if (url.includes('/typing/') || url.includes('/receipt/')) {
+        return Response.json({});
+      }
+      if (url.includes('/messages?')) {
+        return Response.json({
+          chunk: [
+            {
+              event_id: '$res_hist_1',
+              sender: '@alice:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs - 60_000,
+              content: { msgtype: 'm.text', body: '週六想逛 Soho 免費快閃活動' },
+            },
+          ],
+        });
+      }
+      if (url.includes('/send/m.room.message/')) {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        matrixSends.push(body);
+        return Response.json({ event_id: `$res_mat_${matrixSends.length}` });
+      }
+      if (url.includes('api.manyfold.ai/a2a/')) {
+        await new Promise((r) => setTimeout(r, 60));
+        return new Response('upstream failed', { status: 502 });
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    const gateway = createNarraWorkerGateway({
+      spec: { ...TEST_SPEC, name: 'Spotted London' },
+      now: () => nowMs,
+      thinkingDelayMs: 20,
+      thinkingMessage: () => '📍 正在幫你查詢倫敦最新快閃活動…',
+      enableA2AFailureReply: true,
+      resolveA2ACredential: async () => ({
+        url: 'https://api.manyfold.ai/a2a/test',
+        token: 'a2a_tok_res',
+        label: 'Spotted London',
+      }),
+      fastRespond: async () => null,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    let env!: NarraGatewayEnv;
+    const syncHandle = createFakeNamespace((ctx) => new gateway.BaseNarraMatrixSync(ctx, env));
+    const roomHandle = createFakeNamespace((ctx) => new gateway.BaseNarraRoomCoordinator(ctx, env));
+    env = {
+      DB: createD1(),
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'on',
+      NARRA_AGENT_TOKEN: 'narra_tok_res',
+      NARRA_SYNC_DO: syncHandle.namespace,
+      NARRA_ROOM_DO: roomHandle.namespace,
+      AI: {
+        run: async (_model: string, input: { messages: Array<{ content: string }> }) => {
+          aiPromptSeen = input.messages.map((m) => m.content).join('\n');
+          return { response: '群组重点总结：\n1. Alice 想在周六逛 Soho 免费快闪活动\n2. 可再确认时间' };
+        },
+      },
+    };
+
+    const roomStub = roomHandle.namespace.get(roomHandle.namespace.idFromName(roomId));
+    const roomInst = () => roomHandle.instances.get(roomId)!.instance;
+
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        chatType: 'group',
+        members,
+        events: [
+          {
+            event_id: '$res_sum_1',
+            sender: zackId,
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: {
+              msgtype: 'm.text',
+              body: '@Spotted London 幫我總結一下剛剛群裡聊到的內容',
+              'm.mentions': { user_ids: [TEST_SPEC.matrixId!] },
+            },
+          },
+        ],
+      }),
+    });
+
+    nowMs += 2_000;
+    await roomInst().alarm();
+
+    expect(matrixSends).toHaveLength(2);
+    // Must use summary thinking wording, NOT generic London pop-up thinking wording
+    expect(matrixSends[0]?.body).toBe('📝 正在閱讀群組歷史訊息並整理重點，稍等一下…');
+    // Must edit that thinking bubble in place via m.replace with pure zh-Hant & • bullets
+    expect((matrixSends[1]?.['m.relates_to'] as Record<string, unknown>)?.rel_type).toBe('m.replace');
+    expect((matrixSends[1]?.['m.relates_to'] as Record<string, unknown>)?.event_id).toBe('$res_mat_1');
+    const editedBody = String((matrixSends[1]?.['m.new_content'] as Record<string, unknown>)?.body ?? '');
+    expect(editedBody).toContain('群組重點總結');
+    expect(editedBody).toContain('• Alice 想在週六逛 Soho 免費快閃活動');
+    expect(aiPromptSeen).toContain('週六想逛 Soho 免費快閃活動');
+  });
 });

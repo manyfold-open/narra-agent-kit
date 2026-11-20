@@ -7,7 +7,7 @@ import { detectExplicitLangSwitch, detectLang, stripAgentMentions } from './lang
 import { MemoryStore, handleStandardMemoryCommand, } from './memory.js';
 import { editContent, messageContent, plainMentions } from './mentions.js';
 import { shouldQuote } from './quote.js';
-import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSION_WINDOW_MS, createWorkersAiTriageModel, executePoliteYield, hasPeerAnsweredTimeline, hasPeerRepliedAfter, inspectRoomPeers, isChainExhaustedError, isSelfMentioned, routeEvent, } from './router.js';
+import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSION_WINDOW_MS, DEFAULT_WORKERS_AI_TRIAGE_MODEL, createWorkersAiTriageModel, executePoliteYield, hasPeerAnsweredTimeline, hasPeerRepliedAfter, inspectRoomPeers, isChainExhaustedError, isSelfMentioned, routeEvent, } from './router.js';
 import { fetchEventContext, fetchMatrixCredential, fetchNarraChatMessagesBackstop, fetchRoomMessagesBackstop, matrixSyncRequest, redactSecrets, SyncError, syncOnce, } from './sync.js';
 const DEFAULT_NARRA_API_ENDPOINT = 'https://api.netmind.chat';
 const DEFAULT_MATRIX_HOMESERVER = 'https://matrix.netmind.chat';
@@ -51,6 +51,76 @@ function defaultA2AFailureReply(lang) {
     if (lang === 'zh-Hans')
         return '不好意思，刚才查资料的连接有点忙碌，方便稍后再问我一次吗？';
     return 'Sorry, I hit a brief connection hiccup looking that up — could you ask me again in a moment?';
+}
+function extractWorkersAiText(rawOutput) {
+    if (!rawOutput)
+        return '';
+    if (typeof rawOutput === 'string')
+        return rawOutput.trim();
+    if (typeof rawOutput !== 'object')
+        return '';
+    const obj = rawOutput;
+    const direct = obj.response ?? obj.result;
+    if (typeof direct === 'string')
+        return direct.trim();
+    if (direct && typeof direct === 'object') {
+        const inner = direct.response;
+        if (typeof inner === 'string')
+            return inner.trim();
+    }
+    const choices = obj.choices;
+    if (typeof choices?.[0]?.message?.content === 'string') {
+        return choices[0].message.content.trim();
+    }
+    return '';
+}
+async function runWorkersAiResilienceFallback(ai, modelName, spec, envelope, lang, wantsSummary) {
+    const binding = ai && typeof ai.run === 'function'
+        ? ai
+        : null;
+    if (!binding)
+        return null;
+    const model = modelName?.trim() || DEFAULT_WORKERS_AI_TRIAGE_MODEL;
+    const langLabel = lang === 'zh-Hant'
+        ? 'Traditional Chinese (繁體中文)'
+        : lang === 'zh-Hans'
+            ? 'Simplified Chinese (简体中文)'
+            : 'English';
+    const systemPrompt = [
+        `You are "${spec.name}" replying in a Narra Messenger chat.`,
+        `Your domain: ${spec.domainDescription}`,
+        wantsSummary
+            ? 'The user asked to summarize/recap recent chat history. Read recent_conversation_timeline carefully and present a concise, accurate summary using "• " bullets grouped by topic/person. Never invent facts not in the timeline.'
+            : 'Answer the user directly and naturally like a helpful human teammate using any provided recent_self_replies, last_drawn_tarot_cards, last_drawn_fortune_stick, or d1_prefetched_records. Keep replies concise and mobile-friendly (3-5 short lines or 2-3 "• " bullets). Never invent fake URLs or unverified details.',
+        `Reply STRICTLY in ${langLabel}.`,
+        'Never mention internal system errors, fallback models, or envelope metadata. Output ONLY the final reply text.',
+    ].join('\n');
+    let timer;
+    try {
+        const timeoutPromise = new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('workers_ai_fallback_timeout')), 12_000);
+        });
+        const raw = await Promise.race([
+            binding.run(model, {
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: envelope.slice(0, 12_000) },
+                ],
+                max_tokens: wantsSummary ? 420 : 320,
+                temperature: 0.4,
+            }),
+            timeoutPromise,
+        ]);
+        const text = extractWorkersAiText(raw);
+        return text || null;
+    }
+    catch {
+        return null;
+    }
+    finally {
+        if (timer !== undefined)
+            clearTimeout(timer);
+    }
 }
 const schemaInitCache = new WeakMap();
 /**
@@ -1751,8 +1821,10 @@ export class BaseNarraRoomCoordinator {
                             });
                             const thinkingDelayMs = cfg.thinkingDelayMs ?? DEFAULT_THINKING_DELAY_MS;
                             if (isDirectTurn && thinkingDelayMs > 0 && !nextTurn.thinkingEventId) {
-                                const statusText = cfg.thinkingMessage?.(decision.detectedLang, nextTurn.event, decision) ??
-                                    defaultThinkingMessage(decision.detectedLang, wantsSummary);
+                                const statusText = wantsSummary
+                                    ? defaultThinkingMessage(decision.detectedLang, true)
+                                    : (cfg.thinkingMessage?.(decision.detectedLang, nextTurn.event, decision) ??
+                                        defaultThinkingMessage(decision.detectedLang, false));
                                 const roomChatType = context.chatType;
                                 thinkingTimer = setTimeout(() => {
                                     thinkingPostPromise = (async () => {
@@ -1780,7 +1852,7 @@ export class BaseNarraRoomCoordinator {
                                     envelope,
                                     eventId: nextTurn.event.eventId,
                                     ...(storedContextId ? { contextId: storedContextId } : {}),
-                                    timeoutMs: 45_000,
+                                    timeoutMs: 20_000,
                                     fetchImpl: cfg.fetchImpl,
                                 });
                                 rawAnswer = a2aRes.text;
@@ -1795,7 +1867,22 @@ export class BaseNarraRoomCoordinator {
                                     /(?:HTTP 40[04]|context)/i.test(a2aErr.message)) {
                                     await this.ctx.storage.delete('a2aContextId').catch(() => undefined);
                                 }
-                                throw a2aErr;
+                                // Resilience circuit-breaker: Manyfold A2A stays 100% primary; ONLY if Manyfold A2A
+                                // fails on a directly addressed turn when Workers AI is bound + enableA2AFailureReply is on,
+                                // seamlessly fall back to Workers AI using the exact same pre-fetched envelope so the user
+                                // never hangs staring at a stuck progress bubble during an upstream Manyfold outage.
+                                if (isDirectTurn && cfg.enableA2AFailureReply === true && this.env.AI) {
+                                    const backup = await runWorkersAiResilienceFallback(this.env.AI, this.env.AI_TRIAGE_MODEL, effectiveSpec, envelope, decision.detectedLang, wantsSummary);
+                                    if (backup) {
+                                        rawAnswer = backup;
+                                    }
+                                    else {
+                                        throw a2aErr;
+                                    }
+                                }
+                                else {
+                                    throw a2aErr;
+                                }
                             }
                         }
                     }
@@ -1949,8 +2036,7 @@ export class BaseNarraRoomCoordinator {
                         lastDecision?.reason === 'dm' ||
                         lastDecision?.reason === 'explicit_mention' ||
                         lastDecision?.reason === 'reply_to_self';
-                    const shouldSendFailureNotice = error instanceof A2AError &&
-                        nextTurn.answer === undefined &&
+                    const shouldSendFailureNotice = nextTurn.answer === undefined &&
                         (Boolean(nextTurn.thinkingEventId) || (isDirectGiveUp && cfg.enableA2AFailureReply === true));
                     if (shouldSendFailureNotice) {
                         const failLang = lastDecision?.detectedLang ?? detectLang(nextTurn.event.text ?? '');

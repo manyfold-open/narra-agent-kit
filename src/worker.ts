@@ -33,6 +33,7 @@ import {
   AGENT_CHAIN_RETRY_MS,
   AgentChainTracker,
   DEFAULT_SESSION_WINDOW_MS,
+  DEFAULT_WORKERS_AI_TRIAGE_MODEL,
   createWorkersAiTriageModel,
   executePoliteYield,
   hasPeerAnsweredTimeline,
@@ -271,6 +272,90 @@ function defaultA2AFailureReply(lang: LangCode): string {
   if (lang === 'zh-Hant') return '不好意思，剛才查資料的連線有點忙碌，方便稍後再問我一次嗎？';
   if (lang === 'zh-Hans') return '不好意思，刚才查资料的连接有点忙碌，方便稍后再问我一次吗？';
   return 'Sorry, I hit a brief connection hiccup looking that up — could you ask me again in a moment?';
+}
+
+function extractWorkersAiText(rawOutput: unknown): string {
+  if (!rawOutput) return '';
+  if (typeof rawOutput === 'string') return rawOutput.trim();
+  if (typeof rawOutput !== 'object') return '';
+  const obj = rawOutput as Record<string, unknown>;
+  const direct = obj.response ?? obj.result;
+  if (typeof direct === 'string') return direct.trim();
+  if (direct && typeof direct === 'object') {
+    const inner = (direct as Record<string, unknown>).response;
+    if (typeof inner === 'string') return inner.trim();
+  }
+  const choices = obj.choices as Array<{ message?: { content?: unknown } }> | undefined;
+  if (typeof choices?.[0]?.message?.content === 'string') {
+    return choices[0].message.content.trim();
+  }
+  return '';
+}
+
+async function runWorkersAiResilienceFallback(
+  ai: unknown,
+  modelName: string | undefined,
+  spec: AgentSpec,
+  envelope: string,
+  lang: LangCode,
+  wantsSummary: boolean,
+): Promise<string | null> {
+  const binding =
+    ai && typeof (ai as { run?: unknown }).run === 'function'
+      ? (ai as {
+          run: (
+            model: string,
+            input: {
+              messages: Array<{ role: 'system' | 'user'; content: string }>;
+              max_tokens?: number;
+              temperature?: number;
+            },
+          ) => Promise<unknown>;
+        })
+      : null;
+  if (!binding) return null;
+
+  const model = modelName?.trim() || DEFAULT_WORKERS_AI_TRIAGE_MODEL;
+  const langLabel =
+    lang === 'zh-Hant'
+      ? 'Traditional Chinese (繁體中文)'
+      : lang === 'zh-Hans'
+        ? 'Simplified Chinese (简体中文)'
+        : 'English';
+
+  const systemPrompt = [
+    `You are "${spec.name}" replying in a Narra Messenger chat.`,
+    `Your domain: ${spec.domainDescription}`,
+    wantsSummary
+      ? 'The user asked to summarize/recap recent chat history. Read recent_conversation_timeline carefully and present a concise, accurate summary using "• " bullets grouped by topic/person. Never invent facts not in the timeline.'
+      : 'Answer the user directly and naturally like a helpful human teammate using any provided recent_self_replies, last_drawn_tarot_cards, last_drawn_fortune_stick, or d1_prefetched_records. Keep replies concise and mobile-friendly (3-5 short lines or 2-3 "• " bullets). Never invent fake URLs or unverified details.',
+    `Reply STRICTLY in ${langLabel}.`,
+    'Never mention internal system errors, fallback models, or envelope metadata. Output ONLY the final reply text.',
+  ].join('\n');
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('workers_ai_fallback_timeout')), 12_000);
+    });
+    const raw = await Promise.race([
+      binding.run(model, {
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: envelope.slice(0, 12_000) },
+        ],
+        max_tokens: wantsSummary ? 420 : 320,
+        temperature: 0.4,
+      }),
+      timeoutPromise,
+    ]);
+    const text = extractWorkersAiText(raw);
+    return text || null;
+  } catch {
+    return null;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 interface SendFailureError extends Error {
@@ -2300,9 +2385,10 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
 
               const thinkingDelayMs = cfg.thinkingDelayMs ?? DEFAULT_THINKING_DELAY_MS;
               if (isDirectTurn && thinkingDelayMs > 0 && !nextTurn.thinkingEventId) {
-                const statusText =
-                  cfg.thinkingMessage?.(decision.detectedLang, nextTurn.event, decision) ??
-                  defaultThinkingMessage(decision.detectedLang, wantsSummary);
+                const statusText = wantsSummary
+                  ? defaultThinkingMessage(decision.detectedLang, true)
+                  : (cfg.thinkingMessage?.(decision.detectedLang, nextTurn.event, decision) ??
+                    defaultThinkingMessage(decision.detectedLang, false));
                 const roomChatType = context.chatType;
                 thinkingTimer = setTimeout(() => {
                   thinkingPostPromise = (async () => {
@@ -2336,7 +2422,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                   envelope,
                   eventId: nextTurn.event.eventId,
                   ...(storedContextId ? { contextId: storedContextId } : {}),
-                  timeoutMs: 45_000,
+                  timeoutMs: 20_000,
                   fetchImpl: cfg.fetchImpl,
                 });
                 rawAnswer = a2aRes.text;
@@ -2352,7 +2438,27 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                 ) {
                   await this.ctx.storage.delete('a2aContextId').catch(() => undefined);
                 }
-                throw a2aErr;
+                // Resilience circuit-breaker: Manyfold A2A stays 100% primary; ONLY if Manyfold A2A
+                // fails on a directly addressed turn when Workers AI is bound + enableA2AFailureReply is on,
+                // seamlessly fall back to Workers AI using the exact same pre-fetched envelope so the user
+                // never hangs staring at a stuck progress bubble during an upstream Manyfold outage.
+                if (isDirectTurn && cfg.enableA2AFailureReply === true && this.env.AI) {
+                  const backup = await runWorkersAiResilienceFallback(
+                    this.env.AI,
+                    this.env.AI_TRIAGE_MODEL,
+                    effectiveSpec,
+                    envelope,
+                    decision.detectedLang,
+                    wantsSummary,
+                  );
+                  if (backup) {
+                    rawAnswer = backup;
+                  } else {
+                    throw a2aErr;
+                  }
+                } else {
+                  throw a2aErr;
+                }
               }
             }
           } finally {
@@ -2557,7 +2663,6 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             lastDecision?.reason === 'explicit_mention' ||
             lastDecision?.reason === 'reply_to_self';
           const shouldSendFailureNotice =
-            error instanceof A2AError &&
             nextTurn.answer === undefined &&
             (Boolean(nextTurn.thinkingEventId) || (isDirectGiveUp && cfg.enableA2AFailureReply === true));
           if (shouldSendFailureNotice) {

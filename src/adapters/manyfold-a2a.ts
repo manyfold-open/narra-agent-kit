@@ -492,6 +492,16 @@ export async function runManyfoldA2ATurnWithMeta(options: RunA2AOptions): Promis
       contextId: finalSnap.contextId ?? options.contextId ?? null,
       taskId: finalSnap.taskId,
     };
+  } catch (err) {
+    if (err instanceof A2AError) throw err;
+    const isAbort =
+      controller.signal.aborted ||
+      (err instanceof Error && (err.name === 'AbortError' || /abort|timeout/i.test(err.message)));
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new A2AError(
+      isAbort ? `${label} A2A timed out after ${options.timeoutMs ?? 5 * 60_000}ms.` : `${label} A2A network error: ${detail}`,
+      true,
+    );
   } finally {
     clearTimeout(timer);
   }
