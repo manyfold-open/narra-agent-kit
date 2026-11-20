@@ -2295,7 +2295,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           const isCommittedTurn =
             isDirectTurn ||
             decision.reason === 'multi_mention_domain_match' ||
-            (decision.reason === 'active_session' && decision.directRoute === true);
+            decision.reason === 'active_session';
           const mentionNamesForCheck = [
             effectiveSpec.name,
             ...(effectiveSpec.aliases ?? []),
@@ -2693,7 +2693,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             lastDecision?.reason === 'explicit_mention' ||
             lastDecision?.reason === 'reply_to_self' ||
             lastDecision?.reason === 'multi_mention_domain_match' ||
-            (lastDecision?.reason === 'active_session' && lastDecision?.directRoute === true);
+            lastDecision?.reason === 'active_session';
           const shouldSendFailureNotice =
             nextTurn.answer === undefined &&
             (Boolean(nextTurn.thinkingEventId) || (isDirectGiveUp && cfg.enableA2AFailureReply === true));
