@@ -28,7 +28,7 @@ const QUESTION_OR_INTENT_RE =
   /[?？]|嗎|吗|呢|哪裡|哪里|推薦|推荐|介紹|介绍|請問|请问|有什麼|有什么|有沒有|有没有|多少|怎麼|怎么|\b(?:what|where|when|which|how|who|why|any|best|recommend|find|check|code|deals?|split|owe|news)\b/i;
 
 export const IMPLICIT_NEED_CUE_RE =
-  /好餓|好饿|餓了|饿了|吃什麼|吃什么|吃的|好吃|去哪[裡里]?|逛逛|好玩|帶朋友|带朋友|週末|周末|猶豫|犹豫|迷惘|迷茫|煩惱|烦恼|換跑道|换跑道|離職|离职|怎麼辦|怎么办|該不該|该不该|要不要|方向參考|方向参考|建議|建议|手續|手续|規定|规定|變嚴|变严|下架|出問題|出问题|新東西|新东西|新功能|最新|發生什麼|发生什么|聽說|听说|有沒有|有没有|推薦|推荐|哪家|哪間|哪间|便宜|折扣|優惠|优惠|省錢|省钱|\b(?:hungry|craving|where\s+to\s+(?:eat|go)|things\s+to\s+do|this\s+weekend|visit(?:ing)?|recommend|suggest|should\s+i|torn\s+between|confused\s+about|career\s+change|advice|visa|entry\s+rules?|requirements?|recalled?|announcement|launched?|latest|anyone\s+know|cheaper|discount|voucher|deal)\b/i;
+  /好餓|好饿|餓了|饿了|想吃|想喝|想逛|想看展|好想吃|好想喝|想要吃|想要喝|吃什麼|吃什么|吃的|好吃|去哪[裡里]?|逛逛|好玩|帶朋友|带朋友|週末|周末|猶豫|犹豫|迷惘|迷茫|煩惱|烦恼|換跑道|换跑道|離職|离职|怎麼辦|怎么办|該不該|该不该|要不要|方向參考|方向参考|建議|建议|手續|手续|規定|规定|變嚴|变严|下架|出問題|出问题|新東西|新东西|新功能|最新|發生什麼|发生什么|聽說|听说|有沒有|有没有|推薦|推荐|哪家|哪間|哪间|便宜|折扣|優惠|优惠|省錢|省钱|\b(?:hungry|craving|want\s+(?:to\s+eat|some)|feel\s+like\s+(?:eating|having)|where\s+to\s+(?:eat|go)|things\s+to\s+do|this\s+weekend|visit(?:ing)?|recommend|suggest|should\s+i|torn\s+between|confused\s+about|career\s+change|advice|visa|entry\s+rules?|requirements?|recalled?|announcement|launched?|latest|anyone\s+know|cheaper|discount|voucher|deal)\b/i;
 
 const REQUEST_ACTION_RE =
   /[?？]|嗎|吗|呢|哪[裡里家間间]|推薦|推荐|介紹|介绍|請問|请问|有什麼|有什么|有沒有|有没有|幫我|帮我|查一下|找一下|求一?[籤签]|抽一?[張张支牌籤签]|搖一?[籤签]|摇一?[籤签]|怎麼[去買选選辦办]|怎么[去买选办]|要不要|該不該|该不该|\b(?:recommend|suggest|where\s+(?:can|to|is)|what(?:'s|\s+is|\s+are)|which|any\s+(?:good|ideas?|tips?|places?|events?|deals?|codes?)|can\s+you|help\s+me|draw|find|check|looking\s+for)\b/i;
@@ -51,10 +51,10 @@ export const KNOWN_NARRA_PEER_ROLES: Record<string, string> = {
   'ai fortune stick': 'Traditional Chinese fortune stick draws (問一籤/求籤) and grounded decision reflections',
   '@agent-f9388b28:matrix.netmind.chat': 'London pop-ups, weekend events, markets, exhibitions, and sample sales',
   'spotted london': 'London pop-ups, weekend events, markets, exhibitions, and sample sales',
-  '@agent-b2b526f3:matrix.netmind.chat': 'London Chinese restaurants, dishes, dim sum, hotpot, bubble tea, and Chinese groceries',
-  'london chinese food': 'London Chinese restaurants, dishes, dim sum, hotpot, bubble tea, and Chinese groceries',
-  '@agent-37b08ab6:matrix.netmind.chat': '17 verified open datasets: AI hackathons/fundraising/acquisitions/data centers, visa policy changes, new laws, recalls, scholarships, marathons',
-  'manyfold data': '17 verified open datasets: AI hackathons/fundraising/acquisitions/data centers, visa policy changes, new laws, recalls, scholarships, marathons',
+  '@agent-b2b526f3:matrix.netmind.chat': 'London Chinese restaurants, dishes, dim sum, hotpot, Chinese BBQ skewers, bubble tea, and Chinese groceries',
+  'london chinese food': 'London Chinese restaurants, dishes, dim sum, hotpot, Chinese BBQ skewers, bubble tea, and Chinese groceries',
+  '@agent-37b08ab6:matrix.netmind.chat': '17 verified open datasets: AI hackathons/conferences/CFPs/fundraising/acquisitions/data centers, visa policy changes, new laws, recalls, scholarships, marathons',
+  'manyfold data': '17 verified open datasets: AI hackathons/conferences/CFPs/fundraising/acquisitions/data centers, visa policy changes, new laws, recalls, scholarships, marathons',
   '@agent-3add8bb6:matrix.netmind.chat': 'Daily AI news briefings, LLM model launches, and tech industry updates',
   'ai in 5': 'Daily AI news briefings, LLM model launches, and tech industry updates',
   '@agent-54ebea3a:matrix.netmind.chat': 'Shared group expense tracking, bill splitting, balances, and receipt reading',
@@ -716,25 +716,26 @@ export function createWorkersAiTriageModel(
     name: `workers-ai:${model}`,
     async score({ event, context, spec }) {
       const sig = scoreSignals(event, spec, context);
-      if (!sig.text || (sig.text.length <= 2 && sig.keywordHits === 0)) {
+      const selfExplicitlyMentioned = isSelfMentioned(event, spec);
+      if (!sig.text || (sig.text.length <= 2 && sig.keywordHits === 0 && !selfExplicitlyMentioned)) {
         return { score: 0.05, reason: 'triage_too_short' };
       }
       if (isNonConversationalDevOrUrlNoise(sig.text)) {
         return { score: 0.05, reason: 'triage_dev_or_url_noise' };
       }
-      if (isSummaryOrRecapRequest(sig.text) && sig.keywordHits === 0) {
+      if (isSummaryOrRecapRequest(sig.text) && sig.keywordHits === 0 && !selfExplicitlyMentioned) {
         return { score: 0.1, reason: 'triage_unmentioned_summary' };
       }
-      if (sig.isAnecdote && !QUESTION_OR_INTENT_RE.test(sig.text)) {
+      if (sig.isAnecdote && !QUESTION_OR_INTENT_RE.test(sig.text) && !selfExplicitlyMentioned) {
         return { score: Math.min(0.15, sig.heuristic), reason: 'triage_past_anecdote' };
       }
-      if (CASUAL_SMALL_TALK_RE.test(sig.text) && sig.keywordHits === 0 && !sig.hasNeedCue) {
+      if (CASUAL_SMALL_TALK_RE.test(sig.text) && sig.keywordHits === 0 && !sig.hasNeedCue && !selfExplicitlyMentioned) {
         return { score: 0.05, reason: 'triage_casual_chatter' };
       }
-      if (sig.antiHits > 0 && sig.keywordHits === 0) {
+      if (sig.antiHits > 0 && sig.keywordHits === 0 && !selfExplicitlyMentioned) {
         return { score: 0.05, reason: 'triage_other_domain' };
       }
-      if (sig.keywordHits === 0 && !sig.hasNeedCue) {
+      if (sig.keywordHits === 0 && !sig.hasNeedCue && !selfExplicitlyMentioned) {
         return { score: 0.1, reason: 'triage_no_need_cue' };
       }
       const pivotMatch = TOPIC_PIVOT_RE.exec(sig.text);
@@ -789,16 +790,15 @@ export function createWorkersAiTriageModel(
         return { score: Math.max(0.9, sig.heuristic), reason: 'domain_match' };
       }
 
-      const selfExplicitlyMentioned = isSelfMentioned(event, spec);
       if (
         selfExplicitlyMentioned &&
         sig.keywordHits >= 1 &&
         !sig.isAnecdote &&
         (QUESTION_OR_INTENT_RE.test(sig.text) ||
           REQUEST_ACTION_RE.test(sig.text) ||
-          /(?:各推|各來|推|幫我|帮我|推薦|推荐|挑|找|查)/i.test(sig.text))
+          /(?:各推|各來|各来|推|幫我|帮我|推薦|推荐|挑|找|查)/i.test(sig.text))
       ) {
-        return { score: Math.max(0.9, sig.heuristic), reason: 'multi_mention_domain_match' };
+        return { score: Math.max(0.92, sig.heuristic), reason: 'multi_mention_domain_match' };
       }
 
       const hasBackdropOrPivot = PAST_ANECDOTE_RE.test(sig.text) || Boolean(pivotMatch);
@@ -813,6 +813,9 @@ export function createWorkersAiTriageModel(
       }
 
       if (!binding) {
+        if (selfExplicitlyMentioned && !sig.isAnecdote) {
+          return { score: Math.max(0.85, sig.heuristic), reason: 'multi_mention_domain_match' };
+        }
         return { score: sig.heuristic, reason: 'heuristic_fallback' };
       }
 
@@ -1152,8 +1155,8 @@ export async function routeEvent(
     }
   }
 
-  // 9. Peer-already-replied check before running Tier 1
-  if (peers.length > 0 && hasPeerRepliedAfter(event, context, spec.matrixId)) {
+  // 9. Peer-already-replied check before running Tier 1 (skip when explicitly co-mentioned)
+  if (!isMultiAgentMention && peers.length > 0 && hasPeerRepliedAfter(event, context, spec.matrixId)) {
     return {
       shouldReply: false,
       tier: 1,
@@ -1211,9 +1214,9 @@ export async function routeEvent(
     return {
       shouldReply: true,
       tier: 1,
-      reason:
-        triageReason ??
-        (isMultiAgentMention ? 'multi_mention_domain_match' : 'domain_match'),
+      reason: isMultiAgentMention
+        ? 'multi_mention_domain_match'
+        : (triageReason ?? 'domain_match'),
       confidence: score,
       detectedLang,
       shouldQuote: quoteFlag,

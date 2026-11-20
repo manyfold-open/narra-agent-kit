@@ -2393,6 +2393,56 @@ describe('narra-agent-kit simulation & unit suite', () => {
       // Casual hearsay statement without question/request stays quiet in unmentioned group chat
       expect(isPastAnecdoteOrStatement('聽說 UCL 附近好吃的多')).toBe(true);
       expect(isPastAnecdoteOrStatement('聽說 UCL 附近好吃的多，有推薦的嗎？')).toBe(false);
+
+      // Explicit dual @mention does NOT drop at triage_other_domain even when keywordHits===0 and antiHits>0,
+      // and does NOT bail out even if the co-mentioned peer already replied first.
+      const broadCoMentionEv = makeTextEvent({
+        eventId: '$comention_2',
+        timestampMs: 1_700_000_050_000,
+        text: "@ChineseFood @SpottedLondon 週末想去 King's Cross 吃飯加逛逛，各推 1 個",
+        mentions: [CHINESE_FOOD_SPEC.matrixId!, SPOTTED_SPEC.matrixId!],
+      });
+      const aiScoredDual = createWorkersAiTriageModel({
+        run: vi.fn(async () => ({ response: '{"score":0.9,"reason":"dual_food_part"}' })),
+      });
+      const broadCoDecision = await routeEvent(
+        broadCoMentionEv,
+        groupCtx({
+          peers: [
+            { matrixId: SPOTTED_SPEC.matrixId!, displayName: 'SpottedLondon' },
+          ],
+          recentHistory: [
+            {
+              eventId: '$peer_replied_fast',
+              senderId: SPOTTED_SPEC.matrixId!,
+              text: 'Here is a King Cross popup!',
+              timestampMs: 1_700_000_051_000,
+              isAgent: true,
+              replyToEventId: '$comention_2',
+            },
+          ],
+        }),
+        {
+          ...CHINESE_FOOD_SPEC,
+          domainKeywords: ['川菜', '火鍋'],
+          antiKeywords: ['逛逛', '市集'],
+        },
+        { nowMs: 1_700_000_052_000, triageModel: aiScoredDual },
+      );
+      expect(broadCoDecision.shouldReply).toBe(true);
+      expect(broadCoDecision.reason).toBe('multi_mention_domain_match');
+
+      // Present-tense craving ("我想吃烧烤") triggers IMPLICIT_NEED_CUE_RE
+      const bbqTriage = createWorkersAiTriageModel({
+        run: vi.fn(async () => ({ response: '{"score":0.88,"reason":"craving_chinese_bbq"}' })),
+      });
+      const bbqScore = await bbqTriage.score({
+        event: makeTextEvent({ eventId: '$bbq_craving', text: '我想吃烧烤' }),
+        context: ctx,
+        spec: { ...CHINESE_FOOD_SPEC, domainKeywords: ['烧烤', '燒烤', '烤串'] },
+        detectedLang: 'zh-Hans',
+      });
+      expect(bbqScore.score).toBeGreaterThanOrEqual(0.8);
     });
   });
 });
