@@ -29,6 +29,7 @@ import {
   DEFAULT_SESSION_WINDOW_MS,
   createWorkersAiTriageModel,
   executePoliteYield,
+  hasPeerAnsweredTimeline,
   hasPeerRepliedAfter,
   inspectRoomPeers,
   isChainExhaustedError,
@@ -1523,6 +1524,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                 isSelf: true,
                 text: ev.text.slice(0, 1000),
                 timestampMs: ev.timestampMs,
+                ...(ev.replyToEventId ? { replyToEventId: ev.replyToEventId } : {}),
               });
               messageCache[ev.eventId] = {
                 eventId: ev.eventId,
@@ -1549,6 +1551,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                 isSelf: false,
                 text: ev.text.slice(0, 1000),
                 timestampMs: ev.timestampMs,
+                ...(ev.replyToEventId ? { replyToEventId: ev.replyToEventId } : {}),
               });
               messageCache[ev.eventId] = {
                 eventId: ev.eventId,
@@ -1578,6 +1581,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
               isSelf: false,
               text: ev.text.slice(0, 1000),
               timestampMs: ev.timestampMs,
+              ...(ev.replyToEventId ? { replyToEventId: ev.replyToEventId } : {}),
             });
             messageCache[ev.eventId] = {
               eventId: ev.eventId,
@@ -1703,11 +1707,10 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       return false;
     }
 
-    const isPeerEventAfter = (ev: InboundEvent): boolean =>
-      ev.eventId !== event.eventId &&
-      ev.senderId !== selfMatrixId &&
-      isNarraAgent(ev.senderId) &&
-      ev.timestampMs > event.timestampMs;
+    const filterTimeline = (events: InboundEvent[]) =>
+      events.filter(
+        (ev) => ev.kind !== 'reaction' && ev.kind !== 'edit' && ev.kind !== 'redaction',
+      );
 
     if (this.env.NARRA_SYNC_DO) {
       try {
@@ -1716,7 +1719,11 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           roomId: event.roomId,
           limit: 8,
         });
-        if (mat.ok && Array.isArray(mat.events) && mat.events.some(isPeerEventAfter)) {
+        if (
+          mat.ok &&
+          Array.isArray(mat.events) &&
+          hasPeerAnsweredTimeline(event, filterTimeline(mat.events), selfMatrixId)
+        ) {
           return true;
         }
       } catch {
@@ -1735,7 +1742,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           event.roomId,
           { dir: 'b', limit: 8 },
         );
-        if (backstop.events.some(isPeerEventAfter)) {
+        if (hasPeerAnsweredTimeline(event, filterTimeline(backstop.events), selfMatrixId)) {
           return true;
         }
       } catch {
@@ -2222,6 +2229,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             isSelf: true,
             text: answer.slice(0, 1000),
             timestampMs: repliedAtMs,
+            ...(replyToEventId ? { replyToEventId } : {}),
           });
           await this.ctx.storage.put('recentHistory', history.slice(-MAX_RECENT_HISTORY));
 

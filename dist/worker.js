@@ -7,7 +7,7 @@ import { detectExplicitLangSwitch, detectLang, stripAgentMentions } from './lang
 import { MemoryStore, handleStandardMemoryCommand, } from './memory.js';
 import { editContent, messageContent, plainMentions } from './mentions.js';
 import { shouldQuote } from './quote.js';
-import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSION_WINDOW_MS, createWorkersAiTriageModel, executePoliteYield, hasPeerRepliedAfter, inspectRoomPeers, isChainExhaustedError, isSelfMentioned, routeEvent, } from './router.js';
+import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSION_WINDOW_MS, createWorkersAiTriageModel, executePoliteYield, hasPeerAnsweredTimeline, hasPeerRepliedAfter, inspectRoomPeers, isChainExhaustedError, isSelfMentioned, routeEvent, } from './router.js';
 import { fetchEventContext, fetchMatrixCredential, fetchNarraChatMessagesBackstop, fetchRoomMessagesBackstop, matrixSyncRequest, redactSecrets, SyncError, syncOnce, } from './sync.js';
 const DEFAULT_NARRA_API_ENDPOINT = 'https://api.netmind.chat';
 const DEFAULT_MATRIX_HOMESERVER = 'https://matrix.netmind.chat';
@@ -1134,6 +1134,7 @@ export class BaseNarraRoomCoordinator {
                                 isSelf: true,
                                 text: ev.text.slice(0, 1000),
                                 timestampMs: ev.timestampMs,
+                                ...(ev.replyToEventId ? { replyToEventId: ev.replyToEventId } : {}),
                             });
                             messageCache[ev.eventId] = {
                                 eventId: ev.eventId,
@@ -1159,6 +1160,7 @@ export class BaseNarraRoomCoordinator {
                                 isSelf: false,
                                 text: ev.text.slice(0, 1000),
                                 timestampMs: ev.timestampMs,
+                                ...(ev.replyToEventId ? { replyToEventId: ev.replyToEventId } : {}),
                             });
                             messageCache[ev.eventId] = {
                                 eventId: ev.eventId,
@@ -1187,6 +1189,7 @@ export class BaseNarraRoomCoordinator {
                             isSelf: false,
                             text: ev.text.slice(0, 1000),
                             timestampMs: ev.timestampMs,
+                            ...(ev.replyToEventId ? { replyToEventId: ev.replyToEventId } : {}),
                         });
                         messageCache[ev.eventId] = {
                             eventId: ev.eventId,
@@ -1299,10 +1302,7 @@ export class BaseNarraRoomCoordinator {
         if (!isNarraSyncEnabled(this.env)) {
             return false;
         }
-        const isPeerEventAfter = (ev) => ev.eventId !== event.eventId &&
-            ev.senderId !== selfMatrixId &&
-            isNarraAgent(ev.senderId) &&
-            ev.timestampMs > event.timestampMs;
+        const filterTimeline = (events) => events.filter((ev) => ev.kind !== 'reaction' && ev.kind !== 'edit' && ev.kind !== 'redaction');
         if (this.env.NARRA_SYNC_DO) {
             try {
                 const mat = await this.matrixOp({
@@ -1310,7 +1310,9 @@ export class BaseNarraRoomCoordinator {
                     roomId: event.roomId,
                     limit: 8,
                 });
-                if (mat.ok && Array.isArray(mat.events) && mat.events.some(isPeerEventAfter)) {
+                if (mat.ok &&
+                    Array.isArray(mat.events) &&
+                    hasPeerAnsweredTimeline(event, filterTimeline(mat.events), selfMatrixId)) {
                     return true;
                 }
             }
@@ -1325,7 +1327,7 @@ export class BaseNarraRoomCoordinator {
                     narraAgentToken: this.env.NARRA_AGENT_TOKEN,
                     fetchImpl: this.getConfig().fetchImpl,
                 }, event.roomId, { dir: 'b', limit: 8 });
-                if (backstop.events.some(isPeerEventAfter)) {
+                if (hasPeerAnsweredTimeline(event, filterTimeline(backstop.events), selfMatrixId)) {
                     return true;
                 }
             }
@@ -1698,6 +1700,7 @@ export class BaseNarraRoomCoordinator {
                         isSelf: true,
                         text: answer.slice(0, 1000),
                         timestampMs: repliedAtMs,
+                        ...(replyToEventId ? { replyToEventId } : {}),
                     });
                     await this.ctx.storage.put('recentHistory', history.slice(-MAX_RECENT_HISTORY));
                     const consec = ((await this.ctx.storage.get('consecutiveAgentMessages')) ?? 0) + 1;

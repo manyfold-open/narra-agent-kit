@@ -87,6 +87,7 @@ export interface HistoryTurn {
   isSelf?: boolean;
   text: string;
   timestampMs: number;
+  replyToEventId?: string;
 }
 
 export interface ReplyTargetContext {

@@ -61,6 +61,19 @@ export declare class AgentChainTracker {
     nextRetryDelayMs(failedAttempts: number): number | null;
 }
 export declare function isChainExhaustedError(error: unknown): boolean;
+export interface TimelineTurn {
+    eventId: string;
+    senderId: string;
+    isAgent?: boolean;
+    timestampMs: number;
+    replyToEventId?: string;
+}
+/**
+ * Checks whether a peer `@agent-*` already answered THIS specific `event`
+ * (either quoting it/any coalesced fragment, or answering unquoted BEFORE any subsequent human turn).
+ * Peer replies to a later human message (or quoting a different message) do NOT suppress this turn.
+ */
+export declare function hasPeerAnsweredTimeline(event: InboundEvent, timeline: ReadonlyArray<TimelineTurn>, selfMatrixId?: string): boolean;
 /** Checks whether a peer `@agent-*` already replied after the trigger event in recent history. */
 export declare function hasPeerRepliedAfter(event: InboundEvent, context: RoomContext, selfMatrixId?: string): boolean;
 export interface PoliteYieldOptions {

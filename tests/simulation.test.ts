@@ -27,6 +27,7 @@ import {
   fetchMatrixCredential,
   fetchRoomMessagesBackstop,
   hasOnlyTrailingAgentMessages,
+  hasPeerRepliedAfter,
   heuristicDomainScore,
   inspectRoomPeers,
   isChainExhaustedError,
@@ -2121,6 +2122,137 @@ describe('narra-agent-kit simulation & unit suite', () => {
       await coalescer.flushDue(nowMs);
       expect(flushed).toHaveLength(1);
       expect(flushed[0].coalescedEventIds).toEqual(['$f2a', '$f2b']);
+      coalescer.dispose();
+    });
+
+    it('hasPeerRepliedAfter ignores peer replies to later human turns or quoted different events while keeping same-turn yields', () => {
+      const q4 = makeTextEvent({
+        eventId: '$q4',
+        senderId: '@alice:matrix.netmind.chat',
+        text: '幫我找 Soho 附近營業中的拉麵店，順便問一下今天 AI 有什麼大新聞？',
+        timestampMs: 10_000,
+      });
+      const selfId = '@agent-b2b526f3:matrix.netmind.chat'; // LCF
+      const mfdId = '@agent-37b08ab6:matrix.netmind.chat';
+      const tarotId = '@agent-852feddf:matrix.netmind.chat';
+
+      // Case 1: Human B sends Q5 (@Manyfold Data) at 13s and Manyfold Data answers Q5 unquoted at 14s -> LCF must NOT yield on Q4!
+      const ctxLaterHuman = groupCtx({
+        recentHistory: [
+          { eventId: '$q4', senderId: '@alice:matrix.netmind.chat', isAgent: false, text: q4.text, timestampMs: 10_000 },
+          { eventId: '$q5', senderId: '@bob:matrix.netmind.chat', isAgent: false, text: '@Manyfold Data ignore...', timestampMs: 13_000 },
+          { eventId: '$a5', senderId: mfdId, isAgent: true, text: 'Outside my datasets', timestampMs: 14_000 },
+        ],
+      });
+      expect(hasPeerRepliedAfter(q4, ctxLaterHuman, selfId)).toBe(false);
+
+      // Case 2: Peer (AI Tarot) quotes an earlier event ($8a) after $8b -> Spotted London on $8b must NOT yield!
+      const q8b = makeTextEvent({
+        eventId: '$8b',
+        senderId: '@alice:matrix.netmind.chat',
+        text: '這週末倫敦 Shoreditch 有什麼免費快閃市集？',
+        timestampMs: 22_500,
+      });
+      const ctxQuotedOther = groupCtx({
+        recentHistory: [
+          { eventId: '$8a', senderId: '@alice:matrix.netmind.chat', isAgent: false, text: '@AI Tarot ...', timestampMs: 20_000 },
+          { eventId: '$8b', senderId: '@alice:matrix.netmind.chat', isAgent: false, text: q8b.text, timestampMs: 22_500 },
+          { eventId: '$a8a', senderId: tarotId, isAgent: true, text: 'Drawn 1 card', timestampMs: 23_500, replyToEventId: '$8a' },
+        ],
+      });
+      expect(hasPeerRepliedAfter(q8b, ctxQuotedOther, '@agent-f9388b28:matrix.netmind.chat')).toBe(false);
+
+      // Case 3: Peer directly answers Q4 unquoted before any later human turn -> STILL yields!
+      const ctxDirectAnswer = groupCtx({
+        recentHistory: [
+          { eventId: '$q4', senderId: '@alice:matrix.netmind.chat', isAgent: false, text: q4.text, timestampMs: 10_000 },
+          { eventId: '$a4', senderId: mfdId, isAgent: true, text: 'Direct answer', timestampMs: 11_500 },
+        ],
+      });
+      expect(hasPeerRepliedAfter(q4, ctxDirectAnswer, selfId)).toBe(true);
+
+      // Case 4: Peer quotes $8a AFTER another human already spoke ($8b) -> DOES yield for $8a!
+      const q8a = makeTextEvent({
+        eventId: '$8a',
+        senderId: '@alice:matrix.netmind.chat',
+        text: '@AI Tarot ...',
+        timestampMs: 20_000,
+      });
+      expect(hasPeerRepliedAfter(q8a, ctxQuotedOther, '@agent-f9388b28:matrix.netmind.chat')).toBe(true);
+    });
+
+    it('BurstCoalescer splits same-ms sync batches by event timestampMs gap > windowMs, isolates dev/URL noise, and splits standalone questions', async () => {
+      const nowMs = BASE_TIME;
+      const roomId = '!sync_batch:matrix.netmind.chat';
+      const flushed: InboundEvent[] = [];
+      const coalescer = new BurstCoalescer({
+        windowMs: 1_800,
+        scheduleTimers: false,
+        now: () => nowMs,
+        onFlush: (merged) => {
+          flushed.push(merged);
+        },
+      });
+
+      // Simulated single /sync batch arriving at same DO clock `nowMs` containing 4 events sent 3s apart
+      await coalescer.push(
+        makeTextEvent({
+          roomId,
+          eventId: '$m1',
+          text: 'Error 500 on /api/hackathons?city=London&price=£49: openai timeout after 30s at popup_modal.tsx',
+          timestampMs: nowMs,
+        }),
+      );
+      await coalescer.push(
+        makeTextEvent({
+          roomId,
+          eventId: '$m2',
+          text: 'https://github.com/openai/openai-python/issues/1234',
+          timestampMs: nowMs + 3_000,
+        }),
+      );
+      await coalescer.push(
+        makeTextEvent({
+          roomId,
+          eventId: '$m3',
+          text: '剛在唐人街吃完火鍋超撐，順便問一下今天 OpenAI 或 Anthropic 有發新模型嗎？',
+          timestampMs: nowMs + 6_000,
+        }),
+      );
+      await coalescer.push(
+        makeTextEvent({
+          roomId,
+          eventId: '$m4',
+          text: '幫我找 Soho 附近營業中的拉麵店，順便問一下今天 AI 有什麼大新聞？',
+          timestampMs: nowMs + 9_000,
+        }),
+      );
+      await coalescer.flushAll();
+
+      expect(flushed).toHaveLength(4);
+      expect(flushed.map((f) => f.eventId)).toEqual(['$m1', '$m2', '$m3', '$m4']);
+
+      // Same-second consecutive standalone questions with NO-@ ALSO split cleanly so question 1 isn't fused with question 2
+      flushed.length = 0;
+      await coalescer.push(
+        makeTextEvent({
+          roomId,
+          eventId: '$s1',
+          text: '剛在唐人街吃完火鍋超撐，順便問一下今天 OpenAI 或 Anthropic 有發新模型嗎？',
+          timestampMs: nowMs + 20_000,
+        }),
+      );
+      await coalescer.push(
+        makeTextEvent({
+          roomId,
+          eventId: '$s2',
+          text: '幫我找 Soho 附近營業中的拉麵店，順便問一下今天 AI 有什麼大新聞？',
+          timestampMs: nowMs + 20_500,
+        }),
+      );
+      await coalescer.flushAll();
+      expect(flushed).toHaveLength(2);
+      expect(flushed.map((f) => f.eventId)).toEqual(['$s1', '$s2']);
       coalescer.dispose();
     });
   });

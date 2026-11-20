@@ -363,26 +363,68 @@ export function isChainExhaustedError(error: unknown): boolean {
   );
 }
 
+export interface TimelineTurn {
+  eventId: string;
+  senderId: string;
+  isAgent?: boolean;
+  timestampMs: number;
+  replyToEventId?: string;
+}
+
+/**
+ * Checks whether a peer `@agent-*` already answered THIS specific `event`
+ * (either quoting it/any coalesced fragment, or answering unquoted BEFORE any subsequent human turn).
+ * Peer replies to a later human message (or quoting a different message) do NOT suppress this turn.
+ */
+export function hasPeerAnsweredTimeline(
+  event: InboundEvent,
+  timeline: ReadonlyArray<TimelineTurn>,
+  selfMatrixId?: string,
+): boolean {
+  const coalescedIds = new Set(event.coalescedEventIds ?? [event.eventId]);
+  const later = timeline
+    .filter((turn) => turn.timestampMs > event.timestampMs && !coalescedIds.has(turn.eventId))
+    .sort((a, b) => a.timestampMs - b.timestampMs);
+
+  let supersededByLaterHuman = false;
+  for (const turn of later) {
+    const turnIsAgent = Boolean(turn.isAgent) || isNarraAgent(turn.senderId);
+    if (turnIsAgent) {
+      if (turn.senderId === selfMatrixId) continue;
+      if (turn.replyToEventId) {
+        if (coalescedIds.has(turn.replyToEventId)) return true;
+        continue;
+      }
+      if (!supersededByLaterHuman) return true;
+      continue;
+    }
+    supersededByLaterHuman = true;
+  }
+  return false;
+}
+
 /** Checks whether a peer `@agent-*` already replied after the trigger event in recent history. */
 export function hasPeerRepliedAfter(
   event: InboundEvent,
   context: RoomContext,
   selfMatrixId?: string,
 ): boolean {
-  const fromHistory = context.recentHistory.some(
-    (turn) =>
-      (turn.isAgent || isNarraAgent(turn.senderId)) &&
-      turn.senderId !== selfMatrixId &&
-      turn.timestampMs > event.timestampMs,
+  const coalescedIds = new Set(event.coalescedEventIds ?? [event.eventId]);
+  const hasLaterHistory = context.recentHistory.some(
+    (turn) => turn.timestampMs > event.timestampMs && !coalescedIds.has(turn.eventId),
   );
-  if (fromHistory) return true;
+  if (hasLaterHistory) {
+    return hasPeerAnsweredTimeline(event, context.recentHistory, selfMatrixId);
+  }
   if (Array.isArray(context.subsequentEvents)) {
-    return context.subsequentEvents.some(
-      (ev) =>
-        ev.eventId !== event.eventId &&
-        ev.senderId !== selfMatrixId &&
-        isNarraAgent(ev.senderId),
-    );
+    for (const ev of context.subsequentEvents) {
+      if (coalescedIds.has(ev.eventId)) continue;
+      if (isNarraAgent(ev.senderId)) {
+        if (ev.senderId !== selfMatrixId) return true;
+        continue;
+      }
+      break;
+    }
   }
   return false;
 }

@@ -1,4 +1,5 @@
 import type { InboundEvent } from './types.js';
+import { isNonConversationalDevOrUrlNoise } from './router.js';
 
 export const DEFAULT_COALESCE_WINDOW_MS = 1_800;
 
@@ -58,24 +59,42 @@ function burstTargetSignature(event: InboundEvent): string | null {
   return tokens.length > 0 ? [...new Set(tokens)].sort().join(',') : null;
 }
 
-function shouldSplitBurst(existing: InboundEvent[], incoming: InboundEvent): boolean {
+function shouldSplitBurst(
+  existing: InboundEvent[],
+  incoming: InboundEvent,
+  windowMs: number,
+): boolean {
   if (existing.length === 0) return false;
   const prevReplyTo = existing.find((f) => f.replyToEventId)?.replyToEventId;
   if (prevReplyTo && incoming.replyToEventId && incoming.replyToEventId !== prevReplyTo) {
+    return true;
+  }
+  const last = existing[existing.length - 1];
+  if (last.timestampMs > 0 && incoming.timestampMs > 0 && incoming.timestampMs - last.timestampMs > windowMs) {
+    return true;
+  }
+  const existingJoined = existing
+    .map((f) => f.text.trim())
+    .filter(Boolean)
+    .join('\n');
+  const incomingText = (incoming.text ?? '').trim();
+  if (
+    isNonConversationalDevOrUrlNoise(existingJoined) ||
+    isNonConversationalDevOrUrlNoise(incomingText)
+  ) {
     return true;
   }
   const prevMentions = [...new Set(existing.flatMap((f) => f.mentions))].sort();
   const prevSig =
     prevMentions.length > 0 ? prevMentions.join(',') : burstTargetSignature(existing[0]);
   const nextSig = burstTargetSignature(incoming);
+  const existingBody = existing
+    .map((f) => f.text.replace(MENTION_TOKEN_RE, ' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join(' ')
+    .trim();
   if (nextSig === null) {
     if (prevSig !== null) {
-      const existingBody = existing
-        .map((f) => f.text.replace(MENTION_TOKEN_RE, ' ').replace(/\s+/g, ' ').trim())
-        .filter(Boolean)
-        .join(' ')
-        .trim();
-      const incomingText = (incoming.text ?? '').trim();
       if (
         existingBody.length >= 6 &&
         !/[,，、:：]$/.test(existingBody) &&
@@ -84,6 +103,14 @@ function shouldSplitBurst(existing: InboundEvent[], incoming: InboundEvent): boo
       ) {
         return true;
       }
+    } else if (
+      existingBody.length >= 8 &&
+      !/[,，、:：]$/.test(existingBody) &&
+      /[?？]\s*$/.test(existingBody) &&
+      !CONTINUATION_OR_CANCEL_PREFIX_RE.test(incomingText) &&
+      STANDALONE_QUESTION_RE.test(incomingText)
+    ) {
+      return true;
     }
     // Follow-up fragment without a new @mention continues coalescing with the prior turn.
     return false;
@@ -190,7 +217,7 @@ export class BurstCoalescer {
     const key = this.bufferKey(event.roomId, event.senderId);
     let buf = this.buffers.get(key);
     let flushedPrior: InboundEvent | undefined;
-    if (buf && shouldSplitBurst(buf.fragments, event)) {
+    if (buf && shouldSplitBurst(buf.fragments, event, this.windowMs)) {
       const prior = await this.flushKey(key);
       if (prior) flushedPrior = prior;
       buf = undefined;
