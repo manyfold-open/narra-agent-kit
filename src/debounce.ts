@@ -39,15 +39,22 @@ export type CoalescePushResult =
   | { status: 'cancelled'; cancelled: boolean; empty?: boolean }
   | { status: 'bypass'; event: InboundEvent };
 
+const MENTION_TOKEN_RE =
+  /(?<=^|\s)@(?:AI\s+(?:Fortune\s+Stick|Tarot|in\s+5)|Spotted\s+London|London\s+Chinese\s+Food|Manyfold\s+Data|[\p{L}\p{N}._=\-/+]+)/giu;
+
+const CONTINUATION_OR_CANCEL_PREFIX_RE =
+  /^(?:算了|沒事|没事|不用了?|先不用|取消|其實|其实|對了|对了|喔對|哦对|補充|补充|還有|还有|另外|順便|顺便|不對|不对|更正|等等|等一下|btw|nvm|never\s*mind|cancel|actually|also|oh\s+and|wait|sorry|oops)\b/i;
+
+const STANDALONE_QUESTION_RE =
+  /[?？]\s*$|^(?:這週末|这周末|週末|周末|今天|明天|請問|请问|有沒有|有没有|哪裡|哪里|推薦|推荐|幫我|帮我|anyone|any\s+good|what(?:'s|\s+is|\s+are)|where\s+(?:can|to|is)|how\s+(?:do|to))/i;
+
 function burstTargetSignature(event: InboundEvent): string | null {
   if (event.mentions.length > 0) {
     return [...new Set(event.mentions)].sort().join(',');
   }
-  const tokens = [
-    ...(event.text ?? '').matchAll(
-      /(?:^|\s)@(AI\s+(?:Fortune\s+Stick|Tarot|in\s+5)|Spotted\s+London|London\s+Chinese\s+Food|Manyfold\s+Data|[\p{L}\p{N}._=\-/+]+)/giu,
-    ),
-  ].map((m) => `text:${m[1].replace(/\s+/g, ' ').trim().toLowerCase()}`);
+  const tokens = [...(event.text ?? '').matchAll(MENTION_TOKEN_RE)].map(
+    (m) => `text:${m[0].slice(1).replace(/\s+/g, ' ').trim().toLowerCase()}`,
+  );
   return tokens.length > 0 ? [...new Set(tokens)].sort().join(',') : null;
 }
 
@@ -57,14 +64,30 @@ function shouldSplitBurst(existing: InboundEvent[], incoming: InboundEvent): boo
   if (prevReplyTo && incoming.replyToEventId && incoming.replyToEventId !== prevReplyTo) {
     return true;
   }
-  const nextSig = burstTargetSignature(incoming);
-  if (nextSig === null) {
-    // Follow-up fragment without a new @mention continues coalescing with the prior turn.
-    return false;
-  }
   const prevMentions = [...new Set(existing.flatMap((f) => f.mentions))].sort();
   const prevSig =
     prevMentions.length > 0 ? prevMentions.join(',') : burstTargetSignature(existing[0]);
+  const nextSig = burstTargetSignature(incoming);
+  if (nextSig === null) {
+    if (prevSig !== null) {
+      const existingBody = existing
+        .map((f) => f.text.replace(MENTION_TOKEN_RE, ' ').replace(/\s+/g, ' ').trim())
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+      const incomingText = (incoming.text ?? '').trim();
+      if (
+        existingBody.length >= 6 &&
+        !/[,，、:：]$/.test(existingBody) &&
+        !CONTINUATION_OR_CANCEL_PREFIX_RE.test(incomingText) &&
+        STANDALONE_QUESTION_RE.test(incomingText)
+      ) {
+        return true;
+      }
+    }
+    // Follow-up fragment without a new @mention continues coalescing with the prior turn.
+    return false;
+  }
   return nextSig !== prevSig;
 }
 

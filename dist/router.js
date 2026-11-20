@@ -39,6 +39,23 @@ const CASUAL_SMALL_TALK_RE = /天氣|天气|下雨|下雪|晴天|陰天|阴天|�
 const SHORT_CONFIRM_RE = /^(?:抽|搖|摇|好|好的|好喔|好哦|對|对|對的|对的|對啊|对啊|繼續|继续|更多|下一[頁页]|是|不是|行|可以|要|再來|再来|yes|no|ok|okay|sure|more|next|another|draw|shake|go ahead)[!！。.~～?？\s]*$/i;
 const ACTIVE_FOLLOWUP_RE = /(?:這[個間家張支條筆輪期]|这[个间家张支条笔轮期]|哪[一]?[個間家張支條筆]|第\s*[0-9一二三四五六七八九十]+|[那這][張支間家位筆][牌籤簽店]?|還有|还有|別[間家的個]|别[间家的个]|換一|换一|再[抽來找看查問问試试]|詳細|详细|細節|细节|解說|解说|解釋|解释|意思|含義|含义|地址|菜單|菜单|價格|价格|價錢|价钱|多少錢|多少钱|人均|(?:開到|开到|營業到|营业到)\s*(?:幾點|几点)|幾點(?:開門|开门|關門|关门|營業|营业|打烊|開始|开始|結束|结束|截止)|几点(?:开门|关门|营业|打烊|开始|结束|截止)|(?:開門|开门|關門|关门|營業|营业|開始|开始|截止|開放|开放)\s*(?:時間|时间)|開門|开门|營業|营业|怎麼去|怎么去|坐什麼|坐什么|地鐵|地铁|附近|比較近|比较近|比較便宜|比较便宜|推薦|推荐|算一份|也算|改成|取消|截止|日期|來源|来源|連結|链接|網址|网址|網站|网站)|\b(?:which\s+one|that\s+one|those|this\s+one|another|more|next|details?|explain|meaning|interpret|address|menu|price|cost|hours?|opening|how\s+(?:do\s+(?:i|we)|to)\s+get|tube|station|walk|closer|cheaper|recommend|also|actually|make\s+that|what\s+about|how\s+about|why|when|where\s+is|deadline|source|link)\b/i;
 const HUMAN_GROUP_CHATTER_RE = /(?:對了\s*大家|对了\s*大家|大家(?:晚點|晚点|等等|待會|待会|明天|等下|幾點|几点|要不|覺得|觉得)|會議室|会议室|開會|开会|約個會|约个会|訂會議室|订会议室|幾點開會|几点开会|幾點下班|几点下班|幾點出發|几点出发|地鐵誤點|地铁误点|地鐵延誤|地铁延误|延誤|延误|\b(?:everyone|guys|folks|team)\b.{0,24}\b(?:meeting|room|book|call|standup|sync|late|delayed|office|pint|pub)\b|\b(?:meeting\s+room|book\s+a\s+room|standup|conference\s+room|late\s+to\s+the\s+office)\b)/i;
+const BARE_URL_ONLY_RE = /^(?:https?:\/\/\S+\s*)+$/i;
+const DEV_ERROR_HEADER_RE = /\b(?:error\s+[45]\d{2}|http\s+[45]\d{2}|status\s+[45]\d{2}|traceback\s*\(|stack\s*trace|unhandled\s+(?:exception|rejection)|(?:type|reference|syntax|runtime|range|value|key|attribute|index)error|segmentation\s+fault|panic:)\b/i;
+const CODE_PATH_OR_FILE_RE = /(?:\/api\/[\w./-]+|\b[\w-]+\.(?:tsx?|jsx?|py|go|rs|java|rb|php|cpp|hpp|cs|swift|kt|vue|svelte)\b(?::\d+)?)/i;
+const DEV_FAILURE_TERM_RE = /\b(?:error|err|timeout|timed\s+out|exception|failed|failure|crash(?:ed)?|500|502|503|504|404|403|401|econnrefused|enotfound|etimedout)\b/i;
+/** Returns true for bare pasted URLs or developer error/stack-trace snippets that agents should ignore in unmentioned group chat. */
+export function isNonConversationalDevOrUrlNoise(text) {
+    const clean = (text ?? '').trim();
+    if (!clean)
+        return false;
+    if (BARE_URL_ONLY_RE.test(clean))
+        return true;
+    if (DEV_ERROR_HEADER_RE.test(clean))
+        return true;
+    if (CODE_PATH_OR_FILE_RE.test(clean) && DEV_FAILURE_TERM_RE.test(clean))
+        return true;
+    return false;
+}
 /** Extracts peer `@agent-*` members from a room roster, excluding self. */
 export function inspectRoomPeers(members, selfMatrixId) {
     const peers = [];
@@ -379,21 +396,22 @@ function scoreSignals(event, spec, context) {
     const peers = context?.peers ?? inspectRoomPeers(context?.members ?? [], spec.matrixId);
     const mentionNames = collectMentionNames(spec, peers);
     const text = stripAgentMentions(event.text ?? '', mentionNames).trim();
-    if (!text) {
+    if (!text || isNonConversationalDevOrUrlNoise(text)) {
         return {
-            text: '',
+            text: !text ? '' : text,
             peers,
             antiHits: 0,
             keywordHits: 0,
             totalHits: 0,
             isAnecdote: false,
             hasNeedCue: false,
-            heuristic: 0,
+            heuristic: !text ? 0 : 0.05,
         };
     }
-    const lower = text.toLowerCase();
-    const antiHits = countKeywordMatches(text, lower, spec.antiKeywords);
-    const keywordHits = countKeywordMatches(text, lower, spec.domainKeywords);
+    const keywordText = text.replace(/https?:\/\/\S+/gi, ' ').replace(/\s+/g, ' ').trim();
+    const lower = keywordText.toLowerCase();
+    const antiHits = keywordText ? countKeywordMatches(keywordText, lower, spec.antiKeywords) : 0;
+    const keywordHits = keywordText ? countKeywordMatches(keywordText, lower, spec.domainKeywords) : 0;
     let descHits = 0;
     if ((spec.domainKeywords ?? []).length === 0 && spec.domainDescription) {
         const asciiWords = (spec.domainDescription.toLowerCase().match(/[a-z]{3,}/g) ?? []).filter((w) => !STOPWORDS.has(w));
@@ -526,6 +544,9 @@ export function createWorkersAiTriageModel(ai, options = {}) {
             if (!sig.text || (sig.text.length <= 2 && sig.keywordHits === 0)) {
                 return { score: 0.05, reason: 'triage_too_short' };
             }
+            if (isNonConversationalDevOrUrlNoise(sig.text)) {
+                return { score: 0.05, reason: 'triage_dev_or_url_noise' };
+            }
             if (sig.isAnecdote && !QUESTION_OR_INTENT_RE.test(sig.text)) {
                 return { score: Math.min(0.15, sig.heuristic), reason: 'triage_past_anecdote' };
             }
@@ -541,17 +562,52 @@ export function createWorkersAiTriageModel(ai, options = {}) {
             const pivotMatch = TOPIC_PIVOT_RE.exec(sig.text);
             const prePivot = pivotMatch ? sig.text.slice(0, pivotMatch.index).trim() : '';
             const postPivot = pivotMatch ? sig.text.slice(pivotMatch.index + pivotMatch[0].length).trim() : '';
+            const prePivotDomainHits = prePivot
+                ? countKeywordMatches(prePivot, prePivot.toLowerCase(), spec.domainKeywords)
+                : 0;
+            const prePivotAntiHits = prePivot
+                ? countKeywordMatches(prePivot, prePivot.toLowerCase(), spec.antiKeywords)
+                : 0;
+            const postPivotDomainHits = postPivot
+                ? countKeywordMatches(postPivot, postPivot.toLowerCase(), spec.domainKeywords)
+                : 0;
+            const postPivotAntiHits = postPivot
+                ? countKeywordMatches(postPivot, postPivot.toLowerCase(), spec.antiKeywords)
+                : 0;
+            // Post-pivot primary question after a non-request / past-tense backdrop clause (e.g., H1)
             const postPivotDirectMatch = Boolean(pivotMatch) &&
                 Boolean(postPivot) &&
                 !REQUEST_ACTION_RE.test(prePivot) &&
-                countKeywordMatches(postPivot, postPivot.toLowerCase(), spec.domainKeywords) >= 2 &&
-                countKeywordMatches(postPivot, postPivot.toLowerCase(), spec.antiKeywords) === 0 &&
+                postPivotDomainHits >= 2 &&
+                postPivotAntiHits === 0 &&
                 (QUESTION_OR_INTENT_RE.test(postPivot) || IMPLICIT_NEED_CUE_RE.test(postPivot));
+            if (postPivotDirectMatch) {
+                return { score: Math.max(0.92, sig.heuristic), reason: 'domain_match' };
+            }
+            // Past-tense backdrop with peer-specific post-pivot question -> yield deterministically
+            if (Boolean(pivotMatch) &&
+                Boolean(prePivot) &&
+                !REQUEST_ACTION_RE.test(prePivot) &&
+                PAST_ANECDOTE_RE.test(prePivot) &&
+                postPivotDomainHits === 0 &&
+                postPivotAntiHits > 0) {
+                return { score: 0.1, reason: 'triage_backdrop_only' };
+            }
+            // Primary ask before "順便 / btw" followed by a secondary add-on -> primary specialist answers cleanly (e.g., H3)
+            const prePivotDirectMatch = Boolean(pivotMatch) &&
+                Boolean(prePivot) &&
+                REQUEST_ACTION_RE.test(prePivot) &&
+                !PAST_ANECDOTE_RE.test(prePivot) &&
+                prePivotAntiHits === 0 &&
+                (prePivotDomainHits >= 2 || (prePivotDomainHits >= 1 && postPivotAntiHits > 0));
+            if (prePivotDirectMatch) {
+                return { score: Math.max(0.9, sig.heuristic), reason: 'domain_match' };
+            }
             const hasBackdropOrPivot = PAST_ANECDOTE_RE.test(sig.text) || Boolean(pivotMatch);
             if (sig.keywordHits >= 2 &&
                 sig.antiHits === 0 &&
                 !sig.isAnecdote &&
-                (!hasBackdropOrPivot || postPivotDirectMatch) &&
+                !hasBackdropOrPivot &&
                 sig.hasNeedCue) {
                 return { score: Math.max(0.9, sig.heuristic), reason: 'domain_match' };
             }
@@ -761,6 +817,16 @@ export async function routeEvent(event, context, spec, options = {}) {
                 : Infinity);
         if (expires >= nowMs) {
             const strippedText = stripAgentMentions(event.text ?? '', mentionNames).trim();
+            if (isNonConversationalDevOrUrlNoise(strippedText)) {
+                return {
+                    shouldReply: false,
+                    tier: 0,
+                    reason: 'active_session_chatter',
+                    confidence: 0.95,
+                    detectedLang,
+                    shouldQuote: false,
+                };
+            }
             const lowerText = strippedText.toLowerCase();
             const hasAntiHit = countKeywordMatches(strippedText, lowerText, spec.antiKeywords) > 0;
             const hasDomainHit = countKeywordMatches(strippedText, lowerText, spec.domainKeywords) > 0;

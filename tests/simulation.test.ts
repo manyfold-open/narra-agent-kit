@@ -1968,5 +1968,160 @@ describe('narra-agent-kit simulation & unit suite', () => {
       expect(drawFollowUp.shouldReply).toBe(true);
       expect(drawFollowUp.reason).toBe('active_session');
     });
+
+    it('drops bare URLs and dev error/stack-trace logs at 0ms in Tier 1 and active_session (G1a/G1b)', async () => {
+      const mfdSpec: AgentSpec = {
+        id: 'mfd-guide',
+        matrixId: '@agent-37b08ab6:matrix.netmind.chat',
+        name: 'Manyfold Data',
+        domainDescription: 'Verified open datasets including AI hackathons',
+        domainKeywords: ['hackathon', 'hackathons', 'visa'],
+        antiKeywords: ['hotpot'],
+      };
+      const runMock = vi.fn(async () => ({ response: '{"score":0.9,"reason":"oops"}' }));
+      const model = createWorkersAiTriageModel({ run: runMock });
+
+      const errMsg = makeTextEvent({
+        eventId: '$g1a',
+        text: 'Error 500 on /api/hackathons?city=London&price=£49: openai timeout after 30s at popup_modal.tsx',
+      });
+      const urlMsg = makeTextEvent({
+        eventId: '$g1b',
+        text: 'https://github.com/openai/openai-python/issues/1234',
+      });
+
+      const ctx = groupCtx();
+      expect(await model.score({ event: errMsg, context: ctx, spec: mfdSpec, detectedLang: 'en' })).toEqual({
+        score: 0.05,
+        reason: 'triage_dev_or_url_noise',
+      });
+      expect(await model.score({ event: urlMsg, context: ctx, spec: mfdSpec, detectedLang: 'en' })).toEqual({
+        score: 0.05,
+        reason: 'triage_dev_or_url_noise',
+      });
+      expect(runMock).not.toHaveBeenCalled();
+
+      const activeCtx: RoomContext = {
+        ...ctx,
+        activeSession: { active: true, lastAgentReplyAtMs: 1_000, expiresAtMs: 180_000 },
+      };
+      const activeErr = await routeEvent(errMsg, activeCtx, mfdSpec, { nowMs: 5_000, triageModel: model });
+      const activeUrl = await routeEvent(urlMsg, activeCtx, mfdSpec, { nowMs: 6_000, triageModel: model });
+      expect(activeErr).toMatchObject({ shouldReply: false, tier: 0, reason: 'active_session_chatter' });
+      expect(activeUrl).toMatchObject({ shouldReply: false, tier: 0, reason: 'active_session_chatter' });
+    });
+
+    it('resolves H1 post-pivot specialist cleanly even when pre-pivot anecdote hits antiKeywords, and resolves H3 pre-pivot primary ask without mutual deference deadlock', async () => {
+      const runMock = vi.fn(async () => ({ response: '{"score":0.1,"reason":"defer"}' }));
+      const model = createWorkersAiTriageModel({ run: runMock });
+      const lcfSpec: AgentSpec = {
+        id: 'lcf-guide',
+        matrixId: '@agent-b2b526f3:matrix.netmind.chat',
+        name: 'London Chinese Food',
+        domainDescription: 'London Chinese restaurants',
+        domainKeywords: ['唐人街', '火鍋', 'Soho', '拉麵', /soho.{0,24}(?:拉麵|火鍋)/i],
+        antiKeywords: ['openai', 'anthropic', '新模型', 'ai新聞'],
+      };
+      const ai5Spec: AgentSpec = {
+        id: 'ai5-chat',
+        matrixId: '@agent-3add8bb6:matrix.netmind.chat',
+        name: 'AI in 5',
+        domainDescription: 'Daily AI news briefing',
+        domainKeywords: ['openai', 'anthropic', '新模型', 'ai', '大新聞', /\bai\b.{0,16}大新聞/i],
+        antiKeywords: ['火鍋', '拉麵', '唐人街'],
+      };
+      const ctx = groupCtx({
+        peers: [
+          { matrixId: lcfSpec.matrixId!, displayName: 'London Chinese Food' },
+          { matrixId: ai5Spec.matrixId!, displayName: 'AI in 5' },
+        ],
+      });
+
+      // H1: Past-tense hotpot anecdote (in AI5 antiKeywords!) + post-pivot AI question
+      const h1 = makeTextEvent({
+        eventId: '$h1',
+        text: '剛在唐人街吃完火鍋超撐，順便問一下今天 OpenAI 或 Anthropic 有發新模型嗎？',
+      });
+      const h1Ai5 = await model.score({ event: h1, context: ctx, spec: ai5Spec, detectedLang: 'zh-Hant' });
+      const h1Lcf = await model.score({ event: h1, context: ctx, spec: lcfSpec, detectedLang: 'zh-Hant' });
+      expect(h1Ai5.reason).toBe('domain_match');
+      expect(h1Ai5.score).toBeGreaterThanOrEqual(0.92);
+      expect(h1Lcf).toEqual({ score: 0.1, reason: 'triage_backdrop_only' });
+      expect(runMock).not.toHaveBeenCalled();
+
+      // H3: Primary ask before "順便" belongs to LCF -> prePivotDirectMatch fires deterministically
+      const h3 = makeTextEvent({
+        eventId: '$h3',
+        text: '幫我找 Soho 附近營業中的拉麵店，順便問一下今天 AI 有什麼大新聞？',
+      });
+      const h3Lcf = await model.score({ event: h3, context: ctx, spec: lcfSpec, detectedLang: 'zh-Hant' });
+      expect(h3Lcf.reason).toBe('domain_match');
+      expect(h3Lcf.score).toBeGreaterThanOrEqual(0.9);
+    });
+
+    it('BurstCoalescer splits standalone unmentioned question from prior @Agent turn (I1) while keeping F2 cancellation & split-mention bursts intact', async () => {
+      let nowMs = BASE_TIME;
+      const roomId = '!burst_split:matrix.netmind.chat';
+      const flushed: InboundEvent[] = [];
+      const coalescer = new BurstCoalescer({
+        windowMs: 1_800,
+        now: () => nowMs,
+        onFlush: (merged) => {
+          flushed.push(merged);
+        },
+      });
+
+      // I1: Complete @AI Tarot request followed immediately by standalone unmentioned Spotted question
+      await coalescer.push(
+        makeTextEvent({
+          roomId,
+          eventId: '$i1a',
+          text: '@AI Tarot 今天適合部署上線嗎？抽一張牌就好',
+          mentions: ['@agent-852feddf:matrix.netmind.chat'],
+        }),
+      );
+      nowMs += 500;
+      const splitRes = await coalescer.push(
+        makeTextEvent({
+          roomId,
+          eventId: '$i1b',
+          text: '這週末倫敦 Shoreditch 有什麼免費快閃市集？',
+        }),
+      );
+      expect(splitRes.status).toBe('buffered');
+      expect(splitRes.status === 'buffered' ? splitRes.flushedPrior?.eventId : undefined).toBe('$i1a');
+      nowMs += 2_000;
+      await coalescer.flushDue(nowMs);
+      expect(flushed).toHaveLength(2);
+      expect(flushed[0].mentions).toEqual(['@agent-852feddf:matrix.netmind.chat']);
+      expect(flushed[1].mentions).toEqual([]);
+      expect(flushed[1].text).toBe('這週末倫敦 Shoreditch 有什麼免費快閃市集？');
+
+      // F2 regression: cancellation message right after @AI Tarot still merges!
+      flushed.length = 0;
+      await coalescer.push(
+        makeTextEvent({
+          roomId,
+          eventId: '$f2a',
+          text: '@AI Tarot 幫我算一下今年財運',
+          mentions: ['@agent-852feddf:matrix.netmind.chat'],
+        }),
+      );
+      nowMs += 500;
+      const cancelFollowRes = await coalescer.push(
+        makeTextEvent({
+          roomId,
+          eventId: '$f2b',
+          text: '算了沒事 不用抽了 haha',
+        }),
+      );
+      expect(cancelFollowRes.status === 'buffered').toBe(true);
+      expect(cancelFollowRes.status === 'buffered' ? cancelFollowRes.fragmentCount : 0).toBe(2);
+      nowMs += 2_000;
+      await coalescer.flushDue(nowMs);
+      expect(flushed).toHaveLength(1);
+      expect(flushed[0].coalescedEventIds).toEqual(['$f2a', '$f2b']);
+      coalescer.dispose();
+    });
   });
 });

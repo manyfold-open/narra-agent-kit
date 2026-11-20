@@ -9,6 +9,8 @@ export declare const AGENT_CHAIN_CAP = 6;
 export declare const AGENT_CHAIN_RETRY_MS: readonly [15000, 45000, 120000];
 export declare const IMPLICIT_NEED_CUE_RE: RegExp;
 export declare const KNOWN_NARRA_PEER_ROLES: Record<string, string>;
+/** Returns true for bare pasted URLs or developer error/stack-trace snippets that agents should ignore in unmentioned group chat. */
+export declare function isNonConversationalDevOrUrlNoise(text: string): boolean;
 /** Extracts peer `@agent-*` members from a room roster, excluding self. */
 export declare function inspectRoomPeers(members: RoomMemberInfo[], selfMatrixId?: string): PeerAgentInfo[];
 export declare function isSelfMentioned(event: InboundEvent, spec: AgentSpec): boolean;
