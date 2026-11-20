@@ -2292,6 +2292,10 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             decision.reason === 'dm' ||
             decision.reason === 'explicit_mention' ||
             decision.reason === 'reply_to_self';
+          const isCommittedTurn =
+            isDirectTurn ||
+            decision.reason === 'multi_mention_domain_match' ||
+            (decision.reason === 'active_session' && decision.directRoute === true);
           const mentionNamesForCheck = [
             effectiveSpec.name,
             ...(effectiveSpec.aliases ?? []),
@@ -2371,7 +2375,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
               usedA2A = true;
 
               const thinkingDelayMs = cfg.thinkingDelayMs ?? DEFAULT_THINKING_DELAY_MS;
-              if (isDirectTurn && thinkingDelayMs > 0 && !nextTurn.thinkingEventId) {
+              if (isCommittedTurn && thinkingDelayMs > 0 && !nextTurn.thinkingEventId) {
                 const statusText = wantsSummary
                   ? defaultThinkingMessage(decision.detectedLang, true)
                   : (cfg.thinkingMessage?.(decision.detectedLang, nextTurn.event, decision) ??
@@ -2467,7 +2471,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                 // fails on a directly addressed turn when Workers AI is bound + enableA2AFailureReply is on,
                 // seamlessly fall back to Workers AI using the exact same pre-fetched envelope so the user
                 // never hangs staring at a stuck progress bubble during an upstream Manyfold outage.
-                if (isDirectTurn && cfg.enableA2AFailureReply === true && this.env.AI) {
+                if (isCommittedTurn && cfg.enableA2AFailureReply === true && this.env.AI) {
                   const backup = await runWorkersAiResilienceFallback(
                     this.env.AI,
                     this.env.AI_TRIAGE_MODEL,
@@ -2687,7 +2691,9 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             nextTurn.event.chatType === 'dm' ||
             lastDecision?.reason === 'dm' ||
             lastDecision?.reason === 'explicit_mention' ||
-            lastDecision?.reason === 'reply_to_self';
+            lastDecision?.reason === 'reply_to_self' ||
+            lastDecision?.reason === 'multi_mention_domain_match' ||
+            (lastDecision?.reason === 'active_session' && lastDecision?.directRoute === true);
           const shouldSendFailureNotice =
             nextTurn.answer === undefined &&
             (Boolean(nextTurn.thinkingEventId) || (isDirectGiveUp && cfg.enableA2AFailureReply === true));
