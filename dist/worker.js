@@ -1783,6 +1783,9 @@ export class BaseNarraRoomCoordinator {
                                                 {};
                                             hints[nextTurn.event.senderId] = switched;
                                             await this.ctx.storage.put('userLanguageHints', hints);
+                                            if (context.chatType === 'dm') {
+                                                await this.ctx.storage.put('roomLanguageHint', switched);
+                                            }
                                         });
                                     }
                                 }

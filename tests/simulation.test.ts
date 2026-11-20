@@ -2460,6 +2460,28 @@ describe('narra-agent-kit simulation & unit suite', () => {
       );
       expect(simplifiedFollowup.shouldReply).toBe(true);
       expect(simplifiedFollowup.reason).toBe('active_session');
+
+      // Past-tense anecdote ("昨天晚上去吃烧烤撑死了哈哈哈") stays silent EVEN during active_session
+      const activeAnecdote = await routeEvent(
+        makeTextEvent({
+          eventId: '$active_anecdote',
+          timestampMs: 1_700_000_065_000,
+          text: '昨天晚上去吃烧烤撑死了哈哈哈',
+        }),
+        groupCtx({
+          activeSession: { active: true, lastAgentReplyAtMs: 1_700_000_050_000 },
+        }),
+        { ...CHINESE_FOOD_SPEC, domainKeywords: ['烧烤', '燒烤'] },
+        { nowMs: 1_700_000_065_500 },
+      );
+      expect(activeAnecdote.shouldReply).toBe(false);
+      expect(activeAnecdote.reason).toBe('active_session_chatter');
+
+      // Explicit language switch "请改回简体中文" & English command "Expand item 1" after switching to en
+      expect(detectExplicitLangSwitch('请改回简体中文')).toBe('zh-Hans');
+      expect(detectExplicitLangSwitch('切回繁體中文')).toBe('zh-Hant');
+      expect(detectLang('Expand item 1', 'en', 'zh-Hans')).toBe('en');
+      expect(detectLang('Expand item 1', 'zh-Hans', 'zh-Hans')).toBe('en');
     });
   });
 });

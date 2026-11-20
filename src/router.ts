@@ -1060,7 +1060,7 @@ export async function routeEvent(
         : Infinity);
     if (expires >= nowMs) {
       const strippedText = stripAgentMentions(event.text ?? '', mentionNames).trim();
-      if (isNonConversationalDevOrUrlNoise(strippedText)) {
+      if (isNonConversationalDevOrUrlNoise(strippedText) || isPastAnecdoteOrStatement(strippedText)) {
         return {
           shouldReply: false,
           tier: 0,

@@ -125,6 +125,17 @@ const IGNORABLE_ASCII_TOKENS = new Set([
 
 /** Common English grammatical/question/conversational words indicating intentional English prose. */
 const ENGLISH_CUE_WORDS = new Set([
+  'expand',
+  'item',
+  'story',
+  'details',
+  'summary',
+  'recap',
+  'draw',
+  'stick',
+  'card',
+  'cards',
+  'spread',
   'the',
   'a',
   'an',
@@ -353,12 +364,14 @@ export function detectLang(
   }
 
   const hasEnglishCue = lowerTokens.some((tok) => ENGLISH_CUE_WORDS.has(tok));
-  const hasZhHint = userHint === 'zh-Hant' || userHint === 'zh-Hans' || roomHint === 'zh-Hant' || roomHint === 'zh-Hans';
+  const effectiveHint = userHint ?? roomHint;
+  const hasZhHint = effectiveHint === 'zh-Hant' || effectiveHint === 'zh-Hans';
 
   // In a Chinese conversation, 1-2 short non-sentence ASCII tokens (like an unfamiliar shop/model name)
   // without English grammar/question cues inherit the Chinese hint instead of flipping to English.
+  // Never override an explicit `userHint === 'en'` with a stale Chinese `roomHint`.
   if (hasZhHint && nonBrandTokens.length <= 2 && !hasEnglishCue && lowerTokens.length <= 2) {
-    return userHint === 'zh-Hant' || userHint === 'zh-Hans' ? userHint : (roomHint as 'zh-Hant' | 'zh-Hans');
+    return effectiveHint;
   }
 
   return 'en';
@@ -555,15 +568,15 @@ const LANG_SWITCH_ZH_PREFIX =
 const LANG_SWITCH_ZH_SUFFIX =
   '(?:來|来)?(?:回覆|回复|回|聊天|溝通|沟通|對話|对话|說|说|講|讲|聊)?(?:我|一下|吧|好嗎|好吗|可以嗎|可以吗|喔|哦|呀|謝謝|谢谢)?';
 const LANG_SWITCH_HANT_RE = new RegExp(
-  `^(?:${LANG_SWITCH_ZH_PREFIX}[\\s,，]*){0,4}(?:改用|切換成|切换成|換成|换成|用|說|说|講|讲|回覆|回复|回)?(?:繁體|繁体|正體|正体)(?:中文)?(?:[\\s,，]*${LANG_SWITCH_ZH_SUFFIX}){0,3}$`,
+  `^(?:${LANG_SWITCH_ZH_PREFIX}[\\s,，]*){0,4}(?:改用|改回|切回|切換成|切换成|切換回|切换回|換成|换成|換回|换回|轉回|转回|變回|变回|用|說|说|講|讲|回覆|回复|回)?(?:繁體|繁体|正體|正体)(?:中文)?(?:[\\s,，]*${LANG_SWITCH_ZH_SUFFIX}){0,3}$`,
   'i',
 );
 const LANG_SWITCH_HANS_RE = new RegExp(
-  `^(?:${LANG_SWITCH_ZH_PREFIX}[\\s,，]*){0,4}(?:改用|切換成|切换成|換成|换成|用|說|说|講|讲|回覆|回复|回)?(?:簡體|简体)(?:中文)?(?:[\\s,，]*${LANG_SWITCH_ZH_SUFFIX}){0,3}$`,
+  `^(?:${LANG_SWITCH_ZH_PREFIX}[\\s,，]*){0,4}(?:改用|改回|切回|切換成|切换成|切換回|切换回|換成|换成|換回|换回|轉回|转回|變回|变回|用|說|说|講|讲|回覆|回复|回)?(?:簡體|简体)(?:中文)?(?:[\\s,，]*${LANG_SWITCH_ZH_SUFFIX}){0,3}$`,
   'i',
 );
 const LANG_SWITCH_ZH_EN_RE = new RegExp(
-  `^(?:${LANG_SWITCH_ZH_PREFIX}[\\s,，]*){0,4}(?:改用|切換成|切换成|換成|换成|用|說|说|講|讲|回覆|回复|回)英[文語语](?:[\\s,，]*${LANG_SWITCH_ZH_SUFFIX}){0,3}$`,
+  `^(?:${LANG_SWITCH_ZH_PREFIX}[\\s,，]*){0,4}(?:改用|改回|切回|切換成|切换成|切換回|切换回|換成|换成|換回|换回|轉回|转回|變回|变回|用|說|说|講|讲|回覆|回复|回)英[文語语](?:[\\s,，]*${LANG_SWITCH_ZH_SUFFIX}){0,3}$`,
   'i',
 );
 const LANG_SWITCH_EN_RE =
