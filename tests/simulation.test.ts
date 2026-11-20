@@ -2443,6 +2443,23 @@ describe('narra-agent-kit simulation & unit suite', () => {
         detectedLang: 'zh-Hans',
       });
       expect(bbqScore.score).toBeGreaterThanOrEqual(0.8);
+
+      // Simplified Chinese pronoun follow-up ("这几条里哪一条...") stays active during active_session
+      const simplifiedFollowup = await routeEvent(
+        makeTextEvent({
+          eventId: '$zh_hans_followup',
+          timestampMs: 1_700_000_060_000,
+          text: '这几条里哪一条对来英国工作的工程师影响最大？',
+        }),
+        groupCtx({
+          peers: [{ matrixId: SPOTTED_SPEC.matrixId!, displayName: 'SpottedLondon' }],
+          activeSession: { active: true, lastAgentReplyAtMs: 1_700_000_050_000 },
+        }),
+        { ...CHINESE_FOOD_SPEC, domainKeywords: ['签证', '簽證'] },
+        { nowMs: 1_700_000_060_500 },
+      );
+      expect(simplifiedFollowup.shouldReply).toBe(true);
+      expect(simplifiedFollowup.reason).toBe('active_session');
     });
   });
 });
