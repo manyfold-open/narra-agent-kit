@@ -34,7 +34,9 @@ import {
   isNarraAgent,
   isPastAnecdoteOrStatement,
   isSilence,
+  isSummaryOrRecapRequest,
   messageContent,
+  normalizeA2AOutput,
   parseMatrixEvent,
   renderMentions,
   routeEvent,
@@ -2265,6 +2267,106 @@ describe('narra-agent-kit simulation & unit suite', () => {
       expect(flushed).toHaveLength(2);
       expect(flushed.map((f) => f.eventId)).toEqual(['$s1', '$s2']);
       coalescer.dispose();
+    });
+
+    it('buildPromptEnvelope includes recent_self_replies, group_style, and summary_mode timeline; normalizeA2AOutput purifies zh-Hant & bullets', async () => {
+      const ctx = groupCtx({
+        recentHistory: [
+          {
+            eventId: '$h1',
+            senderId: '@alice:matrix.netmind.chat',
+            senderName: 'Alice',
+            isAgent: false,
+            text: '我想在 UCL 附近吃川菜',
+            timestampMs: BASE_TIME - 60_000,
+          },
+          {
+            eventId: '$self1',
+            senderId: CHINESE_FOOD_SPEC.matrixId!,
+            senderName: 'London Chinese Food',
+            isAgent: true,
+            isSelf: true,
+            text: '推薦三峽人家和錦里，都在 UCL 附近！',
+            timestampMs: BASE_TIME - 45_000,
+          },
+          {
+            eventId: '$h2',
+            senderId: '@bob:matrix.netmind.chat',
+            senderName: 'Bob',
+            isAgent: false,
+            text: '我不吃太辣，預算 £25 以內',
+            timestampMs: BASE_TIME - 20_000,
+          },
+        ],
+      });
+
+      const followEv = makeTextEvent({
+        eventId: '$h3',
+        text: '那這兩間哪間比較適合不吃辣的？',
+        timestampMs: BASE_TIME,
+      });
+      const normalEnv = buildPromptEnvelope({
+        event: followEv,
+        context: ctx,
+        decision: {
+          shouldReply: true,
+          tier: 0,
+          reason: 'explicit_mention',
+          confidence: 1,
+          detectedLang: 'zh-Hant',
+          shouldQuote: false,
+        },
+        spec: CHINESE_FOOD_SPEC,
+      });
+      expect(normalEnv).toContain('group_style: true');
+      expect(normalEnv).toContain('recent_self_replies:');
+      expect(normalEnv).toContain('推薦三峽人家和錦里');
+      expect(normalEnv).toContain('我不吃太辣');
+
+      expect(isSummaryOrRecapRequest('幫我總結一下剛剛大家聊的')).toBe(true);
+      expect(isSummaryOrRecapRequest('recap what everyone discussed')).toBe(true);
+      expect(isSummaryOrRecapRequest('UCL 附近好吃的川菜')).toBe(false);
+
+      const summaryEv = makeTextEvent({
+        eventId: '$h4',
+        text: '@London Chinese Food 幫我總結一下剛剛大家聊的',
+        timestampMs: BASE_TIME + 5_000,
+      });
+      const summaryEnv = buildPromptEnvelope({
+        event: summaryEv,
+        context: ctx,
+        decision: {
+          shouldReply: true,
+          tier: 0,
+          reason: 'explicit_mention',
+          confidence: 1,
+          detectedLang: 'zh-Hant',
+          shouldQuote: false,
+        },
+        spec: CHINESE_FOOD_SPEC,
+        summaryMode: true,
+      });
+      expect(summaryEnv).toContain('summary_mode: true');
+      expect(summaryEnv).toContain('recent_conversation_timeline:');
+      expect(summaryEnv).toContain('[self ');
+      expect(summaryEnv).toContain('Alice: 我想在 UCL 附近吃川菜');
+
+      // Unmentioned generic summary stays silent in triage
+      const triage = createWorkersAiTriageModel(null);
+      const unmentionedSummary = await triage.score({
+        event: makeTextEvent({ eventId: '$sum_unm', text: '幫我總結一下剛剛大家聊的' }),
+        context: ctx,
+        spec: { ...CHINESE_FOOD_SPEC, domainKeywords: ['川菜', '火鍋'] },
+        detectedLang: 'zh-Hant',
+      });
+      expect(unmentionedSummary.score).toBeLessThanOrEqual(0.15);
+      expect(unmentionedSummary.reason).toBe('triage_unmentioned_summary');
+
+      // normalizeA2AOutput converts Simplified->Traditional and 1./2. lists to • bullets
+      const norm = normalizeA2AOutput('以下是重点：\n1. 杨国福旗舰店\nhttps://example.com/1\n2. 监控基础账单\nhttps://example.com/2', 'zh-Hant');
+      expect(norm.text).toContain('• 楊國福旗艦店');
+      expect(norm.text).toContain('• 監控基礎帳單');
+      expect(norm.text).not.toMatch(/^\s*1\.\s+/m);
     });
   });
 });

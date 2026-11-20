@@ -1,4 +1,12 @@
-import { defuse, isNarraAgent, isSilence, sanitizeMobileLinks, stripLeakedNotes } from '../guard.js';
+import {
+  defuse,
+  isNarraAgent,
+  isSilence,
+  normalizeBulletLists,
+  sanitizeMobileLinks,
+  stripLeakedNotes,
+} from '../guard.js';
+import { toZhHant } from '../lang.js';
 import { redactSecrets } from '../sync.js';
 import type { RecallTurnResult } from '../memory.js';
 import type {
@@ -36,9 +44,22 @@ export interface PromptEnvelopeInput {
   spec?: AgentSpec;
   maxHistoryTurns?: number;
   extraFields?: Record<string, string>;
+  /** When true, includes a full multi-speaker timeline (up to 40 turns) and structured recap instructions. */
+  summaryMode?: boolean;
+  /** Includes the agent's own recent replies (defaults to true) so A2A follow-ups remember local fast-path answers. */
+  includeSelfReplies?: boolean;
 }
 
 const cleanInline = (s: string) => (s ?? '').replace(/[\r\n]+/g, ' ').trim();
+
+function formatShortUtcTime(timestampMs?: number): string {
+  if (typeof timestampMs !== 'number' || !Number.isFinite(timestampMs) || timestampMs <= 0) return '';
+  const d = new Date(timestampMs);
+  if (Number.isNaN(d.getTime())) return '';
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mm = String(d.getUTCMinutes()).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
 
 function langDirective(lang: LangCode): string {
   if (lang === 'zh-Hant') return 'zh-Hant (Traditional Chinese / 繁體中文)';
@@ -50,13 +71,14 @@ function langDirective(lang: LangCode): string {
  * Builds a prompt-injection-hardened Manyfold A2A turn envelope containing:
  * - Pre-injected room members & peer `@agent-*` roster
  * - `in_reply_to_other` (or `in_reply_to_self`) parent snippet
- * - Recent human-only history (excludes noisy peer agent chatter)
- * - `detected_lang` strict language lock
+ * - Recent human history + agent's own recent replies (or full chronological timeline in summaryMode)
+ * - `detected_lang` strict language lock & mobile group-chat style guidance
  * - Recalled safe memories (with DM-to-group privacy isolation already applied)
  */
 export function buildPromptEnvelope(input: PromptEnvelopeInput): string {
   const { event, context, decision, memories, spec } = input;
-  const maxHistory = input.maxHistoryTurns ?? 6;
+  const summaryMode = input.summaryMode === true;
+  const maxHistory = input.maxHistoryTurns ?? (summaryMode ? 40 : 10);
 
   const humanMembers = context.members
     .filter((m) => !m.isAgent && !isNarraAgent(m.matrixId))
@@ -65,10 +87,39 @@ export function buildPromptEnvelope(input: PromptEnvelopeInput): string {
     .filter((p) => p.matrixId !== spec?.matrixId)
     .map((p) => (p.displayName ? `${cleanInline(p.displayName)} (${p.matrixId})` : p.matrixId));
 
-  const recentHumanTurns = context.recentHistory
-    .filter((t) => !t.isAgent && !isNarraAgent(t.senderId) && t.eventId !== event.eventId)
-    .slice(-maxHistory)
-    .map((t) => `- ${cleanInline(t.senderName || t.senderId)}: ${cleanInline(t.text).slice(0, 220)}`);
+  const recentHumanTurns = !summaryMode
+    ? context.recentHistory
+        .filter((t) => !t.isAgent && !isNarraAgent(t.senderId) && t.eventId !== event.eventId && t.text.trim())
+        .slice(-maxHistory)
+        .map((t) => `- ${cleanInline(t.senderName || t.senderId)}: ${cleanInline(t.text).slice(0, 240)}`)
+    : [];
+
+  const recentSelfReplies =
+    !summaryMode && input.includeSelfReplies !== false
+      ? context.recentHistory
+          .filter(
+            (t) =>
+              t.eventId !== event.eventId &&
+              t.text.trim() &&
+              (t.isSelf || Boolean(spec?.matrixId && t.senderId === spec.matrixId)),
+          )
+          .slice(-3)
+          .map((t) => `- [self] ${cleanInline(t.text).slice(0, 420)}`)
+      : [];
+
+  const summaryTimeline = summaryMode
+    ? context.recentHistory
+        .filter((t) => t.eventId !== event.eventId && t.text.trim())
+        .slice(-maxHistory)
+        .map((t) => {
+          const isSelf = t.isSelf || Boolean(spec?.matrixId && t.senderId === spec.matrixId);
+          const roleTag = isSelf ? 'self' : t.isAgent || isNarraAgent(t.senderId) ? 'agent' : 'human';
+          const hhmm = formatShortUtcTime(t.timestampMs);
+          const tsPart = hhmm ? ` ${hhmm}` : '';
+          const speaker = cleanInline(t.senderName || t.senderId || 'member');
+          return `- [${roleTag}${tsPart}] ${speaker}: ${cleanInline(t.text).slice(0, 280)}`;
+        })
+    : [];
 
   const lines: string[] = [
     '[Channel message context]',
@@ -89,6 +140,15 @@ export function buildPromptEnvelope(input: PromptEnvelopeInput): string {
           'unmentioned_group_turn: true (The user did NOT @mention you. Reply ONLY if this directly asks for your domain or continues your active topic. If it is casual chatter, small talk, or another domain/agent, output ONLY [NO_REPLY] — never explain that it is outside your scope.)',
         ]
       : []),
+    ...(summaryMode
+      ? [
+          'summary_mode: true (The user asked to summarize/recap recent conversation history. Read recent_conversation_timeline carefully and synthesize key topics, each person\'s preferences or constraints, decisions, and open questions concisely in detected_lang using "• " bullets.)',
+        ]
+      : context.chatType === 'group'
+        ? [
+            'group_style: true (Reply concisely and naturally like a helpful human teammate in a mobile group chat: aim for 3-5 short lines or 2-3 "• " bullets, avoid numbered markdown lists like "1. 2. 3.", skip robotic self-intros unless asked, and if a request spans another peer agent\'s specialty, answer your part briefly and suggest that peer by display name without creating a Matrix @mention.)',
+          ]
+        : []),
     ...(event.isVoice ? ['voice_mode: true (keep reply concise and natural for speech; no markdown tables)'] : []),
     ...(humanMembers.length ? [`room_members: ${humanMembers.join(', ')}`] : []),
     ...(peerAgents.length ? [`peer_agents: ${peerAgents.join(', ')}`] : []),
@@ -100,9 +160,18 @@ export function buildPromptEnvelope(input: PromptEnvelopeInput): string {
     lines.push(`${label}: "${who}: ${cleanInline(context.replyToTarget.text).slice(0, 500)}"`);
   }
 
-  if (recentHumanTurns.length) {
-    lines.push('recent_human_history:');
-    lines.push(...recentHumanTurns);
+  if (summaryTimeline.length) {
+    lines.push('recent_conversation_timeline:');
+    lines.push(...summaryTimeline);
+  } else {
+    if (recentHumanTurns.length) {
+      lines.push('recent_human_history:');
+      lines.push(...recentHumanTurns);
+    }
+    if (recentSelfReplies.length) {
+      lines.push('recent_self_replies:');
+      lines.push(...recentSelfReplies);
+    }
   }
 
   if (memories && memories.promptSafeLines.length > 0) {
@@ -256,12 +325,37 @@ export interface RunA2AOptions {
   contextId?: string;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** Optional callback fired when SSE streams intermediate progress text. */
+  onProgress?: (progressText: string) => void;
+}
+
+export interface RunA2ATurnResult {
+  text: string;
+  contextId: string | null;
+  taskId: string | null;
 }
 
 /**
- * Executes one zero-extra-key Manyfold A2A streaming (`message/stream`) turn over JSON-RPC 2.0.
+ * Post-processes raw Manyfold A2A output: strips leaked notes, sanitizes mobile URLs,
+ * converts numbered markdown lists to `• ` bullets, and enforces pure `zh-Hant` when requested.
  */
-export async function runManyfoldA2ATurn(options: RunA2AOptions): Promise<string> {
+export function normalizeA2AOutput(raw: string, lang?: LangCode): { text: string; cut: string } {
+  const { text: withoutNotes, cut } = stripLeakedNotes(raw);
+  if (!withoutNotes || isSilence(withoutNotes)) {
+    return { text: '', cut };
+  }
+  let cleaned = normalizeBulletLists(sanitizeMobileLinks(withoutNotes));
+  if (lang === 'zh-Hant') {
+    cleaned = toZhHant(cleaned);
+  }
+  return { text: cleaned, cut };
+}
+
+/**
+ * Executes one zero-extra-key Manyfold A2A streaming (`message/stream`) turn over JSON-RPC 2.0,
+ * returning both the final answer text and session metadata (`contextId`, `taskId`).
+ */
+export async function runManyfoldA2ATurnWithMeta(options: RunA2AOptions): Promise<RunA2ATurnResult> {
   const { credential, envelope, eventId } = options;
   const doFetch = options.fetchImpl ?? fetch;
   const controller = new AbortController();
@@ -320,7 +414,12 @@ export async function runManyfoldA2ATurn(options: RunA2AOptions): Promise<string
         statusText: '',
       };
       applyA2AResult(acc, json.result);
-      return snapshotFromAccumulator(acc).text.trim();
+      const snap = snapshotFromAccumulator(acc);
+      return {
+        text: snap.text.trim(),
+        contextId: snap.contextId ?? options.contextId ?? null,
+        taskId: snap.taskId,
+      };
     }
 
     if (!response.body) {
@@ -340,6 +439,7 @@ export async function runManyfoldA2ATurn(options: RunA2AOptions): Promise<string
     const decoder = new TextDecoder();
     let buffer = '';
     let received = false;
+    let lastProgress = '';
 
     try {
       while (true) {
@@ -363,11 +463,19 @@ export async function runManyfoldA2ATurn(options: RunA2AOptions): Promise<string
             applyA2AResult(acc, parsed.result);
             received = true;
             const snap = snapshotFromAccumulator(acc);
+            if (!snap.terminal && snap.progressText && snap.progressText !== lastProgress) {
+              lastProgress = snap.progressText;
+              options.onProgress?.(snap.progressText);
+            }
             if (snap.terminal) {
               if (snap.state && !['completed', 'input-required'].includes(snap.state)) {
                 throw new A2AError(`${label} stopped at "${snap.state}".`, snap.state !== 'rejected');
               }
-              return snap.text.trim();
+              return {
+                text: snap.text.trim(),
+                contextId: snap.contextId ?? options.contextId ?? null,
+                taskId: snap.taskId,
+              };
             }
           }
           boundary = buffer.indexOf('\n\n');
@@ -378,10 +486,23 @@ export async function runManyfoldA2ATurn(options: RunA2AOptions): Promise<string
     }
 
     if (!received) throw new A2AError(`${label} stream ended without events.`, true);
-    return snapshotFromAccumulator(acc).text.trim();
+    const finalSnap = snapshotFromAccumulator(acc);
+    return {
+      text: finalSnap.text.trim(),
+      contextId: finalSnap.contextId ?? options.contextId ?? null,
+      taskId: finalSnap.taskId,
+    };
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Executes one zero-extra-key Manyfold A2A streaming (`message/stream`) turn over JSON-RPC 2.0.
+ */
+export async function runManyfoldA2ATurn(options: RunA2AOptions): Promise<string> {
+  const result = await runManyfoldA2ATurnWithMeta(options);
+  return result.text;
 }
 
 export interface FastPathOrA2AOptions {

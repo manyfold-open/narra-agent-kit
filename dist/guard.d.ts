@@ -1,6 +1,14 @@
 import type { ChatType, InboundEvent } from './types.js';
 /** Narra assigns every agent a Matrix ID of the form `@agent-<hex>:<server>`. */
 export declare function isNarraAgent(matrixId: string): boolean;
+/** Returns true when a user message asks to summarize or recap recent conversation history. */
+export declare function isSummaryOrRecapRequest(text: string): boolean;
+/**
+ * Converts Markdown numbered lists (`1. ...`, `2. ...`) into `• ` bullets when separated
+ * by URLs or blank lines (preventing Narra Web's Markdown renderer from resetting every
+ * separated item back to `1.`).
+ */
+export declare function normalizeBulletLists(text: string): string;
 /**
  * Defuses spoofed context header lines inside user-supplied text by quoting them (`> ...`),
  * preventing prompt-envelope spoofing inside A2A messages.

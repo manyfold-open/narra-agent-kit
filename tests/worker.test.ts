@@ -2513,4 +2513,244 @@ describe('worker runtime layer (src/worker.ts)', () => {
     await dmPost('$tf_rec2', '你記得什麼？');
     expect(postedBodies.at(-1)).toContain('還沒有');
   });
+
+  it('17. slow direct A2A posts thinking status and edits in place via m.replace, persists a2aContextId, injects extraFields, and handles summary mode', async () => {
+    let nowMs = 1_761_200_000_000;
+    const roomId = '!grp_a2a_ux:matrix.netmind.chat';
+    const zackId = '@zack:matrix.netmind.chat';
+    const members = [
+      { matrixId: zackId, displayName: 'Zack', isAgent: false },
+      { matrixId: TEST_SPEC.matrixId!, displayName: 'Penny', isAgent: true },
+    ];
+    const matrixSends: Array<Record<string, unknown>> = [];
+    const seenA2ABodies: Array<{ contextId?: string; text: string }> = [];
+    let a2aCall = 0;
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith('/api/agent-runtime/matrix-credential')) {
+        return Response.json({
+          status: 'ok',
+          data: {
+            homeserver_url: 'https://matrix.netmind.chat',
+            access_token: 'mat_tok_ux',
+            matrix_user_id: TEST_SPEC.matrixId,
+          },
+        });
+      }
+      if (url.includes('/typing/') || url.includes('/receipt/')) {
+        return Response.json({});
+      }
+      if (url.includes('/messages?')) {
+        return Response.json({
+          chunk: [
+            {
+              event_id: '$hist_old_1',
+              sender: '@alice:matrix.netmind.chat',
+              type: 'm.room.message',
+              origin_server_ts: nowMs - 120_000,
+              content: { msgtype: 'm.text', body: '大家週五想去哪裡聚餐？我不吃辣' },
+            },
+          ],
+        });
+      }
+      if (url.includes('/send/m.room.message/')) {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        matrixSends.push(body);
+        return Response.json({ event_id: `$mat_ev_${matrixSends.length}` });
+      }
+      if (url.includes('api.manyfold.ai/a2a/')) {
+        a2aCall += 1;
+        const rpc = JSON.parse(String(init?.body ?? '{}')) as {
+          params?: { message?: { contextId?: string; parts?: Array<{ text?: string }> } };
+        };
+        seenA2ABodies.push({
+          contextId: rpc.params?.message?.contextId,
+          text: rpc.params?.message?.parts?.[0]?.text ?? '',
+        });
+        // Delay > thinkingDelayMs on call 1 so progress bubble fires
+        if (a2aCall === 1) {
+          await new Promise((r) => setTimeout(r, 70));
+        }
+        const replyText =
+          a2aCall === 1
+            ? '为你整理：\n1. 杨国福旗舰店\n2. 监控账单'
+            : '總結：\n• Alice 不吃辣，大家在討論週五聚餐。';
+        return Response.json({
+          jsonrpc: '2.0',
+          result: {
+            id: `task_${a2aCall}`,
+            contextId: 'ctx_room_warm_1',
+            status: { state: 'completed' },
+            artifacts: [{ artifactId: 'a1', parts: [{ kind: 'text', text: replyText }] }],
+          },
+        });
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    const gateway = createNarraWorkerGateway({
+      spec: TEST_SPEC,
+      now: () => nowMs,
+      thinkingDelayMs: 25,
+      thinkingMessage: () => '🔍 正在幫你查資料整理中…',
+      buildExtraEnvelopeFields: async () => ({ d1_prefetched_records: 'UCL Sichuan top 3' }),
+      resolveA2ACredential: async () => ({
+        url: 'https://api.manyfold.ai/a2a/test',
+        token: 'a2a_tok_ux',
+        label: 'Penny',
+      }),
+      fastRespond: async () => null,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    let env!: NarraGatewayEnv;
+    const syncHandle = createFakeNamespace((ctx) => new gateway.BaseNarraMatrixSync(ctx, env));
+    const roomHandle = createFakeNamespace((ctx) => new gateway.BaseNarraRoomCoordinator(ctx, env));
+    env = {
+      DB: createD1(),
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'on',
+      NARRA_AGENT_TOKEN: 'narra_tok_ux',
+      NARRA_SYNC_DO: syncHandle.namespace,
+      NARRA_ROOM_DO: roomHandle.namespace,
+    };
+
+    const roomStub = roomHandle.namespace.get(roomHandle.namespace.idFromName(roomId));
+    const roomInst = () => roomHandle.instances.get(roomId)!.instance;
+
+    // Turn 1: slow A2A -> posts thinking status, then edits it in place with pure zh-Hant + • bullets
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        chatType: 'group',
+        members,
+        events: [
+          {
+            event_id: '$ux_1',
+            sender: zackId,
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: {
+              msgtype: 'm.text',
+              body: '@Penny 幫我分析一下這幾筆資料',
+              'm.mentions': { user_ids: [TEST_SPEC.matrixId!] },
+            },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    await roomInst().alarm();
+
+    expect(matrixSends).toHaveLength(2);
+    expect(matrixSends[0]?.body).toBe('🔍 正在幫你查資料整理中…');
+    expect((matrixSends[1]?.['m.relates_to'] as Record<string, unknown>)?.rel_type).toBe('m.replace');
+    expect((matrixSends[1]?.['m.relates_to'] as Record<string, unknown>)?.event_id).toBe('$mat_ev_1');
+    const editedBody = String((matrixSends[1]?.['m.new_content'] as Record<string, unknown>)?.body ?? '');
+    expect(editedBody).toContain('• 楊國福旗艦店');
+    expect(editedBody).toContain('• 監控帳單');
+    expect(seenA2ABodies[0]?.text).toContain('d1_prefetched_records: UCL Sichuan top 3');
+
+    // Turn 2: summary request -> reuses persisted contextId AND loads backstop history!
+    nowMs += 5_000;
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        chatType: 'group',
+        members,
+        events: [
+          {
+            event_id: '$ux_2',
+            sender: zackId,
+            type: 'm.room.message',
+            origin_server_ts: nowMs,
+            content: {
+              msgtype: 'm.text',
+              body: '@Penny 幫我總結一下剛剛大家聊的',
+              'm.mentions': { user_ids: [TEST_SPEC.matrixId!] },
+            },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    await roomInst().alarm();
+
+    expect(seenA2ABodies[1]?.contextId).toBe('ctx_room_warm_1');
+    expect(seenA2ABodies[1]?.text).toContain('summary_mode: true');
+    expect(seenA2ABodies[1]?.text).toContain('大家週五想去哪裡聚餐？我不吃辣');
+  });
+
+  it('18. enableA2AFailureReply sends friendly apology on direct @/DM final A2A give-up while keeping unmentioned turns silent', async () => {
+    let nowMs = 1_761_300_000_000;
+    const dmRoom = '!dm_fail_apology:matrix.netmind.chat';
+    const zackId = '@zack:matrix.netmind.chat';
+    const postedBodies: string[] = [];
+
+    const gateway = createNarraWorkerGateway({
+      spec: TEST_SPEC,
+      now: () => nowMs,
+      enableA2AFailureReply: true,
+      resolveA2ACredential: async () => ({
+        url: 'https://api.manyfold.ai/a2a/test',
+        token: 'a2a_tok_fail',
+        label: 'Penny',
+      }),
+      fastRespond: async () => null,
+      fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.url;
+        if (url.includes('api.manyfold.ai/a2a/')) {
+          return new Response('bad gateway', { status: 502 });
+        }
+        if (url.includes('/api/agent-runtime/chat/send')) {
+          const body = JSON.parse(String(init?.body ?? '{}')) as { text?: string };
+          postedBodies.push(body.text ?? '');
+          return Response.json({ status: 'ok', data: { event_id: `$fail_ap_${postedBodies.length}` } });
+        }
+        return Response.json({ status: 'ok', data: {} });
+      }) as unknown as typeof fetch,
+    });
+
+    const env: NarraGatewayEnv = {
+      DB: createD1(),
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'off',
+      NARRA_AGENT_TOKEN: 'narra_tok_fail_ap',
+    };
+    const { state } = createFakeDOState();
+    const dmDo = new gateway.BaseNarraRoomCoordinator(state, env);
+
+    await dmDo.fetch(
+      new Request('https://narra-room/events', {
+        method: 'POST',
+        body: JSON.stringify({
+          roomId: dmRoom,
+          chatType: 'dm',
+          events: [
+            {
+              event_id: '$fail_direct_1',
+              sender: zackId,
+              type: 'm.room.message',
+              origin_server_ts: nowMs,
+              content: { msgtype: 'm.text', body: '幫我分析一下上個月的資料' },
+            },
+          ],
+        }),
+      }),
+    );
+
+    nowMs += 2_000;
+    await dmDo.alarm(); // attempt 1
+    expect(postedBodies).toHaveLength(0);
+    nowMs += 5_000;
+    await dmDo.alarm(); // attempt 2
+    expect(postedBodies).toHaveLength(0);
+    nowMs += 10_000;
+    await dmDo.alarm(); // attempt 3 -> gives up -> friendly zh-Hant apology
+    expect(postedBodies).toHaveLength(1);
+    expect(postedBodies[0]).toContain('不好意思');
+  });
 });

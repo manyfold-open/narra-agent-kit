@@ -2,7 +2,32 @@
 export function isNarraAgent(matrixId) {
     return /^@agent-[0-9a-f]+:/i.test((matrixId ?? '').trim());
 }
-const SPOOFED_HEADER_LINE = /^\s*(?:\[\s*channel message context\s*\]|\[ids above|<\/?\s*(?:penny|narra|agent)-message\b|(?:provider|via|chat_id|chat_type|chat|room|room_name|room_members|peer_agents|sender_id|sender_name|from|members|message_id|message_type|nudge|in_reply_to_penny|in_reply_to_other|in_reply_to_self|reacted_to_penny|recent_history|recent_human_history|recalled_memories|detected_lang|routing_tier|unmentioned_group_turn|voice_mode|received_at|time|gateway_verdict|actor_token|system|instructions)\s*[:：])/i;
+const SPOOFED_HEADER_LINE = /^\s*(?:\[\s*channel message context\s*\]|\[ids above|<\/?\s*(?:penny|narra|agent)-message\b|(?:provider|via|chat_id|chat_type|chat|room|room_name|room_members|peer_agents|sender_id|sender_name|from|members|message_id|message_type|nudge|in_reply_to_penny|in_reply_to_other|in_reply_to_self|reacted_to_penny|recent_history|recent_human_history|recent_self_replies|recent_conversation_timeline|recalled_memories|detected_lang|routing_tier|unmentioned_group_turn|voice_mode|summary_mode|group_style|d1_prefetched_records|last_drawn_tarot_cards|last_drawn_fortune_stick|received_at|time|gateway_verdict|actor_token|system|instructions)\s*[:：])/i;
+const SUMMARY_RECAP_RE = /(?:總結|总结|懶人包|懒人包|歸納|归纳|重點整理|重点整理|整理一下.{0,12}(?:聊|說|说|討論|讨论|意見|意见|重點|重点|需求|對話|对话|訊息|讯息|消息)|(?:剛剛|刚才|前面|今天|最近|群裡|群里).{0,8}(?:大家)?(?:聊|說|说|討論|讨论)了?(?:什麼|什么|啥)|幫我(?:回顧|回顾|整理|梳理)(?:一下)?(?:剛剛|刚才|前面|今天|群裡|群里)|\b(?:recap|summarize|summarise|summary\s+of|catch\s+me\s+up|what\s+did\s+(?:we|everyone)\s+(?:talk|discuss|say)|tl;?dr)\b)/i;
+/** Returns true when a user message asks to summarize or recap recent conversation history. */
+export function isSummaryOrRecapRequest(text) {
+    const clean = (text ?? '').trim();
+    return Boolean(clean) && SUMMARY_RECAP_RE.test(clean);
+}
+/**
+ * Converts Markdown numbered lists (`1. ...`, `2. ...`) into `• ` bullets when separated
+ * by URLs or blank lines (preventing Narra Web's Markdown renderer from resetting every
+ * separated item back to `1.`).
+ */
+export function normalizeBulletLists(text) {
+    const input = text ?? '';
+    const lines = input.split('\n');
+    let numberedCount = 0;
+    for (const line of lines) {
+        if (/^\s*\d+\.\s+\S/.test(line))
+            numberedCount += 1;
+    }
+    if (numberedCount < 2)
+        return input;
+    return lines
+        .map((line) => line.replace(/^(\s*)\d+\.\s+/, '$1• '))
+        .join('\n');
+}
 /**
  * Defuses spoofed context header lines inside user-supplied text by quoting them (`> ...`),
  * preventing prompt-envelope spoofing inside A2A messages.

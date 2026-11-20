@@ -1,6 +1,6 @@
 import { type BroadcastScheduleResult } from './broadcast.js';
 import { type RecallTurnResult } from './memory.js';
-import type { AgentSpec, AgentUpdateItem, InboundEvent, RoomContext, TriageDecision, TriageModel } from './types.js';
+import type { AgentSpec, AgentUpdateItem, InboundEvent, LangCode, RoomContext, TriageDecision, TriageModel } from './types.js';
 export declare const NARRA_GATEWAY_STATE_SCHEMA = "\nCREATE TABLE IF NOT EXISTS narra_gateway_state (\n  agent_id TEXT PRIMARY KEY,\n  last_broadcast_iso TEXT NOT NULL,\n  updated_at TEXT NOT NULL\n);\n";
 export interface NarraGatewayEnv {
     DB?: D1Database;
@@ -44,6 +44,16 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
     enforceBroadcastStagger?: boolean;
     /** Opt-in fail-closed check against Narra `/api/agent-runtime/matrix/authorize-event`. */
     authorizeEvents?: boolean;
+    /** Optional D1/local pre-fetch hook injected into Manyfold A2A `extraFields` in parallel before calling A2A. */
+    buildExtraEnvelopeFields?: (env: TEnv, event: InboundEvent, decision: TriageDecision, memories: RecallTurnResult, context: RoomContext) => Promise<Record<string, string> | null | undefined>;
+    /** Custom progress status text shown if a directly addressed A2A turn exceeds `thinkingDelayMs`. */
+    thinkingMessage?: (lang: LangCode, event: InboundEvent, decision: TriageDecision) => string;
+    /** Delay before posting a progress status bubble on direct A2A turns (default 3500ms; 0 disables). */
+    thinkingDelayMs?: number;
+    /** When true, posts a brief human-like apology if a directly addressed A2A turn exhausts all retries. */
+    enableA2AFailureReply?: boolean;
+    /** Custom failure apology text when `enableA2AFailureReply` is enabled or a thinking bubble was already posted. */
+    a2aFailureReply?: (lang: LangCode, event: InboundEvent) => string;
     /** Injectable clock for deterministic testing. */
     now?: () => number;
     /** Injectable sleep for deterministic testing. */
@@ -173,6 +183,8 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
     private scheduleNextAlarm;
     private computeShouldQuote;
     private postReplyToRoom;
+    private editReplyInRoom;
+    private loadExpandedHistoryForSummary;
     fetch(request: Request): Promise<Response>;
     private isTurnRedacted;
     private removePendingTurn;

@@ -1,8 +1,8 @@
-import { buildPromptEnvelope, runManyfoldA2ATurn, A2AError } from './adapters/manyfold-a2a.js';
+import { A2AError, buildPromptEnvelope, normalizeA2AOutput, runManyfoldA2ATurnWithMeta, } from './adapters/manyfold-a2a.js';
 import { D1BroadcastStore, InMemoryBroadcastStore, ProactiveBroadcastScheduler, } from './broadcast.js';
 import { runSchemaStatements } from './d1.js';
 import { BurstCoalescer } from './debounce.js';
-import { isNarraAgent, isSilence, parseMatrixEvent, sanitizeMobileLinks, stripLeakedNotes, } from './guard.js';
+import { isNarraAgent, isSilence, isSummaryOrRecapRequest, parseMatrixEvent, sanitizeMobileLinks, stripLeakedNotes, } from './guard.js';
 import { detectExplicitLangSwitch, detectLang, stripAgentMentions } from './lang.js';
 import { MemoryStore, handleStandardMemoryCommand, } from './memory.js';
 import { editContent, messageContent, plainMentions } from './mentions.js';
@@ -18,11 +18,12 @@ const MAX_POST_ATTEMPTS = 3;
 const MAX_QUEUE_SIZE = 200;
 const MAX_HANDLED_IDS = 300;
 const MAX_REDACTED_IDS = 300;
-const MAX_RECENT_HISTORY = 30;
+const MAX_RECENT_HISTORY = 50;
 const MAX_OWN_MESSAGES = 30;
 const MAX_MESSAGE_CACHE = 50;
 const MAX_LOG_LINES = 40;
 const STALE_ROOM_STATUS_LIMIT = 20;
+const DEFAULT_THINKING_DELAY_MS = 3_500;
 export const NARRA_GATEWAY_STATE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS narra_gateway_state (
   agent_id TEXT PRIMARY KEY,
@@ -30,6 +31,27 @@ CREATE TABLE IF NOT EXISTS narra_gateway_state (
   updated_at TEXT NOT NULL
 );
 `;
+function defaultThinkingMessage(lang, isSummary) {
+    if (isSummary) {
+        if (lang === 'zh-Hant')
+            return '📝 正在閱讀群組歷史訊息並整理重點，稍等一下…';
+        if (lang === 'zh-Hans')
+            return '📝 正在阅读群组历史消息并整理重点，稍等一下…';
+        return '📝 Reading recent chat history and putting together a summary…';
+    }
+    if (lang === 'zh-Hant')
+        return '🔍 正在幫你查資料思考中，稍等一下…';
+    if (lang === 'zh-Hans')
+        return '🔍 正在帮你查资料思考中，稍等一下…';
+    return '🔍 Checking that for you, one moment…';
+}
+function defaultA2AFailureReply(lang) {
+    if (lang === 'zh-Hant')
+        return '不好意思，剛才查資料的連線有點忙碌，方便稍後再問我一次嗎？';
+    if (lang === 'zh-Hans')
+        return '不好意思，刚才查资料的连接有点忙碌，方便稍后再问我一次吗？';
+    return 'Sorry, I hit a brief connection hiccup looking that up — could you ask me again in a moment?';
+}
 const schemaInitCache = new WeakMap();
 /**
  * Ensures `NARRA_MEMORY_SCHEMA`, `NARRA_BROADCAST_SCHEMA`, and `narra_gateway_state`
@@ -890,6 +912,74 @@ export class BaseNarraRoomCoordinator {
             fetchImpl: this.getConfig().fetchImpl,
         });
     }
+    async editReplyInRoom(roomId, targetEventId, text, txnSeed, selfMatrixId) {
+        if (!targetEventId || !isNarraSyncEnabled(this.env) || !this.env.NARRA_SYNC_DO) {
+            return false;
+        }
+        const txnId = await deterministicTxnId(`edit:${txnSeed}`);
+        const res = await this.matrixOp({
+            op: 'edit',
+            roomId,
+            eventId: targetEventId,
+            text,
+            txnId,
+            selfMatrixId,
+        }).catch(() => ({ ok: false, status: 0 }));
+        return res.ok;
+    }
+    async loadExpandedHistoryForSummary(roomId, baseHistory, selfMatrixId, members, limit = 40) {
+        const memberNames = new Map();
+        for (const m of members) {
+            if (m.matrixId && m.displayName)
+                memberNames.set(m.matrixId, m.displayName);
+        }
+        const fetched = [];
+        if (isNarraSyncEnabled(this.env) && this.env.NARRA_SYNC_DO) {
+            const mat = await this.matrixOp({
+                op: 'recentMessages',
+                roomId,
+                limit,
+            }).catch(() => ({ ok: false, status: 0 }));
+            if (mat.ok && Array.isArray(mat.events)) {
+                fetched.push(...mat.events);
+            }
+        }
+        if (fetched.length < Math.min(limit, 15) && (this.env.NARRA_AGENT_TOKEN ?? '').trim()) {
+            const backstop = await fetchNarraChatMessagesBackstop({
+                narraApiEndpoint: narraEndpoint(this.env),
+                narraAgentToken: this.env.NARRA_AGENT_TOKEN,
+                fetchImpl: this.getConfig().fetchImpl,
+            }, roomId, { dir: 'b', limit }).catch(() => ({ events: [] }));
+            fetched.push(...backstop.events);
+        }
+        const byId = new Map();
+        for (const h of baseHistory) {
+            if (h.eventId && h.text.trim())
+                byId.set(h.eventId, h);
+        }
+        for (const ev of fetched) {
+            if (!ev.eventId || !ev.text.trim())
+                continue;
+            if (ev.kind === 'reaction' || ev.kind === 'edit' || ev.kind === 'redaction')
+                continue;
+            if (byId.has(ev.eventId))
+                continue;
+            const isSelf = Boolean(selfMatrixId && ev.senderId === selfMatrixId);
+            byId.set(ev.eventId, {
+                eventId: ev.eventId,
+                senderId: ev.senderId,
+                senderName: ev.senderName ?? memberNames.get(ev.senderId),
+                isAgent: isSelf || isNarraAgent(ev.senderId),
+                isSelf,
+                text: ev.text.slice(0, 600),
+                timestampMs: ev.timestampMs,
+                ...(ev.replyToEventId ? { replyToEventId: ev.replyToEventId } : {}),
+            });
+        }
+        return [...byId.values()]
+            .sort((a, b) => a.timestampMs - b.timestampMs)
+            .slice(-limit);
+    }
     async fetch(request) {
         const path = new URL(request.url).pathname;
         if (request.method === 'GET' && path.endsWith('/status')) {
@@ -1452,6 +1542,7 @@ export class BaseNarraRoomCoordinator {
             }
             const effectiveSpec = await this.getEffectiveSpec();
             const memoryStore = await this.getMemoryStore();
+            let lastDecision = nextTurn.decision;
             try {
                 let answer = nextTurn.answer;
                 let decision = nextTurn.decision;
@@ -1466,6 +1557,7 @@ export class BaseNarraRoomCoordinator {
                         triageModel,
                         chainCap: AGENT_CHAIN_CAP,
                     });
+                    lastDecision = decision;
                     if (!decision.shouldReply) {
                         if (decision.reason === 'active_session_off_topic' ||
                             decision.reason === 'active_session_chatter' ||
@@ -1521,6 +1613,37 @@ export class BaseNarraRoomCoordinator {
                             continue;
                         }
                     }
+                    // Kick off read receipt + typing indicator concurrently so they never add serial HTTP latency
+                    // ahead of D1 memory recall, local fastRespond, or Manyfold A2A.
+                    let turnActive = true;
+                    let typingActive = false;
+                    let typingTimer;
+                    const receiptPromise = nextTurn.event.eventId
+                        ? this.matrixOp({
+                            op: 'receipt',
+                            roomId: nextTurn.event.roomId,
+                            eventId: nextTurn.event.eventId,
+                        }).catch(() => undefined)
+                        : Promise.resolve(undefined);
+                    const typingPromise = this.matrixOp({
+                        op: 'typing',
+                        roomId: nextTurn.event.roomId,
+                        typing: true,
+                    })
+                        .then((typingRes) => {
+                        if (typingRes.ok && turnActive) {
+                            typingActive = true;
+                            typingTimer = setInterval(() => {
+                                void this.matrixOp({
+                                    op: 'typing',
+                                    roomId: nextTurn.event.roomId,
+                                    typing: true,
+                                }).catch(() => undefined);
+                            }, TYPING_REFRESH_MS);
+                        }
+                        return typingRes;
+                    })
+                        .catch(() => ({ ok: false, status: 0 }));
                     const memories = memoryStore
                         ? await memoryStore.recallForTurn({
                             roomId: nextTurn.event.roomId,
@@ -1528,40 +1651,22 @@ export class BaseNarraRoomCoordinator {
                             chatType: context.chatType,
                         })
                         : emptyMemories();
-                    // Send read receipt + typing indicator before generating response.
-                    if (nextTurn.event.eventId) {
-                        await this.matrixOp({
-                            op: 'receipt',
-                            roomId: nextTurn.event.roomId,
-                            eventId: nextTurn.event.eventId,
-                        }).catch(() => undefined);
-                    }
-                    let typingActive = false;
-                    let typingTimer;
-                    const typingRes = await this.matrixOp({
-                        op: 'typing',
-                        roomId: nextTurn.event.roomId,
-                        typing: true,
-                    }).catch(() => ({ ok: false, status: 0 }));
-                    if (typingRes.ok) {
-                        typingActive = true;
-                        typingTimer = setInterval(() => {
-                            void this.matrixOp({
-                                op: 'typing',
-                                roomId: nextTurn.event.roomId,
-                                typing: true,
-                            }).catch(() => undefined);
-                        }, TYPING_REFRESH_MS);
-                    }
+                    const isDirectTurn = context.chatType === 'dm' ||
+                        decision.reason === 'dm' ||
+                        decision.reason === 'explicit_mention' ||
+                        decision.reason === 'reply_to_self';
+                    const mentionNamesForCheck = [
+                        effectiveSpec.name,
+                        ...(effectiveSpec.aliases ?? []),
+                        ...context.members.flatMap((m) => (m.displayName ? [m.displayName] : [])),
+                    ];
+                    const strippedForSummary = stripAgentMentions(nextTurn.event.text ?? '', mentionNamesForCheck).trim();
+                    const wantsSummary = isDirectTurn && isSummaryOrRecapRequest(strippedForSummary);
                     let rawAnswer = '';
+                    let usedA2A = false;
+                    let thinkingTimer;
+                    let thinkingPostPromise;
                     try {
-                        const envelope = buildPromptEnvelope({
-                            event: nextTurn.event,
-                            context,
-                            decision,
-                            memories,
-                            spec: effectiveSpec,
-                        });
                         let handledFast = false;
                         if (memoryStore) {
                             try {
@@ -1576,12 +1681,7 @@ export class BaseNarraRoomCoordinator {
                                 if (memReply !== null) {
                                     rawAnswer = memReply;
                                     handledFast = true;
-                                    const switchNames = [
-                                        effectiveSpec.name,
-                                        ...(effectiveSpec.aliases ?? []),
-                                        ...context.members.flatMap((m) => (m.displayName ? [m.displayName] : [])),
-                                    ];
-                                    const switched = detectExplicitLangSwitch(stripAgentMentions(nextTurn.event.text ?? '', switchNames));
+                                    const switched = detectExplicitLangSwitch(strippedForSummary);
                                     if (switched && nextTurn.event.senderId) {
                                         await this.runLocked(async () => {
                                             const hints = (await this.ctx.storage.get('userLanguageHints')) ??
@@ -1596,7 +1696,19 @@ export class BaseNarraRoomCoordinator {
                                 // Fall back cleanly if memory command fails unexpectedly.
                             }
                         }
-                        if (!handledFast && cfg.fastRespond) {
+                        // If a directly addressed user explicitly asks to summarize/recap chat history,
+                        // route straight to Manyfold A2A with expanded history (when A2A is configured)
+                        // instead of letting a local keyword fast-path dump a raw search list.
+                        let preResolvedCred;
+                        let skipFastForSummary = false;
+                        if (!handledFast && wantsSummary) {
+                            preResolvedCred = await (cfg.resolveA2ACredential?.(this.env) ??
+                                defaultResolveA2ACredential(this.env, effectiveSpec));
+                            if (preResolvedCred?.url && preResolvedCred?.token) {
+                                skipFastForSummary = true;
+                            }
+                        }
+                        if (!handledFast && !skipFastForSummary && cfg.fastRespond) {
                             try {
                                 const fast = await cfg.fastRespond(this.env, nextTurn.event, decision, memories, context);
                                 if (fast !== null && fast !== undefined) {
@@ -1609,25 +1721,92 @@ export class BaseNarraRoomCoordinator {
                             }
                         }
                         if (!handledFast) {
-                            const cred = await (cfg.resolveA2ACredential?.(this.env) ??
-                                defaultResolveA2ACredential(this.env, effectiveSpec));
+                            usedA2A = true;
+                            const [cred, extraFields, expandedHistory, storedContextId] = await Promise.all([
+                                preResolvedCred !== undefined
+                                    ? Promise.resolve(preResolvedCred)
+                                    : Promise.resolve(cfg.resolveA2ACredential?.(this.env) ??
+                                        defaultResolveA2ACredential(this.env, effectiveSpec)),
+                                cfg.buildExtraEnvelopeFields
+                                    ? cfg
+                                        .buildExtraEnvelopeFields(this.env, nextTurn.event, decision, memories, context)
+                                        .catch(() => undefined)
+                                    : Promise.resolve(undefined),
+                                wantsSummary
+                                    ? this.loadExpandedHistoryForSummary(nextTurn.event.roomId, context.recentHistory, effectiveSpec.matrixId, context.members, 40).catch(() => context.recentHistory)
+                                    : Promise.resolve(context.recentHistory),
+                                this.ctx.storage.get('a2aContextId').catch(() => undefined),
+                            ]);
                             if (!cred || !cred.url || !cred.token) {
                                 throw new A2AError('No A2A credential available for Narra gateway.', false);
                             }
-                            rawAnswer = await runManyfoldA2ATurn({
-                                credential: {
-                                    rpcUrl: cred.url,
-                                    token: cred.token,
-                                    label: cred.label ?? effectiveSpec.name,
-                                },
-                                envelope,
-                                eventId: nextTurn.event.eventId,
-                                timeoutMs: 45_000,
-                                fetchImpl: cfg.fetchImpl,
+                            const envelope = buildPromptEnvelope({
+                                event: nextTurn.event,
+                                context: wantsSummary ? { ...context, recentHistory: expandedHistory } : context,
+                                decision,
+                                memories,
+                                spec: effectiveSpec,
+                                summaryMode: wantsSummary,
+                                ...(extraFields && Object.keys(extraFields).length > 0 ? { extraFields } : {}),
                             });
+                            const thinkingDelayMs = cfg.thinkingDelayMs ?? DEFAULT_THINKING_DELAY_MS;
+                            if (isDirectTurn && thinkingDelayMs > 0 && !nextTurn.thinkingEventId) {
+                                const statusText = cfg.thinkingMessage?.(decision.detectedLang, nextTurn.event, decision) ??
+                                    defaultThinkingMessage(decision.detectedLang, wantsSummary);
+                                const roomChatType = context.chatType;
+                                thinkingTimer = setTimeout(() => {
+                                    thinkingPostPromise = (async () => {
+                                        try {
+                                            const qNow = await this.computeShouldQuote(nextTurn.event, roomChatType);
+                                            const postedStatus = await this.postReplyToRoom(nextTurn.event.roomId, statusText, `thinking:${nextTurn.event.eventId}`, effectiveSpec.matrixId, qNow ? nextTurn.event.eventId : undefined);
+                                            if (postedStatus.eventId) {
+                                                nextTurn.thinkingEventId = postedStatus.eventId;
+                                                await this.updatePendingTurn(nextTurn);
+                                            }
+                                        }
+                                        catch {
+                                            // Non-fatal: final answer will still be posted normally.
+                                        }
+                                    })();
+                                }, thinkingDelayMs);
+                            }
+                            try {
+                                const a2aRes = await runManyfoldA2ATurnWithMeta({
+                                    credential: {
+                                        rpcUrl: cred.url,
+                                        token: cred.token,
+                                        label: cred.label ?? effectiveSpec.name,
+                                    },
+                                    envelope,
+                                    eventId: nextTurn.event.eventId,
+                                    ...(storedContextId ? { contextId: storedContextId } : {}),
+                                    timeoutMs: 45_000,
+                                    fetchImpl: cfg.fetchImpl,
+                                });
+                                rawAnswer = a2aRes.text;
+                                if (a2aRes.contextId && a2aRes.contextId !== storedContextId) {
+                                    await this.ctx.storage.put('a2aContextId', a2aRes.contextId).catch(() => undefined);
+                                }
+                            }
+                            catch (a2aErr) {
+                                if (storedContextId &&
+                                    a2aErr instanceof A2AError &&
+                                    !a2aErr.retryable &&
+                                    /(?:HTTP 40[04]|context)/i.test(a2aErr.message)) {
+                                    await this.ctx.storage.delete('a2aContextId').catch(() => undefined);
+                                }
+                                throw a2aErr;
+                            }
                         }
                     }
                     finally {
+                        turnActive = false;
+                        if (thinkingTimer !== undefined)
+                            clearTimeout(thinkingTimer);
+                        if (thinkingPostPromise) {
+                            await thinkingPostPromise.catch(() => undefined);
+                        }
+                        await Promise.allSettled([receiptPromise, typingPromise]);
                         if (typingTimer !== undefined)
                             clearInterval(typingTimer);
                         if (typingActive) {
@@ -1638,9 +1817,20 @@ export class BaseNarraRoomCoordinator {
                             }).catch(() => undefined);
                         }
                     }
-                    const { text: withoutNotes } = stripLeakedNotes(rawAnswer);
-                    const cleaned = withoutNotes ? sanitizeMobileLinks(withoutNotes) : '';
+                    let cleaned = '';
+                    if (usedA2A) {
+                        cleaned = normalizeA2AOutput(rawAnswer, decision.detectedLang).text;
+                    }
+                    else {
+                        const { text: withoutNotes } = stripLeakedNotes(rawAnswer);
+                        cleaned = withoutNotes ? sanitizeMobileLinks(withoutNotes) : '';
+                    }
                     if (!cleaned || isSilence(cleaned)) {
+                        if (nextTurn.thinkingEventId) {
+                            const fallback = cfg.a2aFailureReply?.(decision.detectedLang, nextTurn.event) ??
+                                defaultA2AFailureReply(decision.detectedLang);
+                            await this.editReplyInRoom(nextTurn.event.roomId, nextTurn.thinkingEventId, fallback, `silent-fallback:${nextTurn.event.eventId}`, effectiveSpec.matrixId);
+                        }
                         if (decision.reason === 'active_session') {
                             await this.clearUserSession(nextTurn.event.senderId);
                         }
@@ -1681,7 +1871,14 @@ export class BaseNarraRoomCoordinator {
                 }
                 const quoteNow = await this.computeShouldQuote(nextTurn.event, chatType);
                 const replyToEventId = quoteNow ? nextTurn.event.eventId : undefined;
-                const posted = await this.postReplyToRoom(nextTurn.event.roomId, answer, nextTurn.event.eventId, effectiveSpec.matrixId, replyToEventId);
+                let posted;
+                if (nextTurn.thinkingEventId &&
+                    (await this.editReplyInRoom(nextTurn.event.roomId, nextTurn.thinkingEventId, answer, nextTurn.event.eventId, effectiveSpec.matrixId))) {
+                    posted = { eventId: nextTurn.thinkingEventId };
+                }
+                else {
+                    posted = await this.postReplyToRoom(nextTurn.event.roomId, answer, nextTurn.event.eventId, effectiveSpec.matrixId, replyToEventId);
+                }
                 const repliedAtMs = this.nowMs();
                 await this.runLocked(async () => {
                     const ownMessages = (await this.ctx.storage.get('ownMessages')) ?? [];
@@ -1748,6 +1945,30 @@ export class BaseNarraRoomCoordinator {
                     delayMs = attempts < MAX_POST_ATTEMPTS ? 5_000 * 2 ** (attempts - 1) : null;
                 }
                 if (delayMs === null) {
+                    const isDirectGiveUp = nextTurn.event.chatType === 'dm' ||
+                        lastDecision?.reason === 'dm' ||
+                        lastDecision?.reason === 'explicit_mention' ||
+                        lastDecision?.reason === 'reply_to_self';
+                    const shouldSendFailureNotice = error instanceof A2AError &&
+                        nextTurn.answer === undefined &&
+                        (Boolean(nextTurn.thinkingEventId) || (isDirectGiveUp && cfg.enableA2AFailureReply === true));
+                    if (shouldSendFailureNotice) {
+                        const failLang = lastDecision?.detectedLang ?? detectLang(nextTurn.event.text ?? '');
+                        const failText = cfg.a2aFailureReply?.(failLang, nextTurn.event) ?? defaultA2AFailureReply(failLang);
+                        try {
+                            const edited = nextTurn.thinkingEventId
+                                ? await this.editReplyInRoom(nextTurn.event.roomId, nextTurn.thinkingEventId, failText, `fail-edit:${nextTurn.event.eventId}`, effectiveSpec.matrixId)
+                                : false;
+                            if (!edited) {
+                                const meta = await this.ctx.storage.get('roomMeta');
+                                const qNow = await this.computeShouldQuote(nextTurn.event, meta?.chatType ?? nextTurn.event.chatType);
+                                await this.postReplyToRoom(nextTurn.event.roomId, failText, `fail:${nextTurn.event.eventId}`, effectiveSpec.matrixId, qNow ? nextTurn.event.eventId : undefined);
+                            }
+                        }
+                        catch {
+                            // Never fail cleanup if fallback notice itself fails to send.
+                        }
+                    }
                     await appendDoLog(this.ctx.storage, `gave up on ${nextTurn.event.eventId} after ${attempts} attempt(s): ${errMsg}`, failNow, this.env);
                     await this.removePendingTurn(nextTurn.event.eventId);
                     continue;

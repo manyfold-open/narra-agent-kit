@@ -1,5 +1,5 @@
 import type { RecallTurnResult } from '../memory.js';
-import type { AgentSpec, FastPathModel, InboundEvent, RoomContext, TriageDecision } from '../types.js';
+import type { AgentSpec, FastPathModel, InboundEvent, LangCode, RoomContext, TriageDecision } from '../types.js';
 export interface ManyfoldA2ACredential {
     rpcUrl: string;
     token: string;
@@ -18,13 +18,17 @@ export interface PromptEnvelopeInput {
     spec?: AgentSpec;
     maxHistoryTurns?: number;
     extraFields?: Record<string, string>;
+    /** When true, includes a full multi-speaker timeline (up to 40 turns) and structured recap instructions. */
+    summaryMode?: boolean;
+    /** Includes the agent's own recent replies (defaults to true) so A2A follow-ups remember local fast-path answers. */
+    includeSelfReplies?: boolean;
 }
 /**
  * Builds a prompt-injection-hardened Manyfold A2A turn envelope containing:
  * - Pre-injected room members & peer `@agent-*` roster
  * - `in_reply_to_other` (or `in_reply_to_self`) parent snippet
- * - Recent human-only history (excludes noisy peer agent chatter)
- * - `detected_lang` strict language lock
+ * - Recent human history + agent's own recent replies (or full chronological timeline in summaryMode)
+ * - `detected_lang` strict language lock & mobile group-chat style guidance
  * - Recalled safe memories (with DM-to-group privacy isolation already applied)
  */
 export declare function buildPromptEnvelope(input: PromptEnvelopeInput): string;
@@ -55,7 +59,27 @@ export interface RunA2AOptions {
     contextId?: string;
     timeoutMs?: number;
     fetchImpl?: typeof fetch;
+    /** Optional callback fired when SSE streams intermediate progress text. */
+    onProgress?: (progressText: string) => void;
 }
+export interface RunA2ATurnResult {
+    text: string;
+    contextId: string | null;
+    taskId: string | null;
+}
+/**
+ * Post-processes raw Manyfold A2A output: strips leaked notes, sanitizes mobile URLs,
+ * converts numbered markdown lists to `• ` bullets, and enforces pure `zh-Hant` when requested.
+ */
+export declare function normalizeA2AOutput(raw: string, lang?: LangCode): {
+    text: string;
+    cut: string;
+};
+/**
+ * Executes one zero-extra-key Manyfold A2A streaming (`message/stream`) turn over JSON-RPC 2.0,
+ * returning both the final answer text and session metadata (`contextId`, `taskId`).
+ */
+export declare function runManyfoldA2ATurnWithMeta(options: RunA2AOptions): Promise<RunA2ATurnResult>;
 /**
  * Executes one zero-extra-key Manyfold A2A streaming (`message/stream`) turn over JSON-RPC 2.0.
  */
