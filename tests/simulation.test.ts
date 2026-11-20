@@ -2387,6 +2387,12 @@ describe('narra-agent-kit simulation & unit suite', () => {
       });
       expect(coMentionScore.score).toBeGreaterThanOrEqual(0.85);
       expect(coMentionScore.reason).toBe('multi_mention_domain_match');
+
+      // Traditional-only char `靜` switches immediately back to zh-Hant even after a zh-Hans hint
+      expect(detectLang('先安靜', 'zh-Hans')).toBe('zh-Hant');
+      // Casual hearsay statement without question/request stays quiet in unmentioned group chat
+      expect(isPastAnecdoteOrStatement('聽說 UCL 附近好吃的多')).toBe(true);
+      expect(isPastAnecdoteOrStatement('聽說 UCL 附近好吃的多，有推薦的嗎？')).toBe(false);
     });
   });
 });

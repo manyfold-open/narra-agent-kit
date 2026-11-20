@@ -42,6 +42,8 @@ const TOPIC_PIVOT_RE =
 const PERSONAL_STRESS_STATEMENT_RE =
   /(?:明天|後天|后天|下週|下周|待會|待会|等下|晚點|晚点).{0,16}(?:要跟|要去|要見|要见|開會|开会|面試|面试|報告|报告|要?談|談|谈).{0,24}(?:好緊張|好紧张|緊張|紧张|壓力|压力|焦慮|焦虑|好累|好煩|好烦|怕)|\b(?:so\s+nervous|stressed|anxious)\s+about\s+(?:tomorrow|my\s+meeting|pitching|talking\s+to)\b/i;
 
+const HEARSAY_STATEMENT_RE = /^(?:聽說|听说|據說|据说|好像聽說|好像听说|听人说|聽人說)/i;
+
 export const KNOWN_NARRA_PEER_ROLES: Record<string, string> = {
   '@agent-852feddf:matrix.netmind.chat': 'Three-card AI tarot readings, daily card draws, and reflective guidance',
   'ai tarot': 'Three-card AI tarot readings, daily card draws, and reflective guidance',
@@ -497,7 +499,11 @@ export function isPastAnecdoteOrStatement(text: string): boolean {
   const clean = (text ?? '').trim();
   if (!clean) return false;
   if (REQUEST_ACTION_RE.test(clean)) return false;
-  return PAST_ANECDOTE_RE.test(clean) || PERSONAL_STRESS_STATEMENT_RE.test(clean);
+  return (
+    PAST_ANECDOTE_RE.test(clean) ||
+    PERSONAL_STRESS_STATEMENT_RE.test(clean) ||
+    HEARSAY_STATEMENT_RE.test(clean)
+  );
 }
 
 function hashFraction(input: string): number {

@@ -91,7 +91,7 @@ async function runWorkersAiResilienceFallback(ai, modelName, spec, envelope, lan
         `Your domain: ${spec.domainDescription}`,
         wantsSummary
             ? 'The user asked to summarize/recap recent chat history. Read recent_conversation_timeline carefully and present a concise, accurate summary using "• " bullets grouped by topic/person. Always attribute each message to the exact speaker name shown in [human HH:MM] SpeakerName: — never mix up two speakers or invent facts not in the timeline.'
-            : 'Answer the user directly and naturally like a helpful human teammate using any provided recent_self_replies, last_drawn_tarot_cards, last_drawn_fortune_stick, or d1_prefetched_records. Keep replies concise and mobile-friendly (3-5 short lines or 2-3 "• " bullets). Never invent fake URLs or unverified details.',
+            : 'Answer the user directly and naturally like a helpful human teammate. IMPORTANT: If last_drawn_tarot_cards, last_drawn_fortune_stick, d1_prefetched_records, or recent_self_replies is present in the context, you MUST directly interpret, compare, or answer using THOSE exact cards, sticks, or records — never tell the user to draw a new card or claim you cannot see what was just shown. Keep replies concise and mobile-friendly (3-5 short lines or 2-3 "• " bullets). Never invent fake URLs or unverified details.',
         `Reply STRICTLY in ${langLabel}.`,
         'Never mention internal system errors, fallback models, or envelope metadata. Output ONLY the final reply text.',
     ].join('\n');

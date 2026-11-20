@@ -17,6 +17,7 @@ const REQUEST_ACTION_RE = /[?？]|嗎|吗|呢|哪[裡里家間间]|推薦|推荐
 const PAST_ANECDOTE_RE = /(?:昨晚|昨天|前天|上週|上周|上個月|上个月|上次|剛剛|刚刚|剛才|刚才|剛|刚|之前|以前|那天|我朋友|朋友們|朋友们|同學|同学|同事).{0,32}(?:去了?|去完|吃了?|吃完|喝了?|喝完|看了?|看完|逛了?|逛完|玩了?|玩完|算了?|抽[到了的]?|求[到了的]?|參加了?|参加了?|拿了?|贏了?|赢了?|排隊|排队|排了|花[了掉]|買了?|买了?|買完|买完|超[飽饱好吃準准扯強强久酸貴贵神奇讚赞爽棒累]|好[飽饱好吃準准扯強强久酸貴贵神奇讚赞爽棒累]|太[飽饱好吃準准扯強强久酸貴贵神奇讚赞爽棒累]|覺得|觉得|感覺|感觉|撐死|撑死)|\b(?:yesterday|last\s+(?:night|week|weekend|month)|earlier\s+today|just\s+(?:went|ate|had|saw|visited|drew|won|finished|got\s+back\s+from)|my\s+(?:friend|colleague|buddy|mate)\s+(?:went|won|joined|ate|visited|drew))\b/i;
 const TOPIC_PIVOT_RE = /順便|顺便|話說|话说|對了|对了|另外問|另外问|題外話|题外话|\b(?:by\s+the\s+way|btw|side\s+note|also\s+wondering|unrelated|on\s+another\s+note)\b/i;
 const PERSONAL_STRESS_STATEMENT_RE = /(?:明天|後天|后天|下週|下周|待會|待会|等下|晚點|晚点).{0,16}(?:要跟|要去|要見|要见|開會|开会|面試|面试|報告|报告|要?談|談|谈).{0,24}(?:好緊張|好紧张|緊張|紧张|壓力|压力|焦慮|焦虑|好累|好煩|好烦|怕)|\b(?:so\s+nervous|stressed|anxious)\s+about\s+(?:tomorrow|my\s+meeting|pitching|talking\s+to)\b/i;
+const HEARSAY_STATEMENT_RE = /^(?:聽說|听说|據說|据说|好像聽說|好像听说|听人说|聽人說)/i;
 export const KNOWN_NARRA_PEER_ROLES = {
     '@agent-852feddf:matrix.netmind.chat': 'Three-card AI tarot readings, daily card draws, and reflective guidance',
     'ai tarot': 'Three-card AI tarot readings, daily card draws, and reflective guidance',
@@ -402,7 +403,9 @@ export function isPastAnecdoteOrStatement(text) {
         return false;
     if (REQUEST_ACTION_RE.test(clean))
         return false;
-    return PAST_ANECDOTE_RE.test(clean) || PERSONAL_STRESS_STATEMENT_RE.test(clean);
+    return (PAST_ANECDOTE_RE.test(clean) ||
+        PERSONAL_STRESS_STATEMENT_RE.test(clean) ||
+        HEARSAY_STATEMENT_RE.test(clean));
 }
 function hashFraction(input) {
     let h = 2166136261;
