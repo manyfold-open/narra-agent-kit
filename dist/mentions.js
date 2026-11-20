@@ -77,6 +77,9 @@ export function editContent(eventId, text, optionsOrSelfId = {}) {
         body: rendered.body,
         ...(rendered.html ? { format: 'org.matrix.custom.html', formatted_body: rendered.html } : {}),
         'm.mentions': mentions,
+        ...(opts.replyToEventId
+            ? { 'm.relates_to': { 'm.in_reply_to': { event_id: opts.replyToEventId } } }
+            : {}),
     };
     return {
         msgtype: opts.msgtype ?? 'm.text',

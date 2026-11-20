@@ -2367,6 +2367,26 @@ describe('narra-agent-kit simulation & unit suite', () => {
       expect(norm.text).toContain('• 楊國福旗艦店');
       expect(norm.text).toContain('• 監控基礎帳單');
       expect(norm.text).not.toMatch(/^\s*1\.\s+/m);
+      expect(toZhHant('AI 黑客松與骇客松')).toBe('AI 黑客松與駭客松');
+
+      // Explicit dual @mention co-specialist ask (`點心` + `展覽`) scores high for LCF even when peer keyword is in antiKeywords
+      const coMentionEv = makeTextEvent({
+        eventId: '$comention_1',
+        text: '@ChineseFood @SpottedLondon 週末先在 Soho 吃點心再逛展覽，各推 1 個',
+        mentions: [CHINESE_FOOD_SPEC.matrixId!, SPOTTED_SPEC.matrixId!],
+      });
+      const coMentionScore = await triage.score({
+        event: coMentionEv,
+        context: ctx,
+        spec: {
+          ...CHINESE_FOOD_SPEC,
+          domainKeywords: ['點心', '川菜', '中餐'],
+          antiKeywords: ['展覽', '市集'],
+        },
+        detectedLang: 'zh-Hant',
+      });
+      expect(coMentionScore.score).toBeGreaterThanOrEqual(0.85);
+      expect(coMentionScore.reason).toBe('multi_mention_domain_match');
     });
   });
 });

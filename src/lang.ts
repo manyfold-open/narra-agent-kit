@@ -435,6 +435,8 @@ const ZH_HANT_PHRASES: ReadonlyArray<readonly [string, string]> = [
   ['账单', '帳單'],
   ['旗舰', '旗艦'],
   ['旗舰店', '旗艦店'],
+  ['黑客松', '黑客松'],
+  ['骇客松', '駭客松'],
 ];
 
 const PHRASES_BY_LEN = [...ZH_HANT_PHRASES].sort((a, b) => b[0].length - a[0].length);

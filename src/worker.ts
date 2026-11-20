@@ -86,7 +86,7 @@ const MAX_OWN_MESSAGES = 30;
 const MAX_MESSAGE_CACHE = 50;
 const MAX_LOG_LINES = 40;
 const STALE_ROOM_STATUS_LIMIT = 20;
-const DEFAULT_THINKING_DELAY_MS = 3_500;
+const DEFAULT_THINKING_DELAY_MS = 2_000;
 
 export const NARRA_GATEWAY_STATE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS narra_gateway_state (
@@ -327,7 +327,7 @@ async function runWorkersAiResilienceFallback(
     `You are "${spec.name}" replying in a Narra Messenger chat.`,
     `Your domain: ${spec.domainDescription}`,
     wantsSummary
-      ? 'The user asked to summarize/recap recent chat history. Read recent_conversation_timeline carefully and present a concise, accurate summary using "• " bullets grouped by topic/person. Never invent facts not in the timeline.'
+      ? 'The user asked to summarize/recap recent chat history. Read recent_conversation_timeline carefully and present a concise, accurate summary using "• " bullets grouped by topic/person. Always attribute each message to the exact speaker name shown in [human HH:MM] SpeakerName: — never mix up two speakers or invent facts not in the timeline.'
       : 'Answer the user directly and naturally like a helpful human teammate using any provided recent_self_replies, last_drawn_tarot_cards, last_drawn_fortune_stick, or d1_prefetched_records. Keep replies concise and mobile-friendly (3-5 short lines or 2-3 "• " bullets). Never invent fake URLs or unverified details.',
     `Reply STRICTLY in ${langLabel}.`,
     'Never mention internal system errors, fallback models, or envelope metadata. Output ONLY the final reply text.',
@@ -1381,11 +1381,15 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     text: string,
     txnSeed: string,
     selfMatrixId: string | undefined,
+    replyToEventId?: string,
   ): Promise<boolean> {
     if (!targetEventId || !isNarraSyncEnabled(this.env) || !this.env.NARRA_SYNC_DO) {
       return false;
     }
     const txnId = await deterministicTxnId(`edit:${txnSeed}`);
+    const content = replyToEventId
+      ? editContent(targetEventId, text, { selfMatrixId, replyToEventId })
+      : undefined;
     const res = await this.matrixOp({
       op: 'edit',
       roomId,
@@ -1393,8 +1397,22 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       text,
       txnId,
       selfMatrixId,
+      ...(content ? { content } : {}),
     }).catch(() => ({ ok: false as const, status: 0 }));
-    return res.ok;
+    if (res.ok) return true;
+    if (replyToEventId && res.status >= 400 && res.status < 500) {
+      const retryTxnId = await deterministicTxnId(`edit-plain:${txnSeed}`);
+      const retryRes = await this.matrixOp({
+        op: 'edit',
+        roomId,
+        eventId: targetEventId,
+        text,
+        txnId: retryTxnId,
+        selfMatrixId,
+      }).catch(() => ({ ok: false as const, status: 0 }));
+      return retryRes.ok;
+    }
+    return false;
   }
 
   private async loadExpandedHistoryForSummary(
@@ -1446,7 +1464,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       byId.set(ev.eventId, {
         eventId: ev.eventId,
         senderId: ev.senderId,
-        senderName: ev.senderName ?? memberNames.get(ev.senderId),
+        senderName: memberNames.get(ev.senderId) ?? ev.senderName,
         isAgent: isSelf || isNarraAgent(ev.senderId),
         isSelf,
         text: ev.text.slice(0, 600),
@@ -2154,8 +2172,14 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             continue;
           }
 
-          // Polite yield for unmentioned / multi-@ turns so peers don't pile on.
-          if (decision.yieldDelayMs && decision.yieldDelayMs > 0) {
+          // Polite yield for unmentioned turns so peers don't pile on.
+          // Explicit co-mentions (`multi_mention_domain_match`) must NOT yield to another co-mentioned
+          // specialist when the user deliberately called both specialists for their respective domains.
+          if (
+            decision.yieldDelayMs &&
+            decision.yieldDelayMs > 0 &&
+            decision.reason !== 'multi_mention_domain_match'
+          ) {
             const yieldOutcome = await executePoliteYield({
               delayMs: decision.yieldDelayMs,
               sleep: cfg.sleep,
@@ -2345,6 +2369,36 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
 
             if (!handledFast) {
               usedA2A = true;
+
+              const thinkingDelayMs = cfg.thinkingDelayMs ?? DEFAULT_THINKING_DELAY_MS;
+              if (isDirectTurn && thinkingDelayMs > 0 && !nextTurn.thinkingEventId) {
+                const statusText = wantsSummary
+                  ? defaultThinkingMessage(decision.detectedLang, true)
+                  : (cfg.thinkingMessage?.(decision.detectedLang, nextTurn.event, decision) ??
+                    defaultThinkingMessage(decision.detectedLang, false));
+                const roomChatType = context.chatType;
+                thinkingTimer = setTimeout(() => {
+                  thinkingPostPromise = (async () => {
+                    try {
+                      const qNow = await this.computeShouldQuote(nextTurn.event, roomChatType);
+                      const postedStatus = await this.postReplyToRoom(
+                        nextTurn.event.roomId,
+                        statusText,
+                        `thinking:${nextTurn.event.eventId}`,
+                        effectiveSpec.matrixId,
+                        qNow ? nextTurn.event.eventId : undefined,
+                      );
+                      if (postedStatus.eventId) {
+                        nextTurn.thinkingEventId = postedStatus.eventId;
+                        await this.updatePendingTurn(nextTurn);
+                      }
+                    } catch {
+                      // Non-fatal: final answer will still be posted normally.
+                    }
+                  })();
+                }, thinkingDelayMs);
+              }
+
               const [cred, extraFields, expandedHistory, storedContextId] = await Promise.all([
                 preResolvedCred !== undefined
                   ? Promise.resolve(preResolvedCred)
@@ -2383,35 +2437,6 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                 ...(extraFields && Object.keys(extraFields).length > 0 ? { extraFields } : {}),
               });
 
-              const thinkingDelayMs = cfg.thinkingDelayMs ?? DEFAULT_THINKING_DELAY_MS;
-              if (isDirectTurn && thinkingDelayMs > 0 && !nextTurn.thinkingEventId) {
-                const statusText = wantsSummary
-                  ? defaultThinkingMessage(decision.detectedLang, true)
-                  : (cfg.thinkingMessage?.(decision.detectedLang, nextTurn.event, decision) ??
-                    defaultThinkingMessage(decision.detectedLang, false));
-                const roomChatType = context.chatType;
-                thinkingTimer = setTimeout(() => {
-                  thinkingPostPromise = (async () => {
-                    try {
-                      const qNow = await this.computeShouldQuote(nextTurn.event, roomChatType);
-                      const postedStatus = await this.postReplyToRoom(
-                        nextTurn.event.roomId,
-                        statusText,
-                        `thinking:${nextTurn.event.eventId}`,
-                        effectiveSpec.matrixId,
-                        qNow ? nextTurn.event.eventId : undefined,
-                      );
-                      if (postedStatus.eventId) {
-                        nextTurn.thinkingEventId = postedStatus.eventId;
-                        await this.updatePendingTurn(nextTurn);
-                      }
-                    } catch {
-                      // Non-fatal: final answer will still be posted normally.
-                    }
-                  })();
-                }, thinkingDelayMs);
-              }
-
               try {
                 const a2aRes = await runManyfoldA2ATurnWithMeta({
                   credential: {
@@ -2422,7 +2447,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                   envelope,
                   eventId: nextTurn.event.eventId,
                   ...(storedContextId ? { contextId: storedContextId } : {}),
-                  timeoutMs: 20_000,
+                  timeoutMs: 15_000,
                   fetchImpl: cfg.fetchImpl,
                 });
                 rawAnswer = a2aRes.text;
@@ -2569,6 +2594,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             answer,
             nextTurn.event.eventId,
             effectiveSpec.matrixId,
+            replyToEventId,
           ))
         ) {
           posted = { eventId: nextTurn.thinkingEventId };

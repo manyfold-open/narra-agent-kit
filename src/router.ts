@@ -783,6 +783,18 @@ export function createWorkersAiTriageModel(
         return { score: Math.max(0.9, sig.heuristic), reason: 'domain_match' };
       }
 
+      const selfExplicitlyMentioned = isSelfMentioned(event, spec);
+      if (
+        selfExplicitlyMentioned &&
+        sig.keywordHits >= 1 &&
+        !sig.isAnecdote &&
+        (QUESTION_OR_INTENT_RE.test(sig.text) ||
+          REQUEST_ACTION_RE.test(sig.text) ||
+          /(?:各推|各來|推|幫我|帮我|推薦|推荐|挑|找|查)/i.test(sig.text))
+      ) {
+        return { score: Math.max(0.9, sig.heuristic), reason: 'multi_mention_domain_match' };
+      }
+
       const hasBackdropOrPivot = PAST_ANECDOTE_RE.test(sig.text) || Boolean(pivotMatch);
       if (
         sig.keywordHits >= 2 &&
@@ -815,9 +827,17 @@ export function createWorkersAiTriageModel(
           ? ['Other AI agents in this group:', ...peerLines]
           : []),
         'Rules (strict):',
-        '- Default to LOW score <= 0.15 (stay silent) because the user did NOT @mention you.',
-        '- Never stretch your domain to claim casual requests only tangentially related (e.g., do NOT claim general hunger/restaurant questions as pop-ups or datasets; do NOT claim casual weekend sightseeing/hanging out as hackathons or news).',
-        '- If another peer agent in this group is a clearly better match for the user\'s primary intent, you MUST output score <= 0.15 so that specialist answers cleanly.',
+        ...(selfExplicitlyMentioned
+          ? [
+              '- The user explicitly @mentioned BOTH you AND another agent in the same message.',
+              '- Output score 0.85-0.95 if ANY part of the message genuinely asks for YOUR domain (even if another part also asks for a different mentioned agent\'s domain, e.g., "eat dim sum AND visit an exhibition").',
+              '- Output score <= 0.15 ONLY if the message contains ZERO request for your domain.',
+            ]
+          : [
+              '- Default to LOW score <= 0.15 (stay silent) because the user did NOT @mention you.',
+              '- Never stretch your domain to claim casual requests only tangentially related (e.g., do NOT claim general hunger/restaurant questions as pop-ups or datasets; do NOT claim casual weekend sightseeing/hanging out as hackathons or news).',
+              '- If another peer agent in this group is a clearly better match for the user\'s primary intent, you MUST output score <= 0.15 so that specialist answers cleanly.',
+            ]),
         '- If the user already asked a primary question for another peer agent AND your topic is only a secondary "by the way / 順便" add-on, output score <= 0.15. However, if the earlier clause is only casual chatter or a past-tense backdrop (no question) and the "by the way / 順便" clause IS the only actual question, treat that question as the primary ask.',
         '- If your domain words only appear in a past-tense backdrop clause (e.g., "just finished visiting Camden Market, btw any new OpenAI model?") while the actual question belongs to another peer agent, output score <= 0.15.',
         '- Multi-person buildup: if earlier turns in recent_history clearly establish YOUR exact domain (e.g., teammates discussing where to eat Chinese food / London weekend pop-ups / AI news) and current_message adds constraints or asks a follow-up ("最好在 Soho", "有不辣的嗎", "有便宜一點的嗎"), treat it as a genuine domain need (0.78-0.92).',
