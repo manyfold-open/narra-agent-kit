@@ -147,6 +147,34 @@ function makeTextEvent(overrides: Partial<InboundEvent> & { text: string }): Inb
   };
 }
 
+it.each(['有离公司近的吗', '哪个离公司近', '看不懂英文 能不能给我看中文'])(
+  'routes "%s" to the agent whose answer it follows, even for another participant',
+  async (text) => {
+    const event = makeTextEvent({ text });
+    const context: RoomContext = {
+      roomId: event.roomId,
+      chatType: 'group',
+      members: [SPOTTED_SPEC, CHINESE_FOOD_SPEC].map((spec) => ({
+        matrixId: spec.matrixId!, displayName: spec.name, isAgent: true,
+      })),
+      recentHistory: [{
+        eventId: '$answer',
+        senderId: SPOTTED_SPEC.matrixId!,
+        isAgent: true,
+        text: 'Here are two places',
+        timestampMs: BASE_TIME - 1_000,
+      }],
+    };
+    const opts = { nowMs: BASE_TIME };
+    await expect(routeEvent(event, context, SPOTTED_SPEC, opts))
+      .resolves.toMatchObject({ shouldReply: true, reason: 'active_session' });
+    await expect(routeEvent(event, { ...context, activeSession: { active: true } }, CHINESE_FOOD_SPEC, opts))
+      .resolves.toMatchObject({ shouldReply: false });
+    await expect(routeEvent(event, { ...context, roomMuted: true }, SPOTTED_SPEC, opts))
+      .resolves.toMatchObject({ shouldReply: false, reason: 'room_muted' });
+  },
+);
+
 describe('narra-agent-kit simulation & unit suite', () => {
   afterEach(() => {
     vi.useRealTimers();
