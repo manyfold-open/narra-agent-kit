@@ -7,7 +7,7 @@ import { detectExplicitLangSwitch, detectLang, stripAgentMentions } from './lang
 import { MemoryStore, handleStandardMemoryCommand, } from './memory.js';
 import { editContent, messageContent, plainMentions } from './mentions.js';
 import { shouldQuote } from './quote.js';
-import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSION_WINDOW_MS, DEFAULT_WORKERS_AI_TRIAGE_MODEL, createWorkersAiTriageModel, executePoliteYield, hasPeerAnsweredTimeline, hasPeerRepliedAfter, inspectRoomPeers, isChainExhaustedError, isSelfMentioned, routeEvent, } from './router.js';
+import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSION_WINDOW_MS, DEFAULT_WORKERS_AI_TRIAGE_MODEL, createWorkersAiTriageModel, executePoliteYield, hasPeerAnsweredTimeline, hasPeerRepliedAfter, inspectRoomPeers, isChainExhaustedError, isContextualRewrite, isSelfMentioned, routeEvent, } from './router.js';
 import { fetchEventContext, fetchMatrixCredential, fetchNarraChatMessagesBackstop, fetchRoomMessagesBackstop, matrixSyncRequest, redactSecrets, SyncError, syncOnce, } from './sync.js';
 const DEFAULT_NARRA_API_ENDPOINT = 'https://api.netmind.chat';
 const DEFAULT_MATRIX_HOMESERVER = 'https://matrix.netmind.chat';
@@ -1794,19 +1794,21 @@ export class BaseNarraRoomCoordinator {
                                 // Fall back cleanly if memory command fails unexpectedly.
                             }
                         }
-                        // If a directly addressed user explicitly asks to summarize/recap chat history,
-                        // route straight to Manyfold A2A with expanded history (when A2A is configured)
-                        // instead of letting a local keyword fast-path dump a raw search list.
+                        // Summaries and restatements require conversational context rather than a fresh lookup.
                         let preResolvedCred;
-                        let skipFastForSummary = false;
-                        if (!handledFast && wantsSummary) {
+                        const rewriteTimestamp = nextTurn.event.timestampMs;
+                        const wantsRewrite = isContextualRewrite(nextTurn.event.text) &&
+                            (context.replyToTarget?.isSelf || context.recentHistory.some((turn) => turn.isSelf &&
+                                turn.timestampMs <= rewriteTimestamp));
+                        let skipFast = false;
+                        if (!handledFast && (wantsSummary || wantsRewrite)) {
                             preResolvedCred = await (cfg.resolveA2ACredential?.(this.env) ??
                                 defaultResolveA2ACredential(this.env, effectiveSpec));
                             if (preResolvedCred?.url && preResolvedCred?.token) {
-                                skipFastForSummary = true;
+                                skipFast = true;
                             }
                         }
-                        if (!handledFast && !skipFastForSummary && cfg.fastRespond) {
+                        if (!handledFast && !skipFast && cfg.fastRespond) {
                             try {
                                 const fast = await cfg.fastRespond(this.env, nextTurn.event, decision, memories, context);
                                 if (fast !== null && fast !== undefined) {

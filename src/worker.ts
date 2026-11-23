@@ -40,6 +40,7 @@ import {
   hasPeerRepliedAfter,
   inspectRoomPeers,
   isChainExhaustedError,
+  isContextualRewrite,
   isSelfMentioned,
   routeEvent,
 } from './router.js';
@@ -2343,20 +2344,22 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
               }
             }
 
-            // If a directly addressed user explicitly asks to summarize/recap chat history,
-            // route straight to Manyfold A2A with expanded history (when A2A is configured)
-            // instead of letting a local keyword fast-path dump a raw search list.
+            // Summaries and restatements require conversational context rather than a fresh lookup.
             let preResolvedCred: NarraA2ACredentialResult | null | undefined;
-            let skipFastForSummary = false;
-            if (!handledFast && wantsSummary) {
+            const rewriteTimestamp = nextTurn.event.timestampMs;
+            const wantsRewrite = isContextualRewrite(nextTurn.event.text) &&
+              (context.replyToTarget?.isSelf || context.recentHistory.some((turn) => turn.isSelf &&
+                turn.timestampMs <= rewriteTimestamp));
+            let skipFast = false;
+            if (!handledFast && (wantsSummary || wantsRewrite)) {
               preResolvedCred = await (cfg.resolveA2ACredential?.(this.env) ??
                 defaultResolveA2ACredential(this.env, effectiveSpec));
               if (preResolvedCred?.url && preResolvedCred?.token) {
-                skipFastForSummary = true;
+                skipFast = true;
               }
             }
 
-            if (!handledFast && !skipFastForSummary && cfg.fastRespond) {
+            if (!handledFast && !skipFast && cfg.fastRespond) {
               try {
                 const fast = await cfg.fastRespond(
                   this.env,
