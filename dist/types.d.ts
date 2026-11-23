@@ -20,6 +20,8 @@ export interface AgentSpec {
     politeYieldDelayMs?: number;
     cooldownMs?: number;
     capabilities?: AgentCapabilities;
+    /** Opt in when this agent owns a distinct request within an unmentioned group message. */
+    matchesIndependentGroupRequest?: (text: string, context: RoomContext) => boolean;
 }
 export interface PeerAgentInfo {
     matrixId: string;
@@ -116,6 +118,7 @@ export interface TriageDecision {
     detectedLang: LangCode;
     shouldQuote: boolean;
     directRoute?: boolean;
+    independentGroupReply?: boolean;
     yieldDelayMs?: number;
     triageSource?: 'heuristic' | 'model' | 'fast_path';
 }

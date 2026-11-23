@@ -1968,6 +1968,7 @@ export class BaseNarraRoomCoordinator {
                 if (chatType === 'group' &&
                     decision?.tier === 1 &&
                     !decision.directRoute &&
+                    !decision.independentGroupReply &&
                     decision.reason !== 'multi_mention_domain_match') {
                     const latestPeers = inspectRoomPeers(meta?.members ?? [], effectiveSpec.matrixId);
                     if (latestPeers.length > 0 &&

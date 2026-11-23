@@ -2212,6 +2212,7 @@ describe('worker runtime layer (src/worker.ts)', () => {
         ...TEST_SPEC,
         domainKeywords: ['pop-up', '市集', 'UCL'],
         politeYieldDelayMs: 25,
+        matchesIndependentGroupRequest: (text) => text === 'Find a dinner spot and a pop-up near Soho?',
       },
       now: () => nowMs,
       sleep: async (ms: number) => {
@@ -2314,6 +2315,31 @@ describe('worker runtime layer (src/worker.ts)', () => {
     nowMs += 2_000;
     await roomInst().alarm();
     expect(postedPayloads).toHaveLength(1);
+
+    // A separate pop-up request still gets its own answer after a dinner specialist replies.
+    nowMs += 200_000;
+    triggerTs = nowMs;
+    await roomStub.fetch('https://narra-room/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        roomId,
+        chatType: 'group',
+        members,
+        events: [
+          {
+            event_id: '$separate_req',
+            sender: '@zack:matrix.netmind.chat',
+            type: 'm.room.message',
+            origin_server_ts: triggerTs,
+            content: { msgtype: 'm.text', body: 'Find a dinner spot and a pop-up near Soho?' },
+          },
+        ],
+      }),
+    });
+    nowMs += 2_000;
+    await roomInst().alarm();
+    expect(postedPayloads).toHaveLength(2);
+    expect(postedPayloads[1]).toContain('Find a dinner spot and a pop-up near Soho?');
   });
 
   it('15. RoomDO does not head-of-line block local fastRespond/memory turns behind an A2A outage retry', async () => {
@@ -2326,7 +2352,7 @@ describe('worker runtime layer (src/worker.ts)', () => {
     const gateway = createNarraWorkerGateway({
       spec: TEST_SPEC,
       now: () => nowMs,
-      resolveA2ACredential: () => ({
+      resolveA2ACredential: async () => ({
         url: 'https://api.manyfold.ai/a2a/test',
         token: 'a2a_tok_test_hol',
         label: 'Penny',
@@ -2338,7 +2364,7 @@ describe('worker runtime layer (src/worker.ts)', () => {
         return null;
       },
       fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = typeof input === 'string' ? input : input.url;
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
         if (url.includes('api.manyfold.ai/a2a/')) {
           a2aAttempts += 1;
           return new Response('upstream bad gateway', { status: 502 });
@@ -2701,7 +2727,7 @@ describe('worker runtime layer (src/worker.ts)', () => {
       }),
       fastRespond: async () => null,
       fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = typeof input === 'string' ? input : input.url;
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
         if (url.includes('api.manyfold.ai/a2a/')) {
           return new Response('bad gateway', { status: 502 });
         }

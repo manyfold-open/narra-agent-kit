@@ -873,8 +873,13 @@ export async function routeEvent(event, context, spec, options = {}) {
             shouldQuote: false,
         };
     }
+    const independentGroupReply = !selfMentioned &&
+        !event.replyToEventId &&
+        event.kind === 'text' &&
+        peers.length > 0 &&
+        spec.matchesIndependentGroupRequest?.(event.text, context) === true;
     // 8. Active 3-min multi-turn session (only when not multi-`@` disambiguation)
-    if (!isMultiAgentMention && context.activeSession?.active) {
+    if (!independentGroupReply && !isMultiAgentMention && context.activeSession?.active) {
         const expires = context.activeSession.expiresAtMs ??
             (context.activeSession.lastAgentReplyAtMs !== undefined
                 ? context.activeSession.lastAgentReplyAtMs + (spec.sessionWindowMs ?? DEFAULT_SESSION_WINDOW_MS)
@@ -969,7 +974,7 @@ export async function routeEvent(event, context, spec, options = {}) {
         }
     }
     // 9. Peer-already-replied check before running Tier 1 (skip when explicitly co-mentioned)
-    if (!isMultiAgentMention && peers.length > 0 && hasPeerRepliedAfter(event, context, spec.matrixId)) {
+    if (!independentGroupReply && !isMultiAgentMention && peers.length > 0 && hasPeerRepliedAfter(event, context, spec.matrixId)) {
         return {
             shouldReply: false,
             tier: 1,
@@ -1002,7 +1007,11 @@ export async function routeEvent(event, context, spec, options = {}) {
     const effectiveThreshold = inCooldown ? Math.min(0.85, threshold + 0.18) : threshold;
     let score;
     let triageReason;
-    if (options.triageModel) {
+    if (independentGroupReply) {
+        score = 0.95;
+        triageReason = 'independent_group_request';
+    }
+    else if (options.triageModel) {
         const res = await options.triageModel.score({ event, context, spec, detectedLang });
         score = Math.max(0, Math.min(1, res.score));
         triageReason = res.reason;
@@ -1010,7 +1019,7 @@ export async function routeEvent(event, context, spec, options = {}) {
     else {
         score = heuristicDomainScore(event, spec, context);
     }
-    const triageSource = options.triageModel ? 'model' : 'heuristic';
+    const triageSource = independentGroupReply ? 'fast_path' : options.triageModel ? 'model' : 'heuristic';
     if (score >= effectiveThreshold) {
         const baseYieldMs = spec.politeYieldDelayMs ?? DEFAULT_YIELD_DELAY_MS;
         const yieldDelayMs = isMultiAgentMention
@@ -1028,7 +1037,7 @@ export async function routeEvent(event, context, spec, options = {}) {
             detectedLang,
             shouldQuote: quoteFlag,
             triageSource,
-            ...(yieldDelayMs > 0 ? { yieldDelayMs } : {}),
+            ...(independentGroupReply ? { independentGroupReply: true } : yieldDelayMs > 0 ? { yieldDelayMs } : {}),
         };
     }
     if (inCooldown && score >= threshold) {
