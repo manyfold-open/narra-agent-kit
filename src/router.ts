@@ -1051,8 +1051,15 @@ export async function routeEvent(
     };
   }
 
+  const independentGroupReply =
+    !selfMentioned &&
+    !event.replyToEventId &&
+    event.kind === 'text' &&
+    peers.length > 0 &&
+    spec.matchesIndependentGroupRequest?.(event.text, context) === true;
+
   // 8. Active 3-min multi-turn session (only when not multi-`@` disambiguation)
-  if (!isMultiAgentMention && context.activeSession?.active) {
+  if (!independentGroupReply && !isMultiAgentMention && context.activeSession?.active) {
     const expires =
       context.activeSession.expiresAtMs ??
       (context.activeSession.lastAgentReplyAtMs !== undefined
@@ -1156,7 +1163,7 @@ export async function routeEvent(
   }
 
   // 9. Peer-already-replied check before running Tier 1 (skip when explicitly co-mentioned)
-  if (!isMultiAgentMention && peers.length > 0 && hasPeerRepliedAfter(event, context, spec.matrixId)) {
+  if (!independentGroupReply && !isMultiAgentMention && peers.length > 0 && hasPeerRepliedAfter(event, context, spec.matrixId)) {
     return {
       shouldReply: false,
       tier: 1,
@@ -1194,7 +1201,10 @@ export async function routeEvent(
   let score: number;
   let triageReason: string | undefined;
 
-  if (options.triageModel) {
+  if (independentGroupReply) {
+    score = 0.95;
+    triageReason = 'independent_group_request';
+  } else if (options.triageModel) {
     const res = await options.triageModel.score({ event, context, spec, detectedLang });
     score = Math.max(0, Math.min(1, res.score));
     triageReason = res.reason;
@@ -1202,7 +1212,7 @@ export async function routeEvent(
     score = heuristicDomainScore(event, spec, context);
   }
 
-  const triageSource: TriageDecision['triageSource'] = options.triageModel ? 'model' : 'heuristic';
+  const triageSource: TriageDecision['triageSource'] = independentGroupReply ? 'fast_path' : options.triageModel ? 'model' : 'heuristic';
 
   if (score >= effectiveThreshold) {
     const baseYieldMs = spec.politeYieldDelayMs ?? DEFAULT_YIELD_DELAY_MS;
@@ -1221,7 +1231,7 @@ export async function routeEvent(
       detectedLang,
       shouldQuote: quoteFlag,
       triageSource,
-      ...(yieldDelayMs > 0 ? { yieldDelayMs } : {}),
+      ...(independentGroupReply ? { independentGroupReply: true } : yieldDelayMs > 0 ? { yieldDelayMs } : {}),
     };
   }
 
