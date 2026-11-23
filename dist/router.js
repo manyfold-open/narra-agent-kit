@@ -39,6 +39,11 @@ export const KNOWN_NARRA_PEER_ROLES = {
 const CASUAL_SMALL_TALK_RE = /天氣|天气|下雨|下雪|晴天|陰天|阴天|好冷|好熱|好热|好累|累死了|好睏|好困|睡覺|睡觉|早點睡|早点睡|早點休息|早点休息|休息了?|先休息|先去忙|去忙一下|晚點聊|晚点聊|晚點見|晚点见|下次聊|(?:明天|改天|下次|回頭|回头|有空|晚點|晚点|以後|以后)再[看聊找試试]|下班|上班|出門|出门|到家|哈哈+|笑死|掰掰|拜拜|先這樣|先这样|沒事了|没事了|(?:好[喔哦啊呀]?[，,\s]*)?(?:謝謝|谢谢)(?:[!！。.~～\s]*$|[，,]?\s*(?:我先|先去|沒事|没事|先這樣|先这样))|\b(?:nice\s+weather|good\s+weather|so\s+tired|going\s+to\s+(?:bed|sleep)|get\s+some\s+rest|heading\s+out|got\s+to\s+go|gtg|brb|ttyl|see\s+you|bye|good\s*night|good\s*morning|haha+|lol|lmao|thanks?\s*(?:a\s+lot)?|ty|never\s*mind|nvm)\b/i;
 const SHORT_CONFIRM_RE = /^(?:抽|搖|摇|好|好的|好喔|好哦|對|对|對的|对的|對啊|对啊|繼續|继续|更多|下一[頁页]|是|不是|行|可以|要|再來|再来|yes|no|ok|okay|sure|more|next|another|draw|shake|go ahead)[!！。.~～?？\s]*$/i;
 const ACTIVE_FOLLOWUP_RE = /(?:[這这][幾几]?[個个間间家張张支條条筆笔輪轮期]|哪[一]?[個个間间家張张支條条筆笔]|第\s*[0-9一二三四五六七八九十]+|[那這这][張张支間间家位條条筆笔][牌籤簽签店]?|還有|还有|別[間家的個]|别[间家的个]|換一|换一|(?<!明天|改天|下次|回頭|回头|有空|晚點|晚点|以後|以后)再[抽來找看查問问試试]|詳細|详细|細節|细节|解說|解说|解釋|解释|意思|含義|含义|地址|菜單|菜单|價格|价格|價錢|价钱|多少錢|多少钱|人均|(?:開到|开到|營業到|营业到)\s*(?:幾點|几点)|幾點(?:開門|开门|關門|关门|營業|营业|打烊|開始|开始|結束|结束|截止)|几点(?:开门|关门|营业|打烊|开始|结束|截止)|(?:開門|开门|關門|关门|營業|营业|開始|开始|截止|開放|开放)\s*(?:時間|时间)|開門|开门|營業|营业|怎麼去|怎么去|坐什麼|坐什么|地鐵|地铁|附近|比較近|比较近|比較便宜|比较便宜|推薦|推荐|算一份|也算|改成|取消|截止|日期|來源|来源|連結|链接|網址|网址|網站|网站)|\b(?:expand(?:\s+(?:item|story|article|number|#))?|item\s*#?\d+|story\s*#?\d+|which\s+one|that\s+one|those|this\s+one|another|more|next|details?|explain|meaning|interpret|address|menu|price|cost|hours?|opening|how\s+(?:do\s+(?:i|we)|to)\s+get|tube|station|walk|closer|cheaper|recommend|also|actually|make\s+that|what\s+about|how\s+about|why|when|where\s+is|deadline|source|link)\b/i;
+const CONTEXTUAL_REWRITE_RE = /(?:看不懂英文|[給给]我看中文|(?:翻[譯译]|重[說说]|再[說说]一遍|[換换]成)\s*(?:成\s*)?(?:中文|[簡简]體|简体|繁體|繁体|英文)|\b(?:translate|restate|rewrite)\b.{0,40}\b(?:in|into)\s+(?:chinese|english|mandarin)\b)/i;
+const CONTEXTUAL_DISTANCE_RE = /^(?:那\s*)?(?:有[沒有没]?|哪一?[個个家間间]|哪[裡里])?\s*(?:[離离](?:公司|[辦办]公室|[車车]站|地[鐵铁]站)(?:更|最|[較较]|比[較较])?近)(?:的)?(?:[嗎吗呢])?[？?。.!！\s]*$/i;
+export function isContextualRewrite(text) {
+    return CONTEXTUAL_REWRITE_RE.test(text);
+}
 const HUMAN_GROUP_CHATTER_RE = /(?:對了\s*大家|对了\s*大家|大家(?:晚點|晚点|等等|待會|待会|明天|等下|幾點|几点|要不|覺得|觉得)|會議室|会议室|開會|开会|約個會|约个会|訂會議室|订会议室|幾點開會|几点开会|幾點下班|几点下班|幾點出發|几点出发|地鐵誤點|地铁误点|地鐵延誤|地铁延误|延誤|延误|\b(?:everyone|guys|folks|team)\b.{0,24}\b(?:meeting|room|book|call|standup|sync|late|delayed|office|pint|pub)\b|\b(?:meeting\s+room|book\s+a\s+room|standup|conference\s+room|late\s+to\s+the\s+office)\b)/i;
 const BARE_URL_ONLY_RE = /^(?:https?:\/\/\S+\s*)+$/i;
 const DEV_ERROR_HEADER_RE = /\b(?:error\s+[45]\d{2}|http\s+[45]\d{2}|status\s+[45]\d{2}|traceback\s*\(|stack\s*trace|unhandled\s+(?:exception|rejection)|(?:type|reference|syntax|runtime|range|value|key|attribute|index)error|segmentation\s+fault|panic:)\b/i;
@@ -872,6 +877,26 @@ export async function routeEvent(event, context, spec, options = {}) {
             detectedLang,
             shouldQuote: false,
         };
+    }
+    // A short refinement applies to the most recent agent answer in this room.
+    // Explicit replies and mentions keep their usual precedence.
+    if (!selfMentioned && mentionedPeers.length === 0 && !event.replyToEventId && event.kind === 'text' &&
+        (isContextualRewrite(event.text) || CONTEXTUAL_DISTANCE_RE.test(event.text.trim()))) {
+        const previousAnswer = context.recentHistory.reduce((latest, turn) => turn.isAgent && turn.text.trim() && turn.timestampMs <= event.timestampMs &&
+            event.timestampMs - turn.timestampMs <= DEFAULT_SESSION_WINDOW_MS &&
+            (!latest || turn.timestampMs >= latest.timestampMs) ? turn : latest, undefined);
+        if (previousAnswer) {
+            const isOwner = previousAnswer.isSelf === true || previousAnswer.senderId === spec.matrixId;
+            return {
+                shouldReply: isOwner,
+                tier: 0,
+                reason: isOwner ? 'active_session' : 'active_session_chatter',
+                confidence: 1,
+                detectedLang,
+                shouldQuote: isOwner && quoteFlag,
+                directRoute: isOwner,
+            };
+        }
     }
     const independentGroupReply = !selfMentioned &&
         !event.replyToEventId &&
