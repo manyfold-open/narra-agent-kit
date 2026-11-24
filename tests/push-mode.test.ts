@@ -297,4 +297,18 @@ describe('invite acceptance', () => {
     const attempts = (await h.storage.get<Record<string, { failures: number }>>('inviteAttempts'))!;
     expect(attempts['!blocked:matrix.netmind.chat'].failures).toBe(2);
   });
+
+  it('sweeps invites that arrived before invite handling existed (incremental /sync never repeats them)', async () => {
+    const h = harness({ NARRA_SYNC_MODE: 'longpoll' }, { invites: (n) => (n === 2 ? ['!stale:matrix.netmind.chat'] : []) });
+    await h.sync.alarm(); // initial sync, no sweep needed
+    expect(joins(h.calls)).toEqual([]);
+    h.setNow(h.now() + 31 * 60_000);
+    await h.sync.alarm(); // sweep (full, timeline-free /sync) finds the stale invite
+    const sweep = h.calls.filter((c) => c.url.includes('/sync?')).at(1)!;
+    expect(new URL(sweep.url).searchParams.has('since')).toBe(false);
+    expect(JSON.parse(new URL(sweep.url).searchParams.get('filter')!).room.timeline.limit).toBe(0);
+    expect(joins(h.calls)).toEqual(['!stale:matrix.netmind.chat']);
+    expect(h.storage.alarmAt).toBe(h.now());
+  });
 });
+

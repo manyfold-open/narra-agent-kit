@@ -221,6 +221,8 @@ export declare class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGat
      * every event as notifying (edits, redactions and reactions are silent by default).
      * Returns false (caller falls back to long-poll) when either call fails.
      */
+    /** Joins invites that incremental `/sync` will never report again (see INVITE_SWEEP_INTERVAL_MS). */
+    private sweepPendingInvites;
     private ensurePushSetup;
     /** Removes the pusher + wake rule after switching back to long-poll (best effort). */
     private teardownPushSetup;

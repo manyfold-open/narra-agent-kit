@@ -490,6 +490,23 @@ async function errorSnippet(res: Response): Promise<string> {
   return text.replace(/\s+/g, ' ').slice(0, 160);
 }
 
+/**
+ * Incremental `/sync` reports an invite only once, so invites that arrived while an older kit (that
+ * ignored them) was running never show up again. A full, timeline-free `/sync` lists every pending
+ * invite; the sync DO runs one this often.
+ */
+const INVITE_SWEEP_INTERVAL_MS = 30 * 60_000;
+const INVITE_SWEEP_FILTER = JSON.stringify({
+  presence: { types: [] },
+  account_data: { types: [] },
+  room: {
+    timeline: { limit: 0 },
+    state: { types: [] },
+    ephemeral: { types: [] },
+    account_data: { types: [] },
+  },
+});
+
 /** Failed invite joins are retried no sooner than this, doubling per failure. */
 const INVITE_RETRY_BASE_MS = 60_000;
 const INVITE_RETRY_MAX_MS = 6 * 60 * 60_000;
@@ -1255,6 +1272,43 @@ export class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGatewayEnv>
    * every event as notifying (edits, redactions and reactions are silent by default).
    * Returns false (caller falls back to long-poll) when either call fails.
    */
+  /** Joins invites that incremental `/sync` will never report again (see INVITE_SWEEP_INTERVAL_MS). */
+  private async sweepPendingInvites(nowMs: number): Promise<number> {
+    const storage = this.ctx.storage;
+    const last = (await storage.get<number>('inviteSweepAt')) ?? 0;
+    if (nowMs - last < INVITE_SWEEP_INTERVAL_MS) return 0;
+    if (!(await storage.get<SyncState>('sync'))?.since) {
+      // No sync token yet: the initial /sync lists every pending invite and acceptInvites sees it.
+      await storage.put('inviteSweepAt', nowMs);
+      return 0;
+    }
+    try {
+      const { login } = await this.resolveLogin(false);
+      const res = await this.homeserverRequest(
+        login,
+        'GET',
+        `/sync?timeout=0&set_presence=offline&filter=${encodeURIComponent(INVITE_SWEEP_FILTER)}`,
+      );
+      if (res.status === 401) this.cache.login = undefined;
+      if (!res.ok) throw new Error(`invite sweep HTTP ${res.status} ${await errorSnippet(res)}`);
+      const body = (await res.json()) as RawMatrixSyncResponse;
+      await storage.put('inviteSweepAt', nowMs);
+      const pending = Object.keys(body.rooms?.invite ?? {}).length;
+      if (pending > 0) {
+        void appendDoLog(storage, `invite sweep found ${pending} pending invite(s)`, nowMs, this.env);
+      }
+      return await this.acceptInvites(login, body, nowMs);
+    } catch (error) {
+      void appendDoLog(
+        storage,
+        `invite sweep failed: ${error instanceof Error ? error.message : String(error)}`,
+        nowMs,
+        this.env,
+      );
+      return 0;
+    }
+  }
+
   private async ensurePushSetup(nowMs: number): Promise<boolean> {
     const url = narraPushNotifyUrl(this.env);
     const pushkey = await narraPushKey(this.env);
@@ -1347,7 +1401,7 @@ export class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGatewayEnv>
       : (await this.teardownPushSetup(), false);
 
     const pushSeqAtStart = (await storage.get<number>('pushSeq')) ?? 0;
-    let joinedInvites = 0;
+    let joinedInvites = await this.sweepPendingInvites(nowMs);
 
     await this.refreshNarraRoomsMeta(nowMs);
 
@@ -1425,7 +1479,7 @@ export class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGatewayEnv>
 
     if (this.isSyncActive()) {
       let next = delay;
-      if (pushReady && delay === 0 && joinedInvites > 0) {
+      if (delay === 0 && joinedInvites > 0) {
         // Read the newly joined rooms (and the message that came with the invite) right away.
         next = 0;
       } else if (pushReady && delay === 0) {
