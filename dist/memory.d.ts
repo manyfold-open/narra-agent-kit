@@ -88,6 +88,7 @@ export declare class MemoryStore {
      * Recalls safe memories for a turn.
      * PRIVACY BOUNDARY: When `chatType === 'group'`, private DM user memories
      * (`origin_chat_type = 'dm'`) are STRICTLY excluded and never surfaced.
+     * Explicit group notes are visible only in the room that saved them.
      */
     recallForTurn(input: RecallTurnInput): Promise<RecallTurnResult>;
     forget(input: {
@@ -96,6 +97,7 @@ export declare class MemoryStore {
         roomId?: string;
         key?: string;
         originChatType?: ChatType;
+        noteRoomId?: string;
     }): Promise<number>;
     private upsertInternalRoomState;
     getRoomThreshold(roomId: string): Promise<number>;
