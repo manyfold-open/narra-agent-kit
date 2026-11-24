@@ -139,6 +139,9 @@ export interface TriageDecision {
   independentGroupReply?: boolean;
   yieldDelayMs?: number;
   triageSource?: 'heuristic' | 'model' | 'fast_path';
+  /** Set by an ask-aware triage model: the message is a real question/request to the group,
+   *  whoever ends up answering it. Lets agents make sure such a message never goes unanswered. */
+  isAsk?: boolean;
 }
 
 export type MemoryScope = 'user' | 'room';
@@ -179,7 +182,7 @@ export interface TriageModel {
     context: RoomContext;
     spec: AgentSpec;
     detectedLang: LangCode;
-  }): Promise<{ score: number; reason?: string }>;
+  }): Promise<{ score: number; reason?: string; ask?: boolean }>;
 }
 
 export interface FastPathModel {

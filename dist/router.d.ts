@@ -92,6 +92,7 @@ export declare function executePoliteYield(options: PoliteYieldOptions): Promise
 }>;
 /** Returns true when a message is a past-tense story, anecdote, or stress statement without help-seeking intent. */
 export declare function isPastAnecdoteOrStatement(text: string): boolean;
+export declare function hashFraction(input: string): number;
 /**
  * Computes confidence-weighted staggered polite yield delay so higher-confidence specialists
  * reply earlier in unmentioned group conversations and borderline agents yield gracefully.
@@ -126,6 +127,26 @@ export interface RouteOptions {
  * - Tier 1: pluggable `TriageModel` or lightweight keyword/domain heuristic for
  *   unmentioned group turns and multi-`@` disambiguation.
  */
+export interface AskTriageOptions {
+    model?: string;
+    /** Per attempt. */
+    timeoutMs?: number;
+    /** Extra attempts after a timeout, error or unparsable answer. */
+    retries?: number;
+    peerDirectory?: Record<string, string>;
+}
+/**
+ * Language-agnostic group triage. No keyword lists: the model reads the message (any language),
+ * the agent's domain, the other agents in the room and the recent turns, and answers two things:
+ * - `ask`: is this a real question / request / expressed need to the group (not chatter, not a
+ *   statement or acknowledgement, not talk between humans)?
+ * - `fit`: how well can THIS agent help, counting reasonable adjacent needs (hunger for a food
+ *   agent, "what to do tonight" for an events agent), lower when another agent here fits better.
+ * The score is `fit` for asks and near zero otherwise; `ask` travels on the decision so that a
+ * real question nobody claims can still be answered (see the group fallback in worker.ts).
+ * Only content-free messages (emoji, punctuation) are dropped before the model.
+ */
+export declare function createAskTriageModel(ai: unknown, options?: AskTriageOptions): TriageModel;
 export declare function routeEvent(event: InboundEvent, context: RoomContext, spec: AgentSpec, options?: RouteOptions): Promise<TriageDecision>;
 export declare const routeInboundEvent: typeof routeEvent;
 export interface RoomRouterConfig {

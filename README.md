@@ -180,6 +180,20 @@ With `NARRA_SYNC_MODE: "push"` the sync DO registers a Matrix HTTP pusher for th
 
 ---
 
+### 4. Group triage that works in any language (`NARRA_GROUP_TRIAGE=ask`)
+
+The default group triage drops unmentioned messages with Chinese/English keyword checks ("too short", "no need cue", "other domain") before Workers AI ever sees them, asks the model to stay conservative, and treats a model timeout as "stay silent". So a real question phrased differently, or in another language, can go unanswered by every agent.
+
+With `"NARRA_GROUP_TRIAGE": "ask"` (and an `AI` binding):
+
+- **Ask-aware triage** (`createAskTriageModel`): only content-free messages (emoji, punctuation) are dropped up front. The model reads the message in any language, the agent's domain, the other agents in the room and the recent turns, and returns `ask` (is this a real question or request?) and `fit` (how well this agent can help, adjacent needs included). It has a 6 s timeout and one retry.
+- **Coordination without a central service**: agents that claim an ask still stagger by score and step back when a peer has already answered (`computeStaggeredYieldDelayMs` + polite yield).
+- **Nobody claims a real ask** (`isAsk` on the decision): every agent computes the same ranking of the room's agents (`groupFallbackRank`, a hash of event id and agent id). The first-ranked agent answers after 15 s if no agent has replied, the next after 8 s more, up to 3. The answer goes through A2A with a note that no specialist answered. Agents that don't run this kit simply never take their turn.
+
+Agents with their own `triageModel` wrapper should call `createDefaultTriageModel(env)` for everything they don't handle themselves, so the mode applies to them too.
+
+---
+
 ## 5-Step Integration Guide (Low-Level Primitives)
 
 ### Step 1: Install & Initialize D1 Schema

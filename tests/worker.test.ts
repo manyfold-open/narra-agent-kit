@@ -9,6 +9,7 @@ import {
   NarraMatrixSync,
   NarraRoomCoordinator,
   createNarraWorkerGateway,
+  groupFallbackRank,
   getNarraGatewayStatus,
   isNarraGatewayEnabled,
   isNarraSyncEnabled,
@@ -2902,5 +2903,154 @@ describe('worker runtime layer (src/worker.ts)', () => {
     expect(editedBody).toContain('群組重點總結');
     expect(editedBody).toContain('• Alice 想在週六逛 Soho 免費快閃活動');
     expect(aiPromptSeen).toContain('週六想逛 Soho 免費快閃活動');
+  });
+});
+
+describe('ask-aware group triage + elected fallback (NARRA_GROUP_TRIAGE=ask)', () => {
+  const roomId = '!grp_fallback:matrix.netmind.chat';
+  const human = '@cassie:matrix.netmind.chat';
+  const peerA = '@agent-aaaa0001:matrix.netmind.chat';
+  const peerB = '@agent-bbbb0002:matrix.netmind.chat';
+  const members = [
+    { matrixId: human, displayName: 'Cassie', isAgent: false },
+    { matrixId: TEST_SPEC.matrixId!, displayName: 'Penny', isAgent: true },
+    { matrixId: peerA, displayName: 'Spotted London', isAgent: true },
+    { matrixId: peerB, displayName: 'AI in 5', isAgent: true },
+  ];
+
+  function setup() {
+    let nowMs = 1_790_100_000_000;
+    const posted: string[] = [];
+    const envelopes: string[] = [];
+    const aiPrompts: string[] = [];
+    const fastCalls: string[] = [];
+    const fakeAi = {
+      async run(_m: string, input: { messages: Array<{ content: string }> }) {
+        const all = input.messages.map((m) => m.content).join('\n');
+        aiPrompts.push(all);
+        if (all.includes('jajaja')) return { response: '{"ask":false,"fit":0,"reason":"laughing"}' };
+        return { response: '{"ask":true,"fit":0.1,"reason":"plans_not_mine"}' };
+      },
+    };
+    const { state, storage } = createFakeDOState();
+    const env: NarraGatewayEnv = {
+      DB: createD1(),
+      NARRA_GATEWAY_ENABLED: 'on',
+      NARRA_SYNC: 'off',
+      NARRA_AGENT_TOKEN: 'narra_tok_fallback',
+      NARRA_GROUP_TRIAGE: 'ask',
+      AI: fakeAi,
+    };
+    const gateway = createNarraWorkerGateway({
+      spec: { ...TEST_SPEC, politeYieldDelayMs: 25 },
+      now: () => nowMs,
+      sleep: async (ms: number) => {
+        nowMs += ms;
+      },
+      fastRespond: async (_env, ev) => {
+        fastCalls.push(ev.text);
+        return '[NO_REPLY]';
+      },
+      resolveA2ACredential: async () => ({ url: 'https://a2a.example.test/rpc', token: 'a2a_tok' }),
+      fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (url === 'https://a2a.example.test/rpc') {
+          const body = JSON.parse(String(init?.body ?? '{}')) as { params: { message: { parts: Array<{ text: string }> } } };
+          envelopes.push(body.params.message.parts[0].text);
+          return makeSseResponse('Prueba el Southbank Centre mañana por la tarde.');
+        }
+        if (url.includes('/chat/messages')) return Response.json({ status: 'ok', data: { messages: [] } });
+        const body = JSON.parse(String(init?.body ?? '{}')) as { text?: string };
+        if (body.text) posted.push(body.text);
+        return Response.json({ status: 'ok', data: { event_id: `$bot_${posted.length}` } });
+      }) as unknown as typeof fetch,
+    });
+    const room = new gateway.BaseNarraRoomCoordinator(state, env);
+    const send = (eventId: string, body: string, sender = human, ts = nowMs) =>
+      room.fetch(
+        new Request('https://narra-room/events', {
+          method: 'POST',
+          body: JSON.stringify({
+            roomId,
+            chatType: 'group',
+            members,
+            events: [{ event_id: eventId, sender, type: 'm.room.message', origin_server_ts: ts, content: { msgtype: 'm.text', body } }],
+          }),
+        }),
+      );
+    return {
+      room,
+      storage,
+      send,
+      posted,
+      envelopes,
+      aiPrompts,
+      fastCalls,
+      now: () => nowMs,
+      advance: (ms: number) => {
+        nowMs += ms;
+      },
+    };
+  }
+
+  // Spanish, Japanese and Simplified Chinese asks that the keyword triage never let through.
+  it.each([
+    ['$es_1', '¿Qué podemos hacer mañana después del trabajo?'],
+    ['$ja_1', '明日仕事のあと、どこに遊びに行けばいい？'],
+    ['$zh_1', '明天下班出去玩吗，可以去哪儿玩'],
+  ])('answers an unclaimed ask (%s) exactly once, from the elected agent, in any language', async (eventId, text) => {
+    const rank = groupFallbackRank(eventId, TEST_SPEC.matrixId!, members);
+    const t = setup();
+    await t.send(eventId, text);
+    t.advance(2_000);
+    await t.room.alarm();
+    expect(t.aiPrompts).toHaveLength(1);
+    expect(t.aiPrompts[0]).toContain('ANY language');
+    expect(t.aiPrompts[0]).toContain(text);
+    expect(t.posted).toEqual([]);
+
+    // Not due yet: still waiting for a specialist.
+    t.advance(10_000);
+    await t.room.alarm();
+    expect(t.posted).toEqual([]);
+
+    t.advance(5_000 + rank * 8_000 + 1_000);
+    await t.room.alarm();
+    expect(t.fastCalls).toEqual([]);
+    expect(t.envelopes).toHaveLength(1);
+    expect(t.envelopes[0]).toContain('No other AI agent in this group answered this question');
+    expect(t.posted).toEqual(['Prueba el Southbank Centre mañana por la tarde.']);
+    expect(await t.storage.get('pendingTurns')).toEqual([]);
+  });
+
+  it('stays out when a peer agent answered before its fallback turn came up', async () => {
+    const t = setup();
+    await t.send('$es_2', '¿Algún plan para esta noche?');
+    t.advance(2_000);
+    await t.room.alarm();
+    await t.send('$peer_reply', 'Esta noche hay un mercado en Soho.', peerA, t.now() + 3_000);
+    t.advance(60_000);
+    await t.room.alarm();
+    expect(t.envelopes).toEqual([]);
+    expect(t.posted).toEqual([]);
+  });
+
+  it('does not queue a fallback for chatter the model says is not an ask', async () => {
+    const t = setup();
+    await t.send('$es_3', 'jajaja qué risa');
+    t.advance(2_000);
+    await t.room.alarm();
+    expect(await t.storage.get('pendingTurns')).toEqual([]);
+    t.advance(60_000);
+    await t.room.alarm();
+    expect(t.envelopes).toEqual([]);
+  });
+
+  it('ranks the agents the same way on every agent, so exactly one answers first', () => {
+    const ids = members.filter((m) => m.isAgent).map((m) => m.matrixId);
+    for (const eventId of ['$a', '$b', '$c', '$d']) {
+      const ranks = ids.map((id) => groupFallbackRank(eventId, id, members));
+      expect([...ranks].sort()).toEqual([0, 1, 2]);
+    }
   });
 });
