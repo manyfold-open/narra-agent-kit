@@ -1394,25 +1394,48 @@ export class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGatewayEnv>
     const nowMs = this.nowMs();
     const storage = this.ctx.storage;
 
+    // Wall-clock per step, logged when a push-mode run is slow (the DO is billed for all of it).
+    const clock = Date.now;
+    const timing: Record<string, number> = {};
+    let mark = clock();
+    const lap = (name: string) => {
+      const t = clock();
+      timing[name] = (timing[name] ?? 0) + (t - mark);
+      mark = t;
+    };
+
     // Push mode: Synapse wakes us per event, so /sync never waits. If the pusher cannot be
     // registered this round, fall back to a normal long-poll so no message is delayed.
     const pushReady = isNarraPushModeEnabled(this.env)
       ? await this.ensurePushSetup(nowMs)
       : (await this.teardownPushSetup(), false);
 
+    lap('pushSetup');
     const pushSeqAtStart = (await storage.get<number>('pushSeq')) ?? 0;
     let joinedInvites = await this.sweepPendingInvites(nowMs);
+    lap('inviteSweep');
 
     await this.refreshNarraRoomsMeta(nowMs);
+    lap('roomsMeta');
+    let syncHost = '';
 
     const delay = await syncOnce(
       doKeyValueStore(storage),
       {
-        login: async () => (await this.resolveLogin(false)).login,
+        login: async () => {
+          lap('beforeLogin');
+          const login = (await this.resolveLogin(false)).login;
+          lap('login');
+          return login;
+        },
         sync: async (login, since, timeoutMs) => {
+          lap('beforeSync');
+          syncHost = new URL(login.homeserverUrl).host;
           const response = await matrixSyncRequest(login, since, timeoutMs, doFetch);
+          lap(`sync(timeout=${timeoutMs})`);
           await this.updateRoomMetaFromSync(response, nowMs);
           joinedInvites += await this.acceptInvites(login, response, nowMs);
+          lap('afterSync');
           return response;
         },
         backstop: async (login, roomId, prevBatch) => {
@@ -1476,6 +1499,15 @@ export class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGatewayEnv>
       this.cache,
       pushReady ? { timeoutMs: 0 } : {},
     );
+    lap('batch');
+    const total = Object.values(timing).reduce((a, b) => a + b, 0);
+    if (pushReady && total > 3_000) {
+      const steps = Object.entries(timing)
+        .filter(([, ms]) => ms >= 50)
+        .map(([name, ms]) => `${name}=${ms}ms`)
+        .join(' ');
+      void appendDoLog(storage, `slow run ${total}ms (${syncHost}): ${steps}`, nowMs, this.env);
+    }
 
     if (this.isSyncActive()) {
       let next = delay;
