@@ -4,6 +4,7 @@ import {
   NARRA_PUSH_BACKSTOP_MS,
   NARRA_PUSHER_APP_ID,
   NARRA_WAKE_PUSH_RULE_ID,
+  fetchWithDeadline,
   handleNarraPushRequest,
   narraPushKey,
   isNarraPushModeEnabled,
@@ -312,3 +313,37 @@ describe('invite acceptance', () => {
   });
 });
 
+
+describe('fetchWithDeadline', () => {
+  it('leaves no timer behind once the response is in (a pending timer keeps a DO billed)', async () => {
+    vi.useFakeTimers();
+    try {
+      const res = await fetchWithDeadline(async () => new Response('ok'), 'https://x.test/', {}, 20_000);
+      expect(await res.text()).toBe('ok');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still aborts a request that outlives its deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = fetchWithDeadline(
+        (_input, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal!.reason));
+          }),
+        'https://x.test/',
+        {},
+        1_000,
+      );
+      const assertion = expect(pending).rejects.toMatchObject({ name: 'TimeoutError' });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await assertion;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

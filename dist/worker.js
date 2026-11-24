@@ -8,7 +8,7 @@ import { MemoryStore, handleStandardMemoryCommand, } from './memory.js';
 import { editContent, messageContent, plainMentions } from './mentions.js';
 import { shouldQuote } from './quote.js';
 import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSION_WINDOW_MS, DEFAULT_WORKERS_AI_TRIAGE_MODEL, createWorkersAiTriageModel, executePoliteYield, hasPeerAnsweredTimeline, hasPeerRepliedAfter, inspectRoomPeers, isChainExhaustedError, isContextualRewrite, isSelfMentioned, routeEvent, } from './router.js';
-import { fetchEventContext, fetchMatrixCredential, fetchNarraChatMessagesBackstop, fetchRoomMessagesBackstop, matrixSyncRequest, redactSecrets, SyncError, syncOnce, } from './sync.js';
+import { fetchEventContext, fetchMatrixCredential, fetchNarraChatMessagesBackstop, fetchRoomMessagesBackstop, matrixSyncRequest, redactSecrets, SyncError, syncOnce, fetchWithDeadline, } from './sync.js';
 const DEFAULT_NARRA_API_ENDPOINT = 'https://api.netmind.chat';
 const DEFAULT_MATRIX_HOMESERVER = 'https://matrix.netmind.chat';
 const ROOM_META_REFRESH_MS = 5 * 60_000;
@@ -409,7 +409,7 @@ async function postViaNarraChatApi(env, input) {
     const base = narraEndpoint(env);
     let response;
     try {
-        response = await doFetch(`${base}/api/agent-runtime/chat/send`, {
+        response = await fetchWithDeadline(doFetch, `${base}/api/agent-runtime/chat/send`, {
             method: 'POST',
             headers: {
                 authorization: `Bearer ${token}`,
@@ -421,8 +421,7 @@ async function postViaNarraChatApi(env, input) {
                 txn_id: input.txnId,
                 ...(input.replyToEventId ? { reply_to_event_id: input.replyToEventId } : {}),
             }),
-            signal: AbortSignal.timeout(15_000),
-        });
+        }, 15_000);
     }
     catch (error) {
         throw makeSendFailure(`Narra chat/send unreachable: ${scrubSecrets(error instanceof Error ? error.message : error, env)}`, 599, { retryable: true });
@@ -583,15 +582,14 @@ export class BaseNarraMatrixSync {
         }
         let response;
         try {
-            response = await fetchImpl(url, {
+            response = await fetchWithDeadline(fetchImpl, url, {
                 method,
                 headers: {
                     authorization: `Bearer ${login.accessToken}`,
                     'content-type': 'application/json',
                 },
                 body: JSON.stringify(body),
-                signal: AbortSignal.timeout(15_000),
-            });
+            }, 15_000);
         }
         catch (error) {
             return {
@@ -707,10 +705,9 @@ export class BaseNarraMatrixSync {
             const url = new URL(`${narraEndpoint(this.env)}/api/agent-runtime/chat/rooms`);
             url.searchParams.set('conversation_type', 'all');
             url.searchParams.set('include_members', 'true');
-            const res = await doFetch(url.toString(), {
+            const res = await fetchWithDeadline(doFetch, url.toString(), {
                 headers: { authorization: `Bearer ${token}` },
-                signal: AbortSignal.timeout(10_000),
-            });
+            }, 10_000);
             if (!res.ok)
                 return false;
             const body = (await res.json().catch(() => null));
@@ -818,15 +815,14 @@ export class BaseNarraMatrixSync {
     }
     async homeserverRequest(login, method, path, body) {
         const doFetch = this.getConfig().fetchImpl ?? fetch;
-        return doFetch(`${login.homeserverUrl}/_matrix/client/v3${path}`, {
+        return fetchWithDeadline(doFetch, `${login.homeserverUrl}/_matrix/client/v3${path}`, {
             method,
             headers: {
                 authorization: `Bearer ${login.accessToken}`,
                 ...(body === undefined ? {} : { 'content-type': 'application/json' }),
             },
             ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-            signal: AbortSignal.timeout(10_000),
-        });
+        }, 10_000);
     }
     /**
      * Narra creates a new DM (or adds the agent to a group) with the agent only *invited*; nothing

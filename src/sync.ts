@@ -31,6 +31,30 @@ export function redactSecrets(value: unknown): string {
     .slice(0, 600);
 }
 
+/**
+ * `fetch` with a deadline whose timer is cleared as soon as the response arrives. A pending
+ * `AbortSignal.timeout()` timer keeps a Durable Object running, and billed, until it fires, even
+ * after the request finished: a push-mode /sync that answered in 0.1 s held the DO for its whole
+ * 20 s deadline.
+ */
+export async function fetchWithDeadline(
+  fetchImpl: typeof fetch,
+  input: string | URL | Request,
+  init: RequestInit,
+  ms: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new DOMException('The operation timed out.', 'TimeoutError')),
+    ms,
+  );
+  try {
+    return await fetchImpl(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export const SYNC_FILTER = JSON.stringify({
   presence: { types: [] },
   account_data: { types: [] },
@@ -118,11 +142,10 @@ export async function fetchMatrixCredential(
 
     let response: Response;
     try {
-      response = await doFetch(`${base}/api/agent-runtime/matrix-credential`, {
+      response = await fetchWithDeadline(doFetch, `${base}/api/agent-runtime/matrix-credential`, {
         method: 'POST',
         headers: { authorization: `Bearer ${token}` },
-        signal: AbortSignal.timeout(15_000),
-      });
+      }, 15_000);
     } catch (error) {
       throw new SyncError(`Narra unreachable: ${redactSecrets(error instanceof Error ? error.message : error)}`);
     }
@@ -185,15 +208,14 @@ export async function authorizeEvent(
   const doFetch = config.fetchImpl ?? fetch;
 
   try {
-    const response = await doFetch(`${base}/api/agent-runtime/matrix/authorize-event`, {
+    const response = await fetchWithDeadline(doFetch, `${base}/api/agent-runtime/matrix/authorize-event`, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${token}`,
         'content-type': 'application/json',
       },
       body: JSON.stringify(input),
-      signal: AbortSignal.timeout(10_000),
-    });
+    }, 10_000);
     if (!response.ok) {
       return { allow: false, reason: `http_${response.status}` };
     }
@@ -233,10 +255,9 @@ export async function matrixSyncRequest(
 
   let response: Response;
   try {
-    response = await fetchImpl(url.toString(), {
+    response = await fetchWithDeadline(fetchImpl, url.toString(), {
       headers: { authorization: `Bearer ${login.accessToken}` },
-      signal: AbortSignal.timeout(timeoutMs + 20_000),
-    });
+    }, timeoutMs + 20_000);
   } catch (error) {
     throw new SyncError(`Homeserver unreachable: ${redactSecrets(error instanceof Error ? error.message : error)}`);
   }
@@ -268,10 +289,9 @@ export async function fetchRoomMessagesBackstop(
   url.searchParams.set('limit', String(options.limit ?? 50));
   if (options.from) url.searchParams.set('from', options.from);
 
-  const response = await fetchImpl(url.toString(), {
+  const response = await fetchWithDeadline(fetchImpl, url.toString(), {
     headers: { authorization: `Bearer ${login.accessToken}` },
-    signal: AbortSignal.timeout(15_000),
-  });
+  }, 15_000);
   if (response.status === 401) {
     throw new SyncError('Homeserver refused Matrix token on /messages (401).', true);
   }
@@ -318,10 +338,9 @@ export async function fetchNarraChatMessagesBackstop(
   url.searchParams.set('limit', String(options.limit ?? 50));
   if (options.from) url.searchParams.set('from', options.from);
 
-  const response = await doFetch(url.toString(), {
+  const response = await fetchWithDeadline(doFetch, url.toString(), {
     headers: { authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(15_000),
-  });
+  }, 15_000);
   if (!response.ok) {
     throw new SyncError(`Narra chat/messages failed: HTTP ${response.status}`);
   }
@@ -350,10 +369,9 @@ export async function fetchEventContext(
 ): Promise<InboundEvent | null> {
   const url = `${login.homeserverUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/event/${encodeURIComponent(eventId)}`;
   try {
-    const response = await fetchImpl(url, {
+    const response = await fetchWithDeadline(fetchImpl, url, {
       headers: { authorization: `Bearer ${login.accessToken}` },
-      signal: AbortSignal.timeout(10_000),
-    });
+    }, 10_000);
     if (!response.ok) return null;
     const raw = (await response.json().catch(() => null)) as unknown;
     return parseMatrixEvent(raw, { roomId });

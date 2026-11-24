@@ -54,6 +54,7 @@ import {
   SyncError,
   syncOnce,
   type MatrixLogin,
+  fetchWithDeadline,
   type RawMatrixSyncResponse,
   type SyncBatchRoom,
   type SyncState,
@@ -728,7 +729,7 @@ async function postViaNarraChatApi(
   const base = narraEndpoint(env);
   let response: Response;
   try {
-    response = await doFetch(`${base}/api/agent-runtime/chat/send`, {
+    response = await fetchWithDeadline(doFetch, `${base}/api/agent-runtime/chat/send`, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${token}`,
@@ -740,8 +741,7 @@ async function postViaNarraChatApi(
         txn_id: input.txnId,
         ...(input.replyToEventId ? { reply_to_event_id: input.replyToEventId } : {}),
       }),
-      signal: AbortSignal.timeout(15_000),
-    });
+    }, 15_000);
   } catch (error) {
     throw makeSendFailure(
       `Narra chat/send unreachable: ${scrubSecrets(error instanceof Error ? error.message : error, env)}`,
@@ -945,15 +945,14 @@ export class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGatewayEnv>
 
     let response: Response;
     try {
-      response = await fetchImpl(url, {
+      response = await fetchWithDeadline(fetchImpl, url, {
         method,
         headers: {
           authorization: `Bearer ${login.accessToken}`,
           'content-type': 'application/json',
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(15_000),
-      });
+      }, 15_000);
     } catch (error) {
       return {
         ok: false,
@@ -1082,10 +1081,9 @@ export class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGatewayEnv>
       const url = new URL(`${narraEndpoint(this.env)}/api/agent-runtime/chat/rooms`);
       url.searchParams.set('conversation_type', 'all');
       url.searchParams.set('include_members', 'true');
-      const res = await doFetch(url.toString(), {
+      const res = await fetchWithDeadline(doFetch, url.toString(), {
         headers: { authorization: `Bearer ${token}` },
-        signal: AbortSignal.timeout(10_000),
-      });
+      }, 10_000);
       if (!res.ok) return false;
       const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
       const data = (
@@ -1206,15 +1204,19 @@ export class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGatewayEnv>
     body?: unknown,
   ): Promise<Response> {
     const doFetch = this.getConfig().fetchImpl ?? fetch;
-    return doFetch(`${login.homeserverUrl}/_matrix/client/v3${path}`, {
-      method,
-      headers: {
-        authorization: `Bearer ${login.accessToken}`,
-        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+    return fetchWithDeadline(
+      doFetch,
+      `${login.homeserverUrl}/_matrix/client/v3${path}`,
+      {
+        method,
+        headers: {
+          authorization: `Bearer ${login.accessToken}`,
+          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: AbortSignal.timeout(10_000),
-    });
+      10_000,
+    );
   }
 
   /**
