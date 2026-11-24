@@ -10,6 +10,13 @@ export declare class SyncError extends Error {
     constructor(message: string, unauthorized?: boolean);
 }
 export declare function redactSecrets(value: unknown): string;
+/**
+ * `fetch` with a deadline whose timer is cleared as soon as the response arrives. A pending
+ * `AbortSignal.timeout()` timer keeps a Durable Object running, and billed, until it fires, even
+ * after the request finished: a push-mode /sync that answered in 0.1 s held the DO for its whole
+ * 20 s deadline.
+ */
+export declare function fetchWithDeadline(fetchImpl: typeof fetch, input: string | URL | Request, init: RequestInit, ms: number): Promise<Response>;
 export declare const SYNC_FILTER: string;
 export interface RawMatrixSyncResponse {
     next_batch: string;
