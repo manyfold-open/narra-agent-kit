@@ -156,12 +156,100 @@ export function isNarraGatewayEnabled(env) {
 export function isNarraSyncEnabled(env) {
     return isNarraGatewayEnabled(env) && (env?.NARRA_SYNC ?? '').trim() === 'on';
 }
+/** Matrix push gateway path Synapse requires at the end of every HTTP pusher URL. */
+export const NARRA_PUSH_NOTIFY_SUFFIX = '/_matrix/push/v1/notify';
+export const NARRA_PUSHER_APP_ID = 'nexus.narra.agent-kit';
+/** User-defined override push rule that makes every room event notify, so every event wakes the agent. */
+export const NARRA_WAKE_PUSH_RULE_ID = 'nexus.narra.agent-kit.wake';
+/** In push mode, the sync DO still runs one non-blocking `/sync` this often in case a push is lost. */
+export const NARRA_PUSH_BACKSTOP_MS = 60_000;
+/** Pusher + push rule are re-asserted on the homeserver this often (and whenever the URL changes). */
+const NARRA_PUSH_SETUP_REFRESH_MS = 6 * 60 * 60_000;
+const NARRA_PUSH_PATH_RE = /\/narra\/push\/([^/]+)\/_matrix\/push\/v1\/notify$/;
+function pushSecret(env) {
+    return (env?.NARRA_PUSH_SECRET ?? '').trim();
+}
+/** Full pusher URL (contains the secret: never log or return it from status endpoints). */
+export function narraPushNotifyUrl(env) {
+    const base = (env?.NARRA_PUSH_URL ?? '').trim().replace(/\/+$/, '');
+    const secret = pushSecret(env);
+    if (!base || secret.length < 16)
+        return null;
+    let parsed;
+    try {
+        parsed = new URL(base);
+    }
+    catch {
+        return null;
+    }
+    if (parsed.protocol !== 'https:')
+        return null;
+    return `${base}/narra/push/${encodeURIComponent(secret)}${NARRA_PUSH_NOTIFY_SUFFIX}`;
+}
+/** True when sync is on, NARRA_SYNC_MODE is `push`, and a valid push URL + secret are configured. */
+export function isNarraPushModeEnabled(env) {
+    return (isNarraSyncEnabled(env) &&
+        (env?.NARRA_SYNC_MODE ?? '').trim() === 'push' &&
+        narraPushNotifyUrl(env) !== null);
+}
+function timingSafeEqual(a, b) {
+    if (a.length !== b.length)
+        return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++)
+        diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return diff === 0;
+}
+function pushkeysFromNotification(body) {
+    const devices = body?.notification?.devices;
+    if (!Array.isArray(devices))
+        return [];
+    return devices
+        .map((d) => d?.pushkey)
+        .filter((k) => typeof k === 'string');
+}
+/**
+ * Handles Synapse's HTTP pusher call (`POST <NARRA_PUSH_URL>/narra/push/<secret>/_matrix/push/v1/notify`).
+ * Returns `null` when the request is not a push call, so Workers can chain it before their own router:
+ * ```ts
+ * const pushed = await handleNarraPushRequest(request, env);
+ * if (pushed) return pushed;
+ * ```
+ * A valid call only wakes the sync DO; events are still read through `/sync`, so dedupe, room meta
+ * and backstops behave exactly as in long-poll mode. Unknown secrets or push mode being off answer
+ * with the pushkeys `rejected`, which makes Synapse drop the stale pusher.
+ */
+export async function handleNarraPushRequest(request, env) {
+    const match = new URL(request.url).pathname.match(NARRA_PUSH_PATH_RE);
+    if (!match)
+        return null;
+    if (request.method !== 'POST') {
+        return new Response('Method Not Allowed', { status: 405, headers: { allow: 'POST' } });
+    }
+    const body = await request.json().catch(() => null);
+    const pushkeys = pushkeysFromNotification(body);
+    let provided = '';
+    try {
+        provided = decodeURIComponent(match[1]);
+    }
+    catch {
+        provided = '';
+    }
+    const secret = pushSecret(env);
+    if (!isNarraPushModeEnabled(env) || !env.NARRA_SYNC_DO || !timingSafeEqual(provided, secret)) {
+        return Response.json({ rejected: pushkeys });
+    }
+    const stub = env.NARRA_SYNC_DO.get(env.NARRA_SYNC_DO.idFromName('narra'));
+    await stub.fetch('https://narra-sync/push', { method: 'POST' });
+    return Response.json({ rejected: [] });
+}
 function scrubSecrets(value, env, extraSecrets = []) {
     let text = redactSecrets(value);
     const candidates = [
         env?.NARRA_AGENT_TOKEN,
         env?.MATRIX_ACCESS_TOKEN,
         env?.MANYFOLD_A2A_TOKEN,
+        env?.NARRA_PUSH_SECRET,
         ...extraSecrets,
     ];
     for (const raw of candidates) {
@@ -652,6 +740,9 @@ export class BaseNarraMatrixSync {
                 gatewayEnabled: isNarraGatewayEnabled(this.env),
                 syncFlag: (this.env.NARRA_SYNC ?? '').trim() === 'on',
                 alarm: await this.ctx.storage.getAlarm(),
+                syncMode: isNarraPushModeEnabled(this.env) ? 'push' : 'longpoll',
+                pushRegisteredAtMs: (await this.ctx.storage.get('pushSetup'))?.atMs ?? null,
+                lastPushWakeAtMs: (await this.ctx.storage.get('pushWakeAt')) ?? null,
                 started: Boolean(syncState?.since),
                 failures: syncState?.failures ?? 0,
                 lastOk: (await this.ctx.storage.get('lastOk')) ?? null,
@@ -661,6 +752,19 @@ export class BaseNarraMatrixSync {
                 roomIds,
                 log: logs.map((line) => scrubSecrets(line, this.env)),
             });
+        }
+        if (request.method === 'POST' && path.endsWith('/push')) {
+            if (!isNarraPushModeEnabled(this.env)) {
+                return Response.json({ ok: true, woke: false });
+            }
+            const now = this.nowMs();
+            await this.ctx.storage.put('pushWakeAt', now);
+            await this.ctx.storage.put('pushSeq', ((await this.ctx.storage.get('pushSeq')) ?? 0) + 1);
+            const current = await this.ctx.storage.getAlarm();
+            if (current === null || current > now) {
+                await this.ctx.storage.setAlarm(now);
+            }
+            return Response.json({ ok: true, woke: true });
         }
         if (request.method === 'POST' && path.endsWith('/kick')) {
             if (!this.isSyncActive()) {
@@ -675,6 +779,87 @@ export class BaseNarraMatrixSync {
         }
         return Response.json({ ok: false, error: 'not_found' }, { status: 404 });
     }
+    async homeserverRequest(login, method, path, body) {
+        const doFetch = this.getConfig().fetchImpl ?? fetch;
+        return doFetch(`${login.homeserverUrl}/_matrix/client/v3${path}`, {
+            method,
+            headers: {
+                authorization: `Bearer ${login.accessToken}`,
+                ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+            },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            signal: AbortSignal.timeout(10_000),
+        });
+    }
+    pusherKey() {
+        return `narra-agent-kit:${this.getConfig().spec.id}`;
+    }
+    /**
+     * Makes sure the homeserver pushes every new event of this agent to our Worker: one HTTP pusher
+     * (event_id_only payload, no message content leaves Synapse) and one override rule that marks
+     * every event as notifying (edits, redactions and reactions are silent by default).
+     * Returns false (caller falls back to long-poll) when either call fails.
+     */
+    async ensurePushSetup(nowMs) {
+        const url = narraPushNotifyUrl(this.env);
+        if (!url)
+            return false;
+        const storage = this.ctx.storage;
+        const stored = await storage.get('pushSetup');
+        if (stored && stored.url === url && nowMs - stored.atMs < NARRA_PUSH_SETUP_REFRESH_MS) {
+            return true;
+        }
+        try {
+            const { login } = await this.resolveLogin(false);
+            const ruleRes = await this.homeserverRequest(login, 'PUT', `/pushrules/global/override/${encodeURIComponent(NARRA_WAKE_PUSH_RULE_ID)}`, { conditions: [], actions: ['notify'] });
+            if (ruleRes.status === 401)
+                this.cache.login = undefined;
+            if (!ruleRes.ok)
+                throw new Error(`push rule HTTP ${ruleRes.status}`);
+            const pushkey = this.pusherKey();
+            const pusherRes = await this.homeserverRequest(login, 'POST', '/pushers/set', {
+                kind: 'http',
+                app_id: NARRA_PUSHER_APP_ID,
+                pushkey,
+                app_display_name: 'Narra Agent Kit',
+                device_display_name: this.getConfig().spec.name ?? 'agent',
+                lang: 'en',
+                append: false,
+                data: { url, format: 'event_id_only' },
+            });
+            if (pusherRes.status === 401)
+                this.cache.login = undefined;
+            if (!pusherRes.ok)
+                throw new Error(`pusher HTTP ${pusherRes.status}`);
+            await storage.put('pushSetup', { url, pushkey, atMs: nowMs });
+            void appendDoLog(storage, 'push mode: pusher + wake rule registered', nowMs, this.env);
+            return true;
+        }
+        catch (error) {
+            void appendDoLog(storage, `push setup failed, using long-poll: ${error instanceof Error ? error.message : String(error)}`, nowMs, this.env);
+            return false;
+        }
+    }
+    /** Removes the pusher + wake rule after switching back to long-poll (best effort). */
+    async teardownPushSetup() {
+        const storage = this.ctx.storage;
+        const stored = await storage.get('pushSetup');
+        if (!stored)
+            return;
+        try {
+            const { login } = await this.resolveLogin(false);
+            await this.homeserverRequest(login, 'POST', '/pushers/set', {
+                kind: null,
+                app_id: NARRA_PUSHER_APP_ID,
+                pushkey: stored.pushkey,
+            });
+            await this.homeserverRequest(login, 'DELETE', `/pushrules/global/override/${encodeURIComponent(NARRA_WAKE_PUSH_RULE_ID)}`);
+        }
+        catch {
+            // Best effort: a stale pusher gets `rejected` by handleNarraPushRequest and Synapse drops it.
+        }
+        await storage.delete('pushSetup');
+    }
     async alarm() {
         if (!this.isSyncActive()) {
             await this.ctx.storage.deleteAlarm();
@@ -685,6 +870,12 @@ export class BaseNarraMatrixSync {
         const doFetch = cfg.fetchImpl ?? fetch;
         const nowMs = this.nowMs();
         const storage = this.ctx.storage;
+        // Push mode: Synapse wakes us per event, so /sync never waits. If the pusher cannot be
+        // registered this round, fall back to a normal long-poll so no message is delayed.
+        const pushReady = isNarraPushModeEnabled(this.env)
+            ? await this.ensurePushSetup(nowMs)
+            : (await this.teardownPushSetup(), false);
+        const pushSeqAtStart = (await storage.get('pushSeq')) ?? 0;
         await this.refreshNarraRoomsMeta(nowMs);
         const delay = await syncOnce(doKeyValueStore(storage), {
             login: async () => (await this.resolveLogin(false)).login,
@@ -744,9 +935,15 @@ export class BaseNarraMatrixSync {
             log: (line) => {
                 void appendDoLog(storage, line, this.nowMs(), this.env);
             },
-        }, this.cache);
+        }, this.cache, pushReady ? { timeoutMs: 0 } : {});
         if (this.isSyncActive()) {
-            await storage.setAlarm(this.nowMs() + delay);
+            let next = delay;
+            if (pushReady && delay === 0) {
+                // A push that landed while this run was in flight must not be swallowed by the backstop delay.
+                const pushSeqNow = (await storage.get('pushSeq')) ?? 0;
+                next = pushSeqNow !== pushSeqAtStart ? 0 : NARRA_PUSH_BACKSTOP_MS;
+            }
+            await storage.setAlarm(this.nowMs() + next);
         }
         else {
             await storage.deleteAlarm();
@@ -2318,6 +2515,10 @@ export async function getNarraGatewayStatus(env, config) {
         config: {
             NARRA_GATEWAY_ENABLED: (env.NARRA_GATEWAY_ENABLED ?? '').trim() || 'off',
             NARRA_SYNC: (env.NARRA_SYNC ?? '').trim() || 'off',
+            NARRA_SYNC_MODE: (env.NARRA_SYNC_MODE ?? '').trim() || 'longpoll',
+            hasPushUrl: Boolean((env.NARRA_PUSH_URL ?? '').trim()),
+            hasPushSecret: pushSecret(env).length >= 16,
+            pushModeActive: isNarraPushModeEnabled(env),
             hasNarraAgentToken: Boolean((env.NARRA_AGENT_TOKEN ?? '').trim()),
             hasMatrixAccessToken: Boolean((env.MATRIX_ACCESS_TOKEN ?? '').trim()),
             hasSyncDoBinding: Boolean(env.NARRA_SYNC_DO),
@@ -2357,6 +2558,7 @@ export function createNarraWorkerGateway(config) {
         isNarraGatewayEnabled: (env) => isNarraGatewayEnabled(env),
         kickNarraGateway: (env) => kickNarraGateway(env, config),
         getNarraGatewayStatus: (env) => getNarraGatewayStatus(env, config),
+        handleNarraPushRequest: (request, env) => handleNarraPushRequest(request, env),
     };
 }
 export { BaseNarraMatrixSync as NarraMatrixSync, BaseNarraRoomCoordinator as NarraRoomCoordinator, };
