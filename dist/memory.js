@@ -284,6 +284,7 @@ export class MemoryStore {
      * Recalls safe memories for a turn.
      * PRIVACY BOUNDARY: When `chatType === 'group'`, private DM user memories
      * (`origin_chat_type = 'dm'`) are STRICTLY excluded and never surfaced.
+     * Explicit group notes are visible only in the room that saved them.
      */
     async recallForTurn(input) {
         const limit = input.limit ?? 20;
@@ -294,15 +295,17 @@ export class MemoryStore {
                 ? `SELECT id, agent_id, user_id, origin_chat_type, origin_room_id, kind, memory_key, memory_value, confidence, created_at, updated_at
              FROM narra_user_memory
              WHERE agent_id = ? AND user_id = ? AND origin_chat_type = 'group'
+               AND (substr(memory_key, 1, 5) <> 'note_' OR origin_room_id = ?)
              ORDER BY updated_at DESC LIMIT ?`
                 : `SELECT id, agent_id, user_id, origin_chat_type, origin_room_id, kind, memory_key, memory_value, confidence, created_at, updated_at
              FROM narra_user_memory
              WHERE agent_id = ? AND user_id = ?
+               AND (origin_chat_type = 'dm' OR substr(memory_key, 1, 5) <> 'note_')
              ORDER BY CASE WHEN origin_chat_type = 'dm' THEN 0 ELSE 1 END, updated_at DESC LIMIT ?`;
-            const { results } = await this.db
-                .prepare(sql)
-                .bind(this.agentId, input.userId, limit)
-                .all();
+            const query = this.db.prepare(sql);
+            const { results } = await (input.chatType === 'group'
+                ? query.bind(this.agentId, input.userId, input.roomId, limit)
+                : query.bind(this.agentId, input.userId, limit)).all();
             for (const row of results ?? []) {
                 if (!validateMemoryWrite(row.memory_key, row.memory_value).safe)
                     continue;
@@ -363,6 +366,10 @@ export class MemoryStore {
             if (input.originChatType) {
                 filters.push('origin_chat_type = ?');
                 bindings.push(input.originChatType);
+            }
+            if (input.noteRoomId) {
+                filters.push("(substr(memory_key, 1, 5) <> 'note_' OR origin_room_id = ?)");
+                bindings.push(input.noteRoomId);
             }
             const res = await this.db
                 .prepare(`DELETE FROM narra_user_memory WHERE ${filters.join(' AND ')}`)
@@ -573,9 +580,9 @@ const PRIVATE_DM_SUFFIX_RE = /[,，。\s]+(?:這件?事)?(?:請)?(?:只|僅)?記
 function isInternalMemoryKey(key) {
     return key.startsWith('__narra_') || key.startsWith('opt_in_') || key === 'lang';
 }
-async function shortNoteKey(fact) {
-    const bytes = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(fact.toLowerCase())));
-    const hex = [...bytes.slice(0, 4)].map((b) => b.toString(16).padStart(2, '0')).join('');
+async function shortNoteKey(fact, roomId) {
+    const bytes = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(roomId ? JSON.stringify([roomId, fact.toLowerCase()]) : fact.toLowerCase())));
+    const hex = [...bytes.slice(0, roomId ? 12 : 4)].map((b) => b.toString(16).padStart(2, '0')).join('');
     return `note_${hex}`;
 }
 /**
@@ -650,6 +657,7 @@ export async function handleStandardMemoryCommand(input) {
             scope: 'user',
             userId: event.senderId,
             originChatType: context.chatType,
+            noteRoomId: context.chatType === 'group' ? context.roomId : undefined,
         });
         if (lang === 'zh-Hant') {
             return context.chatType === 'dm'
@@ -683,6 +691,7 @@ export async function handleStandardMemoryCommand(input) {
                 userId: event.senderId,
                 key: entry.key,
                 originChatType: context.chatType === 'group' ? 'group' : entry.originChatType,
+                noteRoomId: context.chatType === 'group' ? context.roomId : undefined,
             });
         }
         if (matched.length > 0) {
@@ -743,7 +752,11 @@ export async function handleStandardMemoryCommand(input) {
         const fact = (trimmedSuffix || rawFact).slice(0, 300).trim();
         if (!fact)
             return null;
-        const key = await shortNoteKey(fact);
+        const legacyKey = await shortNoteKey(fact);
+        const hasLegacyNoteInRoom = memories.userMemories.some((entry) => entry.key === legacyKey && entry.roomId === context.roomId);
+        const key = context.chatType === 'group' && !hasLegacyNoteInRoom
+            ? await shortNoteKey(fact, context.roomId)
+            : legacyKey;
         try {
             await store.rememberUser({
                 userId: event.senderId,
