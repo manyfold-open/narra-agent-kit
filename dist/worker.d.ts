@@ -191,6 +191,14 @@ export declare class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGat
     private refreshNarraRoomsMeta;
     fetch(request: Request): Promise<Response>;
     private homeserverRequest;
+    /**
+     * Narra creates a new DM (or adds the agent to a group) with the agent only *invited*; nothing
+     * joined on the agent's behalf, so those rooms never reached `/sync` `rooms.join` and new users
+     * got no reply. Narra already decides who may start a chat with an agent (agent_request /
+     * connection approval), so the agent accepts every invite it is sent.
+     * Returns how many rooms were joined in this call.
+     */
+    private acceptInvites;
     private pusherKey;
     /**
      * Makes sure the homeserver pushes every new event of this agent to our Worker: one HTTP pusher

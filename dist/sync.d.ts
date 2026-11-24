@@ -24,6 +24,12 @@ export interface RawMatrixSyncResponse {
                 events?: Array<Record<string, unknown>>;
             };
         }>;
+        /** Rooms the agent has been invited to but not joined yet (e.g. a new user's DM). */
+        invite?: Record<string, {
+            invite_state?: {
+                events?: Array<Record<string, unknown>>;
+            };
+        }>;
     };
 }
 export interface SyncBatchRoom {
