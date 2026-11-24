@@ -192,6 +192,13 @@ export function isNarraPushModeEnabled(env) {
         (env?.NARRA_SYNC_MODE ?? '').trim() === 'push' &&
         narraPushNotifyUrl(env) !== null);
 }
+async function errorSnippet(res) {
+    const text = await res.text().catch(() => '');
+    return text.replace(/\s+/g, ' ').slice(0, 160);
+}
+/** Failed invite joins are retried no sooner than this, doubling per failure. */
+const INVITE_RETRY_BASE_MS = 60_000;
+const INVITE_RETRY_MAX_MS = 6 * 60 * 60_000;
 function timingSafeEqual(a, b) {
     if (a.length !== b.length)
         return false;
@@ -274,6 +281,7 @@ function doKeyValueStore(storage) {
 async function appendDoLog(storage, line, nowMs, env) {
     const existing = (await storage.get('log')) ?? [];
     const entry = `${new Date(nowMs).toISOString()} ${scrubSecrets(line, env)}`;
+    console.log(`[narra-gateway] ${entry}`);
     await storage.put('log', [...existing, entry].slice(-MAX_LOG_LINES));
 }
 async function deterministicTxnId(seed) {
@@ -791,6 +799,53 @@ export class BaseNarraMatrixSync {
             signal: AbortSignal.timeout(10_000),
         });
     }
+    /**
+     * Narra creates a new DM (or adds the agent to a group) with the agent only *invited*; nothing
+     * joined on the agent's behalf, so those rooms never reached `/sync` `rooms.join` and new users
+     * got no reply. Narra already decides who may start a chat with an agent (agent_request /
+     * connection approval), so the agent accepts every invite it is sent.
+     * Returns how many rooms were joined in this call.
+     */
+    async acceptInvites(login, response, nowMs) {
+        const invited = Object.keys(response.rooms?.invite ?? {});
+        if (invited.length === 0)
+            return 0;
+        const storage = this.ctx.storage;
+        const attempts = (await storage.get('inviteAttempts')) ?? {};
+        let joined = 0;
+        for (const roomId of invited) {
+            const prior = attempts[roomId];
+            if (prior && prior.nextAtMs > nowMs)
+                continue;
+            let res;
+            try {
+                res = await this.homeserverRequest(login, 'POST', `/rooms/${encodeURIComponent(roomId)}/join`, {});
+            }
+            catch (error) {
+                res = new Response(String(error instanceof Error ? error.message : error), { status: 599 });
+            }
+            if (res.ok) {
+                delete attempts[roomId];
+                joined++;
+                void appendDoLog(storage, `accepted invite to ${roomId}`, nowMs, this.env);
+                continue;
+            }
+            if (res.status === 401)
+                this.cache.login = undefined;
+            const failures = (prior?.failures ?? 0) + 1;
+            attempts[roomId] = {
+                failures,
+                nextAtMs: nowMs + Math.min(INVITE_RETRY_MAX_MS, INVITE_RETRY_BASE_MS * 2 ** (failures - 1)),
+            };
+            void appendDoLog(storage, `invite join failed for ${roomId} (${failures}): HTTP ${res.status} ${await errorSnippet(res)}`, nowMs, this.env);
+        }
+        for (const roomId of Object.keys(attempts)) {
+            if (!invited.includes(roomId))
+                delete attempts[roomId];
+        }
+        await storage.put('inviteAttempts', attempts);
+        return joined;
+    }
     pusherKey() {
         return `narra-agent-kit:${this.getConfig().spec.id}`;
     }
@@ -815,7 +870,7 @@ export class BaseNarraMatrixSync {
             if (ruleRes.status === 401)
                 this.cache.login = undefined;
             if (!ruleRes.ok)
-                throw new Error(`push rule HTTP ${ruleRes.status}`);
+                throw new Error(`push rule HTTP ${ruleRes.status} ${await errorSnippet(ruleRes)}`);
             const pushkey = this.pusherKey();
             const pusherRes = await this.homeserverRequest(login, 'POST', '/pushers/set', {
                 kind: 'http',
@@ -830,7 +885,7 @@ export class BaseNarraMatrixSync {
             if (pusherRes.status === 401)
                 this.cache.login = undefined;
             if (!pusherRes.ok)
-                throw new Error(`pusher HTTP ${pusherRes.status}`);
+                throw new Error(`pusher HTTP ${pusherRes.status} ${await errorSnippet(pusherRes)}`);
             await storage.put('pushSetup', { url, pushkey, atMs: nowMs });
             void appendDoLog(storage, 'push mode: pusher + wake rule registered', nowMs, this.env);
             return true;
@@ -876,12 +931,14 @@ export class BaseNarraMatrixSync {
             ? await this.ensurePushSetup(nowMs)
             : (await this.teardownPushSetup(), false);
         const pushSeqAtStart = (await storage.get('pushSeq')) ?? 0;
+        let joinedInvites = 0;
         await this.refreshNarraRoomsMeta(nowMs);
         const delay = await syncOnce(doKeyValueStore(storage), {
             login: async () => (await this.resolveLogin(false)).login,
             sync: async (login, since, timeoutMs) => {
                 const response = await matrixSyncRequest(login, since, timeoutMs, doFetch);
                 await this.updateRoomMetaFromSync(response, nowMs);
+                joinedInvites += await this.acceptInvites(login, response, nowMs);
                 return response;
             },
             backstop: async (login, roomId, prevBatch) => {
@@ -938,7 +995,11 @@ export class BaseNarraMatrixSync {
         }, this.cache, pushReady ? { timeoutMs: 0 } : {});
         if (this.isSyncActive()) {
             let next = delay;
-            if (pushReady && delay === 0) {
+            if (pushReady && delay === 0 && joinedInvites > 0) {
+                // Read the newly joined rooms (and the message that came with the invite) right away.
+                next = 0;
+            }
+            else if (pushReady && delay === 0) {
                 // A push that landed while this run was in flight must not be swallowed by the backstop delay.
                 const pushSeqNow = (await storage.get('pushSeq')) ?? 0;
                 next = pushSeqNow !== pushSeqAtStart ? 0 : NARRA_PUSH_BACKSTOP_MS;

@@ -67,7 +67,10 @@ interface Call {
   body: unknown;
 }
 
-function harness(envOverrides: Partial<NarraGatewayEnv> = {}, opts: { pusherStatus?: number } = {}) {
+function harness(
+  envOverrides: Partial<NarraGatewayEnv> = {},
+  opts: { pusherStatus?: number; joinStatus?: number; invites?: (n: number) => string[] } = {},
+) {
   let nowMs = 1_790_000_000_000;
   const calls: Call[] = [];
   let syncCount = 0;
@@ -84,10 +87,15 @@ function harness(envOverrides: Partial<NarraGatewayEnv> = {}, opts: { pusherStat
       return new Response('{}', { status: opts.pusherStatus ?? 200 });
     }
     if (url.includes('/pushrules/')) return new Response('{}', { status: 200 });
+    if (url.endsWith('/join')) {
+      const status = opts.joinStatus ?? 200;
+      return new Response(status === 200 ? '{"room_id":"x"}' : '{"errcode":"M_FORBIDDEN"}', { status });
+    }
     if (url.includes('/_matrix/client/v3/sync')) {
       syncCount++;
       await onSync?.();
-      return Response.json({ next_batch: `b${syncCount}`, rooms: { join: {} } });
+      const invite = Object.fromEntries((opts.invites?.(syncCount) ?? []).map((id) => [id, { invite_state: { events: [] } }]));
+      return Response.json({ next_batch: `b${syncCount}`, rooms: { join: {}, invite } });
     }
     return new Response('not found', { status: 404 });
   });
@@ -254,5 +262,33 @@ describe('handleNarraPushRequest', () => {
     const off = { ...env, NARRA_SYNC_MODE: 'longpoll' };
     expect(await (await handleNarraPushRequest(notify(SECRET), off))!.json()).toEqual({ rejected: ['pk1'] });
     expect(doCalls).toEqual([]);
+  });
+});
+
+describe('invite acceptance', () => {
+  const joins = (calls: Call[]) =>
+    calls.filter((c) => c.url.endsWith('/join')).map((c) => decodeURIComponent(c.url.split('/rooms/')[1].split('/')[0]));
+
+  it('joins a new DM invite and re-syncs right away to read its first message', async () => {
+    const h = harness({}, { invites: (n) => (n === 2 ? ['!newdm:matrix.netmind.chat'] : []) });
+    await h.sync.alarm();
+    await h.sync.alarm();
+    expect(joins(h.calls)).toEqual(['!newdm:matrix.netmind.chat']);
+    expect(h.storage.alarmAt).toBe(h.now());
+    await h.sync.alarm();
+    expect(h.storage.alarmAt).toBe(h.now() + NARRA_PUSH_BACKSTOP_MS);
+  });
+
+  it('backs off a refused invite instead of retrying it on every sync', async () => {
+    const h = harness({ NARRA_SYNC_MODE: 'longpoll' }, { joinStatus: 403, invites: () => ['!blocked:matrix.netmind.chat'] });
+    await h.sync.alarm();
+    await h.sync.alarm();
+    await h.sync.alarm();
+    expect(joins(h.calls)).toHaveLength(1);
+    h.setNow(h.now() + 61_000);
+    await h.sync.alarm();
+    expect(joins(h.calls)).toHaveLength(2);
+    const attempts = (await h.storage.get<Record<string, { failures: number }>>('inviteAttempts'))!;
+    expect(attempts['!blocked:matrix.netmind.chat'].failures).toBe(2);
   });
 });
