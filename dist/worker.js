@@ -156,8 +156,13 @@ export function isNarraGatewayEnabled(env) {
 export function isNarraSyncEnabled(env) {
     return isNarraGatewayEnabled(env) && (env?.NARRA_SYNC ?? '').trim() === 'on';
 }
-/** Matrix push gateway path Synapse requires at the end of every HTTP pusher URL. */
-export const NARRA_PUSH_NOTIFY_SUFFIX = '/_matrix/push/v1/notify';
+/**
+ * Synapse refuses an HTTP pusher unless its URL path is exactly this (`M_MISSING_PARAM: 'url' must
+ * have a path of '/_matrix/push/v1/notify'`), so the Worker must answer it at the origin root.
+ */
+export const NARRA_PUSH_NOTIFY_PATH = '/_matrix/push/v1/notify';
+/** @deprecated Use NARRA_PUSH_NOTIFY_PATH. */
+export const NARRA_PUSH_NOTIFY_SUFFIX = NARRA_PUSH_NOTIFY_PATH;
 export const NARRA_PUSHER_APP_ID = 'nexus.narra.agent-kit';
 /** User-defined override push rule that makes every room event notify, so every event wakes the agent. */
 export const NARRA_WAKE_PUSH_RULE_ID = 'nexus.narra.agent-kit.wake';
@@ -165,15 +170,17 @@ export const NARRA_WAKE_PUSH_RULE_ID = 'nexus.narra.agent-kit.wake';
 export const NARRA_PUSH_BACKSTOP_MS = 60_000;
 /** Pusher + push rule are re-asserted on the homeserver this often (and whenever the URL changes). */
 const NARRA_PUSH_SETUP_REFRESH_MS = 6 * 60 * 60_000;
-const NARRA_PUSH_PATH_RE = /\/narra\/push\/([^/]+)\/_matrix\/push\/v1\/notify$/;
 function pushSecret(env) {
     return (env?.NARRA_PUSH_SECRET ?? '').trim();
 }
-/** Full pusher URL (contains the secret: never log or return it from status endpoints). */
+/**
+ * Pusher URL: the origin of NARRA_PUSH_URL plus the fixed notify path (any path in NARRA_PUSH_URL is
+ * ignored). Use a hostname this Worker owns at its root, e.g. its workers.dev URL. Returns null
+ * without a usable https URL and a push secret of at least 16 characters.
+ */
 export function narraPushNotifyUrl(env) {
-    const base = (env?.NARRA_PUSH_URL ?? '').trim().replace(/\/+$/, '');
-    const secret = pushSecret(env);
-    if (!base || secret.length < 16)
+    const base = (env?.NARRA_PUSH_URL ?? '').trim();
+    if (!base || pushSecret(env).length < 16)
         return null;
     let parsed;
     try {
@@ -184,7 +191,19 @@ export function narraPushNotifyUrl(env) {
     }
     if (parsed.protocol !== 'https:')
         return null;
-    return `${base}/narra/push/${encodeURIComponent(secret)}${NARRA_PUSH_NOTIFY_SUFFIX}`;
+    return `${parsed.origin}${NARRA_PUSH_NOTIFY_PATH}`;
+}
+/**
+ * The pushkey this agent registers, derived from NARRA_PUSH_SECRET. Synapse echoes it in every
+ * notification (`devices[].pushkey`), which is how the Worker tells real pushes from anyone else
+ * posting to the public notify path. Never log it.
+ */
+export async function narraPushKey(env) {
+    const secret = pushSecret(env);
+    if (secret.length < 16)
+        return null;
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`narra-agent-kit:pushkey:${secret}`)));
+    return `nak:${[...digest].map((b) => b.toString(16).padStart(2, '0')).join('')}`;
 }
 /** True when sync is on, NARRA_SYNC_MODE is `push`, and a valid push URL + secret are configured. */
 export function isNarraPushModeEnabled(env) {
@@ -216,34 +235,28 @@ function pushkeysFromNotification(body) {
         .filter((k) => typeof k === 'string');
 }
 /**
- * Handles Synapse's HTTP pusher call (`POST <NARRA_PUSH_URL>/narra/push/<secret>/_matrix/push/v1/notify`).
+ * Handles Synapse's HTTP pusher call (`POST <origin of NARRA_PUSH_URL>/_matrix/push/v1/notify`).
  * Returns `null` when the request is not a push call, so Workers can chain it before their own router:
  * ```ts
  * const pushed = await handleNarraPushRequest(request, env);
  * if (pushed) return pushed;
  * ```
  * A valid call only wakes the sync DO; events are still read through `/sync`, so dedupe, room meta
- * and backstops behave exactly as in long-poll mode. Unknown secrets or push mode being off answer
- * with the pushkeys `rejected`, which makes Synapse drop the stale pusher.
+ * and backstops behave exactly as in long-poll mode. A pushkey that does not match NARRA_PUSH_SECRET,
+ * or push mode being off, is answered with the pushkeys `rejected`, which makes Synapse drop the
+ * stale pusher.
  */
 export async function handleNarraPushRequest(request, env) {
-    const match = new URL(request.url).pathname.match(NARRA_PUSH_PATH_RE);
-    if (!match)
+    if (new URL(request.url).pathname !== NARRA_PUSH_NOTIFY_PATH)
         return null;
     if (request.method !== 'POST') {
         return new Response('Method Not Allowed', { status: 405, headers: { allow: 'POST' } });
     }
     const body = await request.json().catch(() => null);
     const pushkeys = pushkeysFromNotification(body);
-    let provided = '';
-    try {
-        provided = decodeURIComponent(match[1]);
-    }
-    catch {
-        provided = '';
-    }
-    const secret = pushSecret(env);
-    if (!isNarraPushModeEnabled(env) || !env.NARRA_SYNC_DO || !timingSafeEqual(provided, secret)) {
+    const expected = await narraPushKey(env);
+    const authentic = expected !== null && pushkeys.some((key) => timingSafeEqual(key, expected));
+    if (!isNarraPushModeEnabled(env) || !env.NARRA_SYNC_DO || !authentic) {
         return Response.json({ rejected: pushkeys });
     }
     const stub = env.NARRA_SYNC_DO.get(env.NARRA_SYNC_DO.idFromName('narra'));
@@ -846,9 +859,6 @@ export class BaseNarraMatrixSync {
         await storage.put('inviteAttempts', attempts);
         return joined;
     }
-    pusherKey() {
-        return `narra-agent-kit:${this.getConfig().spec.id}`;
-    }
     /**
      * Makes sure the homeserver pushes every new event of this agent to our Worker: one HTTP pusher
      * (event_id_only payload, no message content leaves Synapse) and one override rule that marks
@@ -857,11 +867,15 @@ export class BaseNarraMatrixSync {
      */
     async ensurePushSetup(nowMs) {
         const url = narraPushNotifyUrl(this.env);
-        if (!url)
+        const pushkey = await narraPushKey(this.env);
+        if (!url || !pushkey)
             return false;
         const storage = this.ctx.storage;
         const stored = await storage.get('pushSetup');
-        if (stored && stored.url === url && nowMs - stored.atMs < NARRA_PUSH_SETUP_REFRESH_MS) {
+        if (stored &&
+            stored.url === url &&
+            stored.pushkey === pushkey &&
+            nowMs - stored.atMs < NARRA_PUSH_SETUP_REFRESH_MS) {
             return true;
         }
         try {
@@ -871,7 +885,6 @@ export class BaseNarraMatrixSync {
                 this.cache.login = undefined;
             if (!ruleRes.ok)
                 throw new Error(`push rule HTTP ${ruleRes.status} ${await errorSnippet(ruleRes)}`);
-            const pushkey = this.pusherKey();
             const pusherRes = await this.homeserverRequest(login, 'POST', '/pushers/set', {
                 kind: 'http',
                 app_id: NARRA_PUSHER_APP_ID,

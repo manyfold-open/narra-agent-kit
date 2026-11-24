@@ -5,6 +5,7 @@ import {
   NARRA_PUSHER_APP_ID,
   NARRA_WAKE_PUSH_RULE_ID,
   handleNarraPushRequest,
+  narraPushKey,
   isNarraPushModeEnabled,
   narraPushNotifyUrl,
   type AgentSpec,
@@ -132,9 +133,8 @@ function harness(
 
 describe('push mode (NARRA_SYNC_MODE=push)', () => {
   it('builds the pusher URL only for https + long secret, and gates push mode on it', () => {
-    expect(narraPushNotifyUrl(BASE_ENV)).toBe(
-      `https://agent.example.com/tarot/narra/push/${SECRET}/_matrix/push/v1/notify`,
-    );
+    // Synapse only accepts the exact notify path, so any base path in NARRA_PUSH_URL is dropped.
+    expect(narraPushNotifyUrl(BASE_ENV)).toBe('https://agent.example.com/_matrix/push/v1/notify');
     expect(isNarraPushModeEnabled(BASE_ENV)).toBe(true);
     expect(narraPushNotifyUrl({ ...BASE_ENV, NARRA_PUSH_URL: 'http://agent.example.com' })).toBeNull();
     expect(narraPushNotifyUrl({ ...BASE_ENV, NARRA_PUSH_SECRET: 'short' })).toBeNull();
@@ -151,14 +151,17 @@ describe('push mode (NARRA_SYNC_MODE=push)', () => {
     expect(rule).toHaveLength(1);
     expect(rule[0]).toMatchObject({ method: 'PUT', body: { conditions: [], actions: ['notify'] } });
 
+    const pushkey = await narraPushKey(BASE_ENV);
+    expect(pushkey).toMatch(/^nak:[0-9a-f]{64}$/);
+    expect(pushkey).not.toContain(SECRET);
     const pushers = h.calls.filter((c) => c.url.endsWith('/pushers/set'));
     expect(pushers).toHaveLength(1);
     expect(pushers[0].body).toMatchObject({
       kind: 'http',
       app_id: NARRA_PUSHER_APP_ID,
-      pushkey: `narra-agent-kit:${SPEC.id}`,
+      pushkey,
       data: {
-        url: `https://agent.example.com/tarot/narra/push/${SECRET}/_matrix/push/v1/notify`,
+        url: 'https://agent.example.com/_matrix/push/v1/notify',
         format: 'event_id_only',
       },
     });
@@ -213,7 +216,7 @@ describe('push mode (NARRA_SYNC_MODE=push)', () => {
     (h.env as NarraGatewayEnv).NARRA_SYNC_MODE = 'longpoll';
     await h.sync.alarm();
     const removal = h.calls.filter((c) => c.url.endsWith('/pushers/set')).at(-1);
-    expect(removal?.body).toMatchObject({ kind: null, pushkey: `narra-agent-kit:${SPEC.id}` });
+    expect(removal?.body).toMatchObject({ kind: null, pushkey: await narraPushKey(BASE_ENV) });
     expect(
       h.calls.some((c) => c.method === 'DELETE' && c.url.includes(`/pushrules/global/override/${NARRA_WAKE_PUSH_RULE_ID}`)),
     ).toBe(true);
@@ -236,31 +239,34 @@ describe('handleNarraPushRequest', () => {
     } as unknown as DurableObjectNamespace;
     return { env: { ...BASE_ENV, NARRA_SYNC_DO: ns }, doCalls };
   }
-  const notify = (secret: string) =>
-    new Request(`https://agent.example.com/tarot/narra/push/${secret}/_matrix/push/v1/notify`, {
+  const notify = (pushkey: string, path = '/_matrix/push/v1/notify') =>
+    new Request(`https://agent.example.com${path}`, {
       method: 'POST',
-      body: JSON.stringify({ notification: { event_id: '$e', devices: [{ pushkey: 'pk1' }] } }),
+      body: JSON.stringify({ notification: { event_id: '$e', devices: [{ pushkey }] } }),
     });
 
-  it('ignores unrelated paths', async () => {
+  it('ignores every path but the exact notify path', async () => {
     const { env } = envWithDo();
     expect(await handleNarraPushRequest(new Request('https://agent.example.com/tarot/api/x'), env)).toBeNull();
+    const key = (await narraPushKey(env))!;
+    expect(await handleNarraPushRequest(notify(key, '/tarot/_matrix/push/v1/notify'), env)).toBeNull();
   });
 
-  it('wakes the sync DO for the right secret', async () => {
+  it('wakes the sync DO when Synapse echoes our pushkey', async () => {
     const { env, doCalls } = envWithDo();
-    const res = await handleNarraPushRequest(notify(SECRET), env);
+    const res = await handleNarraPushRequest(notify((await narraPushKey(env))!), env);
     expect(await res!.json()).toEqual({ rejected: [] });
     expect(doCalls).toEqual(['https://narra-sync/push']);
   });
 
-  it('rejects the pushkey (so Synapse drops the pusher) for a wrong secret or push mode off', async () => {
+  it('rejects (so Synapse drops the pusher) a foreign or stale pushkey, or any push with push mode off', async () => {
     const { env, doCalls } = envWithDo();
-    expect(await (await handleNarraPushRequest(notify('wrong_secret_0123456789'), env))!.json()).toEqual({
-      rejected: ['pk1'],
+    expect(await (await handleNarraPushRequest(notify('pk-from-old-secret'), env))!.json()).toEqual({
+      rejected: ['pk-from-old-secret'],
     });
+    const key = (await narraPushKey(env))!;
     const off = { ...env, NARRA_SYNC_MODE: 'longpoll' };
-    expect(await (await handleNarraPushRequest(notify(SECRET), off))!.json()).toEqual({ rejected: ['pk1'] });
+    expect(await (await handleNarraPushRequest(notify(key), off))!.json()).toEqual({ rejected: [key] });
     expect(doCalls).toEqual([]);
   });
 });

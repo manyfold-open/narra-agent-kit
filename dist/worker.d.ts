@@ -145,27 +145,43 @@ export interface NarraGatewayStatus {
  */
 export declare function isNarraGatewayEnabled(env: NarraGatewayEnv | undefined | null): boolean;
 export declare function isNarraSyncEnabled(env: NarraGatewayEnv | undefined | null): boolean;
-/** Matrix push gateway path Synapse requires at the end of every HTTP pusher URL. */
+/**
+ * Synapse refuses an HTTP pusher unless its URL path is exactly this (`M_MISSING_PARAM: 'url' must
+ * have a path of '/_matrix/push/v1/notify'`), so the Worker must answer it at the origin root.
+ */
+export declare const NARRA_PUSH_NOTIFY_PATH = "/_matrix/push/v1/notify";
+/** @deprecated Use NARRA_PUSH_NOTIFY_PATH. */
 export declare const NARRA_PUSH_NOTIFY_SUFFIX = "/_matrix/push/v1/notify";
 export declare const NARRA_PUSHER_APP_ID = "nexus.narra.agent-kit";
 /** User-defined override push rule that makes every room event notify, so every event wakes the agent. */
 export declare const NARRA_WAKE_PUSH_RULE_ID = "nexus.narra.agent-kit.wake";
 /** In push mode, the sync DO still runs one non-blocking `/sync` this often in case a push is lost. */
 export declare const NARRA_PUSH_BACKSTOP_MS = 60000;
-/** Full pusher URL (contains the secret: never log or return it from status endpoints). */
+/**
+ * Pusher URL: the origin of NARRA_PUSH_URL plus the fixed notify path (any path in NARRA_PUSH_URL is
+ * ignored). Use a hostname this Worker owns at its root, e.g. its workers.dev URL. Returns null
+ * without a usable https URL and a push secret of at least 16 characters.
+ */
 export declare function narraPushNotifyUrl(env: NarraGatewayEnv | undefined | null): string | null;
+/**
+ * The pushkey this agent registers, derived from NARRA_PUSH_SECRET. Synapse echoes it in every
+ * notification (`devices[].pushkey`), which is how the Worker tells real pushes from anyone else
+ * posting to the public notify path. Never log it.
+ */
+export declare function narraPushKey(env: NarraGatewayEnv | undefined | null): Promise<string | null>;
 /** True when sync is on, NARRA_SYNC_MODE is `push`, and a valid push URL + secret are configured. */
 export declare function isNarraPushModeEnabled(env: NarraGatewayEnv | undefined | null): boolean;
 /**
- * Handles Synapse's HTTP pusher call (`POST <NARRA_PUSH_URL>/narra/push/<secret>/_matrix/push/v1/notify`).
+ * Handles Synapse's HTTP pusher call (`POST <origin of NARRA_PUSH_URL>/_matrix/push/v1/notify`).
  * Returns `null` when the request is not a push call, so Workers can chain it before their own router:
  * ```ts
  * const pushed = await handleNarraPushRequest(request, env);
  * if (pushed) return pushed;
  * ```
  * A valid call only wakes the sync DO; events are still read through `/sync`, so dedupe, room meta
- * and backstops behave exactly as in long-poll mode. Unknown secrets or push mode being off answer
- * with the pushkeys `rejected`, which makes Synapse drop the stale pusher.
+ * and backstops behave exactly as in long-poll mode. A pushkey that does not match NARRA_PUSH_SECRET,
+ * or push mode being off, is answered with the pushkeys `rejected`, which makes Synapse drop the
+ * stale pusher.
  */
 export declare function handleNarraPushRequest(request: Request, env: NarraGatewayEnv): Promise<Response | null>;
 /**
@@ -199,7 +215,6 @@ export declare class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGat
      * Returns how many rooms were joined in this call.
      */
     private acceptInvites;
-    private pusherKey;
     /**
      * Makes sure the homeserver pushes every new event of this agent to our Worker: one HTTP pusher
      * (event_id_only payload, no message content leaves Synapse) and one override rule that marks
