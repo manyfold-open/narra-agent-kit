@@ -143,6 +143,9 @@ export class NarraRoomCoordinator extends gateway.BaseNarraRoomCoordinator {}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    // Synapse pusher calls (push mode); returns null for every other request.
+    const pushed = await gateway.handleNarraPushRequest(request, env);
+    if (pushed) return pushed;
     const url = new URL(request.url);
     if (url.pathname === '/api/gateway/status') {
       // Protect behind your Worker's admin auth check before returning!
@@ -162,6 +165,16 @@ export default {
 > - `kickNarraGateway(env)` makes **zero external HTTP calls and zero D1 queries** when disabled.
 > - Matrix logins are held **strictly in memory** inside `BaseNarraMatrixSync` and are never written to DO storage, D1, or logs.
 > - `getNarraGatewayStatus(env)` returns redacted boolean/counter diagnostics and never leaks tokens or raw user message bodies.
+
+### 3. Push mode: keep replies instant without a 24/7 Durable Object
+
+By default (`NARRA_SYNC_MODE` unset or `longpoll`) the sync DO keeps a 25s `/sync` long-poll open around the clock. Cloudflare bills Durable Object duration for that whole wait, so each agent costs about 10,800 GB-s per day even when nobody is talking.
+
+With `NARRA_SYNC_MODE: "push"` the sync DO registers a Matrix HTTP pusher for the agent's account, pointing at this Worker. Synapse then calls the Worker for every new event, and the Worker wakes the sync DO, which runs one non-blocking `/sync` (`timeout=0`). Reply latency stays about the same, but the DO only runs while there is something to read.
+
+- **Set up:** add `"NARRA_SYNC_MODE": "push"` and `"NARRA_PUSH_URL": "https://<public worker origin + base path>"` to `vars`, put a random `NARRA_PUSH_SECRET` (at least 16 characters) with `wrangler secret put NARRA_PUSH_SECRET`, and route `handleNarraPushRequest` as shown above.
+- **What it registers on the agent's Matrix account:** one pusher (`app_id` `nexus.narra.agent-kit`, `format: event_id_only`, so no message content leaves Synapse), and one override push rule (`nexus.narra.agent-kit.wake`) that makes every event notify, including the edits, redactions and reactions that are silent by default. Both are re-asserted every 6 hours and whenever the URL changes.
+- **Safety nets:** the DO still runs one `/sync` every 60s in case a push is lost. If registering the pusher fails, that round falls back to a normal long-poll. Switching back to `longpoll` removes the pusher and the rule. A push with an unknown secret is answered with the pushkey `rejected`, so Synapse drops stale pushers on its own.
 
 ---
 

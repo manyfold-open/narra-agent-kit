@@ -6,6 +6,16 @@ export interface NarraGatewayEnv {
     DB?: D1Database;
     NARRA_GATEWAY_ENABLED?: string;
     NARRA_SYNC?: string;
+    /**
+     * `longpoll` (default): the sync DO keeps a 25s `/sync` long-poll open around the clock.
+     * `push`: Synapse pushes a wake-up to this Worker for each new event; the sync DO only runs a
+     * non-blocking `/sync` when woken, plus a slow backstop. Needs NARRA_PUSH_URL + NARRA_PUSH_SECRET.
+     */
+    NARRA_SYNC_MODE?: string;
+    /** Public https base URL of this Worker (including any base path), used to register the Matrix pusher. */
+    NARRA_PUSH_URL?: string;
+    /** Random secret (>= 16 chars) embedded in the pusher URL so only Synapse can wake the sync DO. */
+    NARRA_PUSH_SECRET?: string;
     NARRA_AGENT_TOKEN?: string;
     NARRA_API_ENDPOINT?: string;
     MATRIX_ACCESS_TOKEN?: string;
@@ -116,6 +126,10 @@ export interface NarraGatewayStatus {
     config: {
         NARRA_GATEWAY_ENABLED: string;
         NARRA_SYNC: string;
+        NARRA_SYNC_MODE: string;
+        hasPushUrl: boolean;
+        hasPushSecret: boolean;
+        pushModeActive: boolean;
         hasNarraAgentToken: boolean;
         hasMatrixAccessToken: boolean;
         hasSyncDoBinding: boolean;
@@ -131,6 +145,29 @@ export interface NarraGatewayStatus {
  */
 export declare function isNarraGatewayEnabled(env: NarraGatewayEnv | undefined | null): boolean;
 export declare function isNarraSyncEnabled(env: NarraGatewayEnv | undefined | null): boolean;
+/** Matrix push gateway path Synapse requires at the end of every HTTP pusher URL. */
+export declare const NARRA_PUSH_NOTIFY_SUFFIX = "/_matrix/push/v1/notify";
+export declare const NARRA_PUSHER_APP_ID = "nexus.narra.agent-kit";
+/** User-defined override push rule that makes every room event notify, so every event wakes the agent. */
+export declare const NARRA_WAKE_PUSH_RULE_ID = "nexus.narra.agent-kit.wake";
+/** In push mode, the sync DO still runs one non-blocking `/sync` this often in case a push is lost. */
+export declare const NARRA_PUSH_BACKSTOP_MS = 60000;
+/** Full pusher URL (contains the secret: never log or return it from status endpoints). */
+export declare function narraPushNotifyUrl(env: NarraGatewayEnv | undefined | null): string | null;
+/** True when sync is on, NARRA_SYNC_MODE is `push`, and a valid push URL + secret are configured. */
+export declare function isNarraPushModeEnabled(env: NarraGatewayEnv | undefined | null): boolean;
+/**
+ * Handles Synapse's HTTP pusher call (`POST <NARRA_PUSH_URL>/narra/push/<secret>/_matrix/push/v1/notify`).
+ * Returns `null` when the request is not a push call, so Workers can chain it before their own router:
+ * ```ts
+ * const pushed = await handleNarraPushRequest(request, env);
+ * if (pushed) return pushed;
+ * ```
+ * A valid call only wakes the sync DO; events are still read through `/sync`, so dedupe, room meta
+ * and backstops behave exactly as in long-poll mode. Unknown secrets or push mode being off answer
+ * with the pushkeys `rejected`, which makes Synapse drop the stale pusher.
+ */
+export declare function handleNarraPushRequest(request: Request, env: NarraGatewayEnv): Promise<Response | null>;
 /**
  * Base Durable Object for Matrix `/sync` + `/messages` backstop + in-memory credential handling.
  * Consumer Workers subclass this locally (e.g. `export class NarraMatrixSync extends BaseNarraMatrixSync {}`)
@@ -153,6 +190,17 @@ export declare class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGat
     private updateRoomMetaFromSync;
     private refreshNarraRoomsMeta;
     fetch(request: Request): Promise<Response>;
+    private homeserverRequest;
+    private pusherKey;
+    /**
+     * Makes sure the homeserver pushes every new event of this agent to our Worker: one HTTP pusher
+     * (event_id_only payload, no message content leaves Synapse) and one override rule that marks
+     * every event as notifying (edits, redactions and reactions are silent by default).
+     * Returns false (caller falls back to long-poll) when either call fails.
+     */
+    private ensurePushSetup;
+    /** Removes the pusher + wake rule after switching back to long-poll (best effort). */
+    private teardownPushSetup;
     alarm(): Promise<void>;
 }
 /**
@@ -217,6 +265,8 @@ export interface NarraWorkerGateway<TEnv extends NarraGatewayEnv = NarraGatewayE
     isNarraGatewayEnabled: (env: TEnv) => boolean;
     kickNarraGateway: (env: TEnv) => Promise<NarraGatewayKickResult>;
     getNarraGatewayStatus: (env: TEnv) => Promise<NarraGatewayStatus>;
+    /** Route Synapse pusher calls; returns null for any other request. */
+    handleNarraPushRequest: (request: Request, env: TEnv) => Promise<Response | null>;
 }
 /**
  * Factory binding `NarraGatewayConfig` to pre-configured Durable Object base classes
