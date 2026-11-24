@@ -1,6 +1,6 @@
 import { type BroadcastScheduleResult } from './broadcast.js';
 import { type RecallTurnResult } from './memory.js';
-import type { AgentSpec, AgentUpdateItem, InboundEvent, LangCode, RoomContext, TriageDecision, TriageModel } from './types.js';
+import type { AgentSpec, AgentUpdateItem, InboundEvent, LangCode, RoomContext, RoomMemberInfo, TriageDecision, TriageModel } from './types.js';
 export declare const NARRA_GATEWAY_STATE_SCHEMA = "\nCREATE TABLE IF NOT EXISTS narra_gateway_state (\n  agent_id TEXT PRIMARY KEY,\n  last_broadcast_iso TEXT NOT NULL,\n  updated_at TEXT NOT NULL\n);\n";
 export interface NarraGatewayEnv {
     DB?: D1Database;
@@ -32,6 +32,11 @@ export interface NarraGatewayEnv {
     AI?: unknown;
     AI_TRIAGE_MODEL?: string;
     NARRA_AI_TRIAGE?: string;
+    /**
+     * `ask`: language-agnostic group triage (createAskTriageModel) plus the group fallback, so a real
+     * question that no agent claims still gets one answer. Anything else keeps the keyword-gated triage.
+     */
+    NARRA_GROUP_TRIAGE?: string;
 }
 export interface NarraA2ACredentialResult {
     url: string;
@@ -140,6 +145,18 @@ export interface NarraGatewayStatus {
     sync: Record<string, unknown> | null;
     rooms: Record<string, Record<string, unknown>>;
 }
+export declare function isAskGroupTriage(env: NarraGatewayEnv | undefined | null): boolean;
+/**
+ * The triage model an agent gets unless it supplies its own: ask-aware when NARRA_GROUP_TRIAGE is
+ * `ask`, otherwise the keyword-gated Workers AI triage. Agents that wrap triage with their own fast
+ * paths should call this for everything they do not handle themselves.
+ */
+export declare function createDefaultTriageModel(env: NarraGatewayEnv): TriageModel | undefined;
+/**
+ * Deterministic election among the AI agents in the room, the same on every agent without them
+ * talking to each other: rank by hash of (event, agent). Returns this agent's rank.
+ */
+export declare function groupFallbackRank(eventId: string, selfMatrixId: string, members: RoomMemberInfo[]): number;
 /**
  * Returns `true` ONLY when BOTH `NARRA_GATEWAY_ENABLED` is `'on'` AND `NARRA_AGENT_TOKEN` is non-empty.
  */
@@ -263,6 +280,11 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
     private removePendingTurn;
     private updatePendingTurn;
     private clearUserSession;
+    /**
+     * Due fallback turn: answer only if no agent has replied since the question and nothing makes it
+     * moot (stale, muted room, aimed at someone, chain cap).
+     */
+    private resolveGroupFallback;
     private hasLivePeerRepliedAfter;
     private buildRoomContextForTurn;
     alarm(): Promise<void>;

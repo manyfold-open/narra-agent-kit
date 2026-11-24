@@ -34,8 +34,10 @@ import {
   AgentChainTracker,
   DEFAULT_SESSION_WINDOW_MS,
   DEFAULT_WORKERS_AI_TRIAGE_MODEL,
+  createAskTriageModel,
   createWorkersAiTriageModel,
   executePoliteYield,
+  hashFraction,
   hasPeerAnsweredTimeline,
   hasPeerRepliedAfter,
   inspectRoomPeers,
@@ -128,6 +130,11 @@ export interface NarraGatewayEnv {
   AI?: unknown;
   AI_TRIAGE_MODEL?: string;
   NARRA_AI_TRIAGE?: string;
+  /**
+   * `ask`: language-agnostic group triage (createAskTriageModel) plus the group fallback, so a real
+   * question that no agent claims still gets one answer. Anything else keeps the keyword-gated triage.
+   */
+  NARRA_GROUP_TRIAGE?: string;
 }
 
 export interface NarraA2ACredentialResult {
@@ -267,10 +274,50 @@ interface PendingTurn {
   attempts: number;
   enqueuedAtMs: number;
   dueAtMs: number;
+  /** Queued as a group fallback: this agent's place in the election for an unclaimed ask. */
+  fallbackRank?: number;
   answer?: string;
   decision?: TriageDecision;
   thinkingEventId?: string;
   lastError?: string;
+}
+
+/** A real question nobody claimed: the first elected agent answers after this long... */
+const GROUP_FALLBACK_BASE_MS = 15_000;
+/** ...and the next one this much later if that agent stayed silent (e.g. it runs an older kit). */
+const GROUP_FALLBACK_STEP_MS = 8_000;
+/** Only this many agents per message take part in the fallback election. */
+const GROUP_FALLBACK_MAX_RANK = 3;
+const GROUP_FALLBACK_NOTE =
+  'No other AI agent in this group answered this question. Answer it yourself, briefly and helpfully, ' +
+  'even if it is outside your speciality. If another agent in this group clearly fits better, say so and name them. ' +
+  'Reply in the language of the question.';
+
+export function isAskGroupTriage(env: NarraGatewayEnv | undefined | null): boolean {
+  return (env?.NARRA_GROUP_TRIAGE ?? '').trim() === 'ask';
+}
+
+/**
+ * The triage model an agent gets unless it supplies its own: ask-aware when NARRA_GROUP_TRIAGE is
+ * `ask`, otherwise the keyword-gated Workers AI triage. Agents that wrap triage with their own fast
+ * paths should call this for everything they do not handle themselves.
+ */
+export function createDefaultTriageModel(env: NarraGatewayEnv): TriageModel | undefined {
+  if (!env.AI || (env.NARRA_AI_TRIAGE ?? '').trim() === 'off') return undefined;
+  return isAskGroupTriage(env)
+    ? createAskTriageModel(env.AI, { model: env.AI_TRIAGE_MODEL })
+    : createWorkersAiTriageModel(env.AI, { model: env.AI_TRIAGE_MODEL });
+}
+
+/**
+ * Deterministic election among the AI agents in the room, the same on every agent without them
+ * talking to each other: rank by hash of (event, agent). Returns this agent's rank.
+ */
+export function groupFallbackRank(eventId: string, selfMatrixId: string, members: RoomMemberInfo[]): number {
+  const agents = new Set<string>([selfMatrixId]);
+  for (const m of members) if (m.isAgent || isNarraAgent(m.matrixId)) agents.add(m.matrixId);
+  const ordered = [...agents].sort((a, b) => hashFraction(`${eventId}:${a}`) - hashFraction(`${eventId}:${b}`));
+  return ordered.indexOf(selfMatrixId);
 }
 
 function defaultThinkingMessage(lang: LangCode, isSummary: boolean): string {
@@ -2338,6 +2385,42 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     });
   }
 
+  /**
+   * Due fallback turn: answer only if no agent has replied since the question and nothing makes it
+   * moot (stale, muted room, aimed at someone, chain cap).
+   */
+  private async resolveGroupFallback(
+    turn: PendingTurn,
+    context: RoomContext,
+    spec: AgentSpec,
+    nowMs: number,
+  ): Promise<TriageDecision> {
+    const routed = await routeEvent(turn.event, context, spec, { nowMs, chainCap: AGENT_CHAIN_CAP });
+    const moot = new Set([
+      'sender_is_self',
+      'sender_is_agent',
+      'redaction',
+      'stale_group_message',
+      'aimed_elsewhere',
+      'room_muted',
+      'peer_already_replied',
+      'chain_cap_exhausted',
+    ]);
+    if (moot.has(routed.reason)) return { ...routed, shouldReply: false, reason: `fallback_moot:${routed.reason}` };
+    if (await this.hasLivePeerRepliedAfter(turn.event, context, spec.matrixId)) {
+      return { ...routed, shouldReply: false, reason: 'fallback_not_needed' };
+    }
+    return {
+      shouldReply: true,
+      tier: 1,
+      reason: 'group_fallback',
+      confidence: 0.5,
+      detectedLang: routed.detectedLang,
+      shouldQuote: true,
+      isAsk: true,
+    };
+  }
+
   private async hasLivePeerRepliedAfter(
     event: InboundEvent,
     baseContext: RoomContext,
@@ -2556,20 +2639,44 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             currentNowMs,
           );
 
-          const triageModel =
-            cfg.triageModel?.(this.env) ??
-            (this.env.AI && (this.env.NARRA_AI_TRIAGE ?? '').trim() !== 'off'
-              ? createWorkersAiTriageModel(this.env.AI, { model: this.env.AI_TRIAGE_MODEL })
-              : undefined);
+          const triageModel = cfg.triageModel?.(this.env) ?? createDefaultTriageModel(this.env);
 
-          decision = await routeEvent(nextTurn.event, context, effectiveSpec, {
-            nowMs: currentNowMs,
-            triageModel,
-            chainCap: AGENT_CHAIN_CAP,
-          });
+          decision =
+            nextTurn.fallbackRank !== undefined
+              ? await this.resolveGroupFallback(nextTurn, context, effectiveSpec, currentNowMs)
+              : await routeEvent(nextTurn.event, context, effectiveSpec, {
+                  nowMs: currentNowMs,
+                  triageModel,
+                  chainCap: AGENT_CHAIN_CAP,
+                });
           lastDecision = decision;
 
           if (!decision.shouldReply) {
+            // A real question nobody may claim: join the fallback election instead of dropping it.
+            if (
+              nextTurn.fallbackRank === undefined &&
+              decision.isAsk === true &&
+              context.chatType === 'group' &&
+              isAskGroupTriage(this.env) &&
+              effectiveSpec.matrixId
+            ) {
+              const rank = groupFallbackRank(nextTurn.event.eventId, effectiveSpec.matrixId, context.members);
+              if (rank >= 0 && rank < GROUP_FALLBACK_MAX_RANK) {
+                await this.updatePendingTurn({
+                  ...nextTurn,
+                  decision: undefined,
+                  fallbackRank: rank,
+                  dueAtMs: currentNowMs + GROUP_FALLBACK_BASE_MS + rank * GROUP_FALLBACK_STEP_MS,
+                });
+                await appendDoLog(
+                  this.ctx.storage,
+                  `not mine ${nextTurn.event.eventId} (${decision.reason}); fallback rank ${rank}`,
+                  currentNowMs,
+                  this.env,
+                );
+                continue;
+              }
+            }
             if (
               decision.reason === 'active_session_off_topic' ||
               decision.reason === 'active_session_chatter' ||
@@ -2711,7 +2818,8 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           const isCommittedTurn =
             isDirectTurn ||
             decision.reason === 'multi_mention_domain_match' ||
-            decision.reason === 'active_session';
+            decision.reason === 'active_session' ||
+            decision.reason === 'group_fallback';
           const mentionNamesForCheck = [
             effectiveSpec.name,
             ...(effectiveSpec.aliases ?? []),
@@ -2774,7 +2882,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
               }
             }
 
-            if (!handledFast && !skipFast && cfg.fastRespond) {
+            if (!handledFast && !skipFast && cfg.fastRespond && decision.reason !== 'group_fallback') {
               try {
                 const fast = await cfg.fastRespond(
                   this.env,
@@ -2852,6 +2960,10 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                 throw new A2AError('No A2A credential available for Narra gateway.', false);
               }
 
+              const envelopeFields = {
+                ...(extraFields ?? {}),
+                ...(decision.reason === 'group_fallback' ? { routing_note: GROUP_FALLBACK_NOTE } : {}),
+              };
               const envelope = buildPromptEnvelope({
                 event: nextTurn.event,
                 context: wantsSummary ? { ...context, recentHistory: expandedHistory } : context,
@@ -2859,7 +2971,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                 memories,
                 spec: effectiveSpec,
                 summaryMode: wantsSummary,
-                ...(extraFields && Object.keys(extraFields).length > 0 ? { extraFields } : {}),
+                ...(Object.keys(envelopeFields).length > 0 ? { extraFields: envelopeFields } : {}),
               });
 
               try {
