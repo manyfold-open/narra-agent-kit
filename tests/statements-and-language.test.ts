@@ -68,6 +68,12 @@ describe('statements inside an active session (ask-aware triage)', () => {
     expect(d).toMatchObject({ shouldReply: true, reason: 'active_session' });
   });
 
+  it('leaves a question on another agent\'s topic to that agent, in any language', async () => {
+    const offTopic: TriageModel = { askAware: true, score: vi.fn(async () => ({ score: 0.1, ask: true, reason: 'ask:food' })) };
+    const d = await routeEvent(event('今夜ロンドンでおすすめの中華料理はある？'), context, spec, { nowMs: NOW, triageModel: offTopic });
+    expect(d).toMatchObject({ shouldReply: false, reason: 'active_session_other_topic', isAsk: true });
+  });
+
   it('keeps the old behavior with a keyword-gated (not ask-aware) model', async () => {
     const m = model(false, false);
     const d = await routeEvent(event('我等等要去吃火鍋'), context, spec, { nowMs: NOW, triageModel: m });
