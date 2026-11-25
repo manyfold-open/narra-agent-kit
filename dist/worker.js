@@ -3,7 +3,7 @@ import { D1BroadcastStore, DEFAULT_ROOM_POSTING_RULES, InMemoryBroadcastStore, P
 import { runSchemaStatements } from './d1.js';
 import { BurstCoalescer } from './debounce.js';
 import { isNarraAgent, isSilence, isSummaryOrRecapRequest, parseMatrixEvent, sanitizeMobileLinks, stripLeakedNotes, } from './guard.js';
-import { detectExplicitLangSwitch, detectForeignLanguage, detectLang, isZhOrEn, stripAgentMentions } from './lang.js';
+import { detectExplicitLangSwitch, detectLang, isZhOrEn, stripAgentMentions } from './lang.js';
 import { MemoryStore, handleStandardMemoryCommand, } from './memory.js';
 import { editContent, messageContent, plainMentions } from './mentions.js';
 import { shouldQuote } from './quote.js';
@@ -15,6 +15,7 @@ import { decideWake } from './v2/gate.js';
 import { CLAIM_REACTION, applyClaimReaction, applyClaimRedaction, buildLedgerSummary, emptyRoomState, peerAnswered, peerClaimHolder, pruneClaims, } from './v2/ledger.js';
 import { pipelineForRoom } from './v2/pipeline.js';
 import { shouldFlushStream, streamableText } from './v2/stream.js';
+import { languageName, matchScript, replyLanguageFor } from './v2/language.js';
 import { scoreRelevance } from './v2/relevance.js';
 const DEFAULT_NARRA_API_ENDPOINT = 'https://api.netmind.chat';
 const DEFAULT_MATRIX_HOMESERVER = 'https://matrix.netmind.chat';
@@ -2166,7 +2167,13 @@ export class BaseNarraRoomCoordinator {
                 void this.matrixOp({ op: 'typing', roomId, typing: true }).catch(() => undefined);
             }, TYPING_REFRESH_MS);
             let raw = '';
-            const streamLang = detectForeignLanguage(turn.event.text ?? '') ? 'en' : detectLang(turn.event.text ?? '');
+            // Reply in the asker's language: zh-Hant, zh-Hans or English; anything else in English.
+            const replyLang = replyLanguageFor(turn.event.text ?? '', {
+                mentionNames: [spec.name, ...(spec.aliases ?? []), ...context.members.flatMap((m) => (m.displayName ? [m.displayName] : []))],
+                ...(context.userLanguageHint ? { userHint: context.userLanguageHint } : {}),
+                ...(context.roomLanguageHint ? { roomHint: context.roomLanguageHint } : {}),
+            });
+            const streamLang = replyLang;
             const stream = {
                 shown: '',
                 lastAt: 0,
@@ -2178,7 +2185,7 @@ export class BaseNarraRoomCoordinator {
                 const candidate = streamableText(partial);
                 if (!candidate)
                     return;
-                const display = normalizeA2AOutput(candidate, streamLang).text;
+                const display = matchScript(normalizeA2AOutput(candidate, streamLang).text, streamLang);
                 if (!display)
                     return;
                 const at = this.nowMs();
@@ -2208,8 +2215,7 @@ export class BaseNarraRoomCoordinator {
                 const memories = memoryStore
                     ? await memoryStore.recallForTurn({ roomId, userId: turn.event.senderId, chatType: context.chatType })
                     : emptyMemories();
-                const foreign = detectForeignLanguage(turn.event.text ?? '');
-                const lang = detectLang(turn.event.text ?? '');
+                const lang = replyLang;
                 const triageLike = {
                     shouldReply: true,
                     tier: decision.direct ? 0 : 1,
@@ -2223,7 +2229,6 @@ export class BaseNarraRoomCoordinator {
                     confidence: decision.score ?? 1,
                     detectedLang: lang,
                     shouldQuote: false,
-                    ...(foreign ? { replyLang: foreign } : {}),
                 };
                 const [cred, extraFields, storedContextId] = await Promise.all([
                     Promise.resolve(cfg.resolveA2ACredential?.(this.env) ?? defaultResolveA2ACredential(this.env, spec)),
@@ -2251,7 +2256,11 @@ export class BaseNarraRoomCoordinator {
                             mode,
                             wakeReason: decision.reason,
                         }),
-                        chat_behaviour: chatBehaviourNote({ chatType: context.chatType, direct: decision.direct }),
+                        chat_behaviour: chatBehaviourNote({
+                            chatType: context.chatType,
+                            direct: decision.direct,
+                            replyLanguage: languageName(replyLang),
+                        }),
                     },
                 });
                 const res = await runManyfoldA2ATurnWithMeta({
@@ -2312,8 +2321,7 @@ export class BaseNarraRoomCoordinator {
                     await this.ctx.storage.put('v2State', latest);
                 });
             }
-            const foreign = detectForeignLanguage(turn.event.text ?? '');
-            const text = normalizeA2AOutput(action.text, foreign ? 'en' : detectLang(turn.event.text ?? '')).text;
+            const text = matchScript(normalizeA2AOutput(action.text, replyLang).text, replyLang);
             if (!text) {
                 await this.releaseV2Claim(turn);
                 await this.removePendingTurn(turn.event.eventId);

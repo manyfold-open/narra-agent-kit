@@ -21,5 +21,6 @@ export declare function parseBrainOutput(raw: string): BrainAction;
 export declare function chatBehaviourNote(opts: {
     chatType: 'dm' | 'group';
     direct: boolean;
+    replyLanguage?: string;
 }): string;
 //# sourceMappingURL=actions.d.ts.map
