@@ -1884,6 +1884,17 @@ export class BaseNarraRoomCoordinator {
             isAsk: true,
         };
     }
+    async tryFastRespond(cfg, event, decision, memories, context) {
+        if (!cfg.fastRespond)
+            return null;
+        try {
+            const fast = await cfg.fastRespond(this.env, event, decision, memories, context);
+            return fast && !isSilence(fast) ? fast : null;
+        }
+        catch {
+            return null;
+        }
+    }
     async hasLivePeerRepliedAfter(event, baseContext, selfMatrixId) {
         const localHistory = (await this.ctx.storage.get('recentHistory')) ?? [];
         if (hasPeerRepliedAfter(event, { ...baseContext, recentHistory: localHistory }, selfMatrixId)) {
@@ -2177,10 +2188,18 @@ export class BaseNarraRoomCoordinator {
                         decision.reason === 'dm' ||
                         decision.reason === 'explicit_mention' ||
                         decision.reason === 'reply_to_self';
+                    // fastRespond templates speak zh/en only: a message in another language goes to A2A,
+                    // which gets the same prefetched records and can answer in the asker's language.
+                    const foreignReplyLang = decision.replyLang && !isZhOrEn(decision.replyLang) ? decision.replyLang : undefined;
+                    // Committed turns post a status bubble while A2A works (so the room, and other agents'
+                    // group fallback, can see the question is being handled) and get the Workers AI backup
+                    // when A2A fails, instead of silence.
                     const isCommittedTurn = isDirectTurn ||
                         decision.reason === 'multi_mention_domain_match' ||
                         decision.reason === 'active_session' ||
-                        decision.reason === 'group_fallback';
+                        decision.reason === 'group_fallback' ||
+                        decision.isAsk === true ||
+                        Boolean(foreignReplyLang);
                     const mentionNamesForCheck = [
                         effectiveSpec.name,
                         ...(effectiveSpec.aliases ?? []),
@@ -2239,9 +2258,6 @@ export class BaseNarraRoomCoordinator {
                                 skipFast = true;
                             }
                         }
-                        // fastRespond templates speak zh/en only: a message in another language goes to A2A,
-                        // which gets the same prefetched records and can answer in the asker's language.
-                        const foreignReplyLang = decision.replyLang && !isZhOrEn(decision.replyLang) ? decision.replyLang : undefined;
                         if (!handledFast &&
                             !skipFast &&
                             cfg.fastRespond &&
@@ -2355,7 +2371,12 @@ export class BaseNarraRoomCoordinator {
                                         rawAnswer = backup;
                                     }
                                     else {
-                                        throw a2aErr;
+                                        const local = foreignReplyLang ? await this.tryFastRespond(cfg, nextTurn.event, decision, memories, context) : null;
+                                        if (local === null)
+                                            throw a2aErr;
+                                        // Better a zh/en answer from the agent's own data than an apology.
+                                        rawAnswer = local;
+                                        usedA2A = false;
                                     }
                                 }
                                 else {
@@ -2384,7 +2405,8 @@ export class BaseNarraRoomCoordinator {
                     }
                     let cleaned = '';
                     if (usedA2A) {
-                        cleaned = normalizeA2AOutput(rawAnswer, decision.detectedLang).text;
+                        // No zh-Hant/zh-Hans conversion for other languages: it would rewrite Japanese kanji.
+                        cleaned = normalizeA2AOutput(rawAnswer, foreignReplyLang ? 'en' : decision.detectedLang).text;
                     }
                     else {
                         const { text: withoutNotes } = stripLeakedNotes(rawAnswer);

@@ -285,6 +285,7 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
      * moot (stale, muted room, aimed at someone, chain cap).
      */
     private resolveGroupFallback;
+    private tryFastRespond;
     private hasLivePeerRepliedAfter;
     private buildRoomContextForTurn;
     alarm(): Promise<void>;
