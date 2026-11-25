@@ -281,6 +281,22 @@ describe('v2 relevance scoring', () => {
     expect(ai.calls[1]).toEqual(['哈哈哈']);
   });
 
+  it('uses a v2-only profile and drops messages that belong to other agents', async () => {
+    const ai = {
+      run: async (_m: string, input: { text: string[] }) => ({
+        data: input.text.map((t) => (/新聞|news/i.test(t) ? [1, 0, 0] : /融資|funding|AI/i.test(t) ? [0.8, 0.6, 0] : [0, 0, 1])),
+      }),
+    };
+    const spec = { ...NEWS_SPEC, domainDescription: 'unrelated v1 text' };
+    const fb = { event: ev('$q', 'x'), context: ctx() };
+    // Datasets agent: its profile is about AI funding, AI news belongs to another agent.
+    const own = await scoreRelevance('哪些 AI 公司拿到融資', spec, [], { ai, profile: 'AI funding rounds', notExamples: ['今天有什麼 AI 新聞'] }, fb);
+    expect(own.score).toBe(1);
+    const news = await scoreRelevance('最近有啥 AI 新聞嗎', spec, [], { ai, profile: 'AI funding rounds', notExamples: ['今天有什麼 AI 新聞'] }, fb);
+    expect(news.score).toBe(0);
+    expect(news.notCosine).toBe(1);
+  });
+
   it('falls back to the keyword heuristic without Workers AI', async () => {
     const r = await scoreRelevance('AI news?', NEWS_SPEC, [], { ai: undefined }, { event: ev('$q', 'AI news?'), context: ctx() });
     expect(r.source).toBe('heuristic');

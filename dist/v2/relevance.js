@@ -8,8 +8,8 @@ export const DEFAULT_EMBEDDING_MODEL = '@cf/baai/bge-m3';
 /** Cosine similarity at or below this maps to relevance 0; at or above `high`, to 1. */
 export const DEFAULT_COSINE_LOW = 0.35;
 export const DEFAULT_COSINE_HIGH = 0.65;
-export function profileTexts(spec, examples = []) {
-    return [spec.domainDescription, ...examples].map((t) => t.trim()).filter(Boolean).slice(0, 24);
+export function profileTexts(spec, examples = [], profile) {
+    return [profile?.trim() || spec.domainDescription, ...examples].map((t) => t.trim()).filter(Boolean).slice(0, 24);
 }
 export function cosine(a, b) {
     let dot = 0;
@@ -76,9 +76,11 @@ export async function scoreRelevance(text, spec, examples, options, fallback) {
     if (!binding || !clean)
         return heuristic();
     const model = options.model ?? DEFAULT_EMBEDDING_MODEL;
-    const profile = profileTexts(spec, examples);
-    if (profile.length === 0)
+    const positives = profileTexts(spec, examples, options.profile);
+    if (positives.length === 0)
         return heuristic();
+    const negatives = (options.notExamples ?? []).map((t) => t.trim()).filter(Boolean).slice(0, 16);
+    const profile = [...positives, ...negatives];
     const timeoutMs = options.timeoutMs ?? 4_000;
     try {
         const cacheKey = `v2:profile:${model}:${hashKey(profile)}`;
@@ -99,11 +101,16 @@ export async function scoreRelevance(text, spec, examples, options, fallback) {
             messageVector = one[0];
         }
         let best = -1;
-        for (const v of profileVectors)
+        for (const v of profileVectors.slice(0, positives.length))
             best = Math.max(best, cosine(v, messageVector));
+        let notBest = -1;
+        for (const v of profileVectors.slice(positives.length))
+            notBest = Math.max(notBest, cosine(v, messageVector));
+        const notMine = negatives.length > 0 && notBest > best;
         return {
-            score: scaleCosine(best, options.cosineLow, options.cosineHigh),
+            score: notMine ? 0 : scaleCosine(best, options.cosineLow, options.cosineHigh),
             cosine: Math.round(best * 1000) / 1000,
+            ...(negatives.length > 0 ? { notCosine: Math.round(notBest * 1000) / 1000 } : {}),
             source: 'embedding',
         };
     }

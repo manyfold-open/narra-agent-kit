@@ -28,6 +28,13 @@ export interface RelevanceScorerOptions {
   cosineHigh?: number;
   /** Stores the profile vectors so they are embedded once, not on every message. */
   cache?: VectorCache;
+  /** v2-only profile text used instead of `spec.domainDescription`. */
+  profile?: string;
+  /**
+   * Requests that are NOT this agent's (e.g. a news agent's topics for a datasets agent). When a
+   * message is closer to one of these than to the agent's own profile, its relevance is 0.
+   */
+  notExamples?: readonly string[];
   timeoutMs?: number;
 }
 
@@ -35,11 +42,13 @@ export interface RelevanceResult {
   score: number;
   /** Raw best cosine, logged so thresholds can be calibrated from real traffic. */
   cosine?: number;
+  /** Best cosine against `notExamples`, when given. */
+  notCosine?: number;
   source: 'embedding' | 'heuristic';
 }
 
-export function profileTexts(spec: AgentSpec, examples: readonly string[] = []): string[] {
-  return [spec.domainDescription, ...examples].map((t) => t.trim()).filter(Boolean).slice(0, 24);
+export function profileTexts(spec: AgentSpec, examples: readonly string[] = [], profile?: string): string[] {
+  return [profile?.trim() || spec.domainDescription, ...examples].map((t) => t.trim()).filter(Boolean).slice(0, 24);
 }
 
 export function cosine(a: number[], b: number[]): number {
@@ -114,8 +123,10 @@ export async function scoreRelevance(
   if (!binding || !clean) return heuristic();
 
   const model = options.model ?? DEFAULT_EMBEDDING_MODEL;
-  const profile = profileTexts(spec, examples);
-  if (profile.length === 0) return heuristic();
+  const positives = profileTexts(spec, examples, options.profile);
+  if (positives.length === 0) return heuristic();
+  const negatives = (options.notExamples ?? []).map((t) => t.trim()).filter(Boolean).slice(0, 16);
+  const profile = [...positives, ...negatives];
   const timeoutMs = options.timeoutMs ?? 4_000;
 
   try {
@@ -134,10 +145,14 @@ export async function scoreRelevance(
       messageVector = one[0];
     }
     let best = -1;
-    for (const v of profileVectors) best = Math.max(best, cosine(v, messageVector!));
+    for (const v of profileVectors.slice(0, positives.length)) best = Math.max(best, cosine(v, messageVector!));
+    let notBest = -1;
+    for (const v of profileVectors.slice(positives.length)) notBest = Math.max(notBest, cosine(v, messageVector!));
+    const notMine = negatives.length > 0 && notBest > best;
     return {
-      score: scaleCosine(best, options.cosineLow, options.cosineHigh),
+      score: notMine ? 0 : scaleCosine(best, options.cosineLow, options.cosineHigh),
       cosine: Math.round(best * 1000) / 1000,
+      ...(negatives.length > 0 ? { notCosine: Math.round(notBest * 1000) / 1000 } : {}),
       source: 'embedding',
     };
   } catch {

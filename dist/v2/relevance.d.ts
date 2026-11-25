@@ -14,15 +14,24 @@ export interface RelevanceScorerOptions {
     cosineHigh?: number;
     /** Stores the profile vectors so they are embedded once, not on every message. */
     cache?: VectorCache;
+    /** v2-only profile text used instead of `spec.domainDescription`. */
+    profile?: string;
+    /**
+     * Requests that are NOT this agent's (e.g. a news agent's topics for a datasets agent). When a
+     * message is closer to one of these than to the agent's own profile, its relevance is 0.
+     */
+    notExamples?: readonly string[];
     timeoutMs?: number;
 }
 export interface RelevanceResult {
     score: number;
     /** Raw best cosine, logged so thresholds can be calibrated from real traffic. */
     cosine?: number;
+    /** Best cosine against `notExamples`, when given. */
+    notCosine?: number;
     source: 'embedding' | 'heuristic';
 }
-export declare function profileTexts(spec: AgentSpec, examples?: readonly string[]): string[];
+export declare function profileTexts(spec: AgentSpec, examples?: readonly string[], profile?: string): string[];
 export declare function cosine(a: number[], b: number[]): number;
 export declare function scaleCosine(value: number, low?: number, high?: number): number;
 /**

@@ -77,7 +77,9 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
     /** Opt-in fail-closed check against Narra `/api/agent-runtime/matrix/authorize-event`. */
     authorizeEvents?: boolean;
     /** Optional D1/local pre-fetch hook injected into Manyfold A2A `extraFields` in parallel before calling A2A. */
-    buildExtraEnvelopeFields?: (env: TEnv, event: InboundEvent, decision: TriageDecision, memories: RecallTurnResult, context: RoomContext) => Promise<Record<string, string> | null | undefined>;
+    buildExtraEnvelopeFields?: (env: TEnv, event: InboundEvent, decision: TriageDecision, memories: RecallTurnResult, context: RoomContext, info?: {
+        pipeline: 'v1' | 'v2';
+    }) => Promise<Record<string, string> | null | undefined>;
     /** Custom progress status text shown if a directly addressed A2A turn exceeds `thinkingDelayMs`. */
     thinkingMessage?: (lang: LangCode, event: InboundEvent, decision: TriageDecision) => string;
     /** Delay before posting a progress status bubble on direct A2A turns (default 3500ms; 0 disables). */
@@ -90,6 +92,10 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
     v2?: {
         /** Example requests this agent is good at, in any language; sharpen relevance scoring. */
         wakeExamples?: string[];
+        /** Profile text for v2 relevance instead of `spec.domainDescription` (which v1 also reads). */
+        profile?: string;
+        /** Requests that belong to other agents; a message closer to these than to this agent never wakes it. */
+        notExamples?: string[];
         gate?: Partial<WakeGateOptions>;
         /** Timeout for the Manyfold brain call (default 25s). */
         brainTimeoutMs?: number;
