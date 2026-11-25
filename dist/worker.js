@@ -2280,8 +2280,11 @@ export class BaseNarraRoomCoordinator {
                         }
                         if (!handledFast) {
                             usedA2A = true;
-                            const thinkingDelayMs = cfg.thinkingDelayMs ?? DEFAULT_THINKING_DELAY_MS;
-                            if (isCommittedTurn && thinkingDelayMs > 0 && !nextTurn.thinkingEventId) {
+                            // An unmentioned group question this agent claimed shows its status right away: the
+                            // other agents' polite yield sees it and stands down instead of answering too.
+                            const claimedGroupAsk = decision.isAsk === true && context.chatType === 'group' && !isDirectTurn;
+                            const thinkingDelayMs = claimedGroupAsk ? 0 : (cfg.thinkingDelayMs ?? DEFAULT_THINKING_DELAY_MS);
+                            if (isCommittedTurn && (thinkingDelayMs > 0 || claimedGroupAsk) && !nextTurn.thinkingEventId) {
                                 const statusText = wantsSummary
                                     ? defaultThinkingMessage(decision.detectedLang, true)
                                     : (cfg.thinkingMessage?.(decision.detectedLang, nextTurn.event, decision) ??

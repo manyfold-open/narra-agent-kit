@@ -10,6 +10,7 @@ import {
   NarraRoomCoordinator,
   createNarraWorkerGateway,
   groupFallbackRank,
+  routeEvent,
   getNarraGatewayStatus,
   isNarraGatewayEnabled,
   isNarraSyncEnabled,
@@ -3026,7 +3027,9 @@ describe('ask-aware group triage + elected fallback (NARRA_GROUP_TRIAGE=ask)', (
     expect(t.fastCalls).toEqual([]);
     expect(t.envelopes).toHaveLength(1);
     expect(t.envelopes[0]).toContain('No other AI agent in this group answered this question');
-    expect(t.posted).toEqual(['Prueba el Southbank Centre mañana por la tarde.']);
+    // At most a status bubble (posted right away so peers stand down) and the answer that replaces it.
+    expect(t.posted.at(-1)).toBe('Prueba el Southbank Centre mañana por la tarde.');
+    expect(t.posted.filter((m) => !m.startsWith('🔍'))).toHaveLength(1);
     expect(await t.storage.get('pendingTurns')).toEqual([]);
   });
 
@@ -3092,3 +3095,32 @@ describe('ask-aware group triage + elected fallback (NARRA_GROUP_TRIAGE=ask)', (
     }
   });
 });
+
+describe('ask-aware claims spread out and show up early', () => {
+  it('waits clearly longer for lower fits when the triage is ask-aware', async () => {
+    const NOW = 1_790_000_000_000;
+    const spec = { ...TEST_SPEC, politeYieldDelayMs: 1_200 };
+    const ev = {
+      roomId: '!g:x', chatType: 'group' as const, eventId: '$claim', senderId: '@z:x', senderName: 'Z',
+      type: 'm.room.message' as const, kind: 'text' as const, msgtype: 'm.text', timestampMs: NOW,
+      timeIso: new Date(NOW).toISOString(), mentions: [], text: '¿Hay alguna noticia de IA hoy?',
+    };
+    const ctx = {
+      roomId: '!g:x', chatType: 'group' as const, recentHistory: [],
+      members: [{ matrixId: '@agent-aaaa0001:matrix.netmind.chat', displayName: 'AI in 5', isAgent: true }],
+    };
+    const decide = (fit: number) =>
+      routeEvent(ev as never, ctx as never, spec, {
+        nowMs: NOW,
+        triageModel: { askAware: true, score: async () => ({ score: fit, ask: true, reason: 'ask:x' }) },
+      });
+    const top = (await decide(0.95)).yieldDelayMs!;
+    const mid = (await decide(0.7)).yieldDelayMs!;
+    const low = (await decide(0.58)).yieldDelayMs!;
+    expect(top).toBeGreaterThanOrEqual(1_800);
+    expect(top).toBeLessThan(2_400);
+    expect(mid).toBeGreaterThan(4_900);
+    expect(low).toBeGreaterThan(6_500);
+  });
+});
+
