@@ -121,6 +121,8 @@ describe('v2 reply language', () => {
     expect(matchScript('三条要闻', 'zh-Hant')).toBe('三條要聞');
     expect(matchScript('三條要聞', 'zh-Hans')).toBe('三条要闻');
     expect(matchScript('Three stories', 'en')).toBe('Three stories');
+    expect(matchScript('FCC 批准 SpaceX 的计划，标准和准备都很准确', 'zh-Hant')).toBe('FCC 批准 SpaceX 的計劃，標準和準備都很準確');
+    expect(matchScript('FCC 批准 SpaceX 的計劃', 'zh-Hant')).toBe('FCC 批准 SpaceX 的計劃');
   });
 });
 
@@ -189,8 +191,17 @@ describe('v2 wake gate', () => {
 
   it('continues its own conversation with the sender without scoring', async () => {
     const history = [turn('$a', ZACK, NOW - 60_000), turn('$b', NEWS, NOW - 50_000, { answersEventId: '$a' })];
-    const d = await decideWake({ event: ev('$c', '第二則是哪家公司'), context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: never });
+    const d = await decideWake({ event: ev('$c', '第二則是哪家公司'), context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => 0.3 });
     expect(d).toMatchObject({ wake: true, reason: 'your_conversation', delayMs: 0, claim: true, direct: false });
+  });
+
+  it('lets a conversation move on to another agent\'s topic (晚餐吃啥好 after talking with the events agent)', async () => {
+    const history = [turn('$a', ZACK, NOW - 60_000), turn('$b', NEWS, NOW - 50_000, { answersEventId: '$a' })];
+    const moved = await decideWake({ event: ev('$c', '晚餐吃啥好'), context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0, notMine: true }) });
+    expect(moved).toMatchObject({ wake: false, reason: 'topic_moved_on' });
+    // A short follow-up that just looks unrelated still stays with the agent.
+    const follow = await decideWake({ event: ev('$d', 'Holborn'), context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.1 }) });
+    expect(follow).toMatchObject({ wake: true, reason: 'your_conversation' });
   });
 
   it('wakes on relevance, sooner when more relevant, and asks more when the sender talks with another agent', async () => {
@@ -202,7 +213,7 @@ describe('v2 wake gate', () => {
     expect(high.wake && mid.wake).toBe(true);
     expect(high.delayMs).toBeLessThan(mid.delayMs);
     const history = [turn('$a', ZACK, NOW - 30_000), turn('$b', SPOTTED, NOW - 20_000, { answersEventId: '$a' })];
-    const withPeer = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => 0.7 });
+    const withPeer = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => 0.6 });
     expect(withPeer).toMatchObject({ wake: false, reason: 'peer_conversation' });
   });
 });

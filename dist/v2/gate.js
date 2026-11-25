@@ -10,7 +10,7 @@ import { THREAD_WINDOW_MS, threadPartner } from './ledger.js';
 export const V2_AGENT_TAIL_CAP = 5;
 export const DEFAULT_WAKE_GATE_OPTIONS = {
     threshold: 0.5,
-    peerConversationThreshold: 0.8,
+    peerConversationThreshold: 0.65,
     maxDelayMs: 4_000,
     minDelayMs: 600,
 };
@@ -57,10 +57,24 @@ export async function decideWake(input) {
     if (input.budgetExhausted)
         return drop('budget');
     const partner = threadPartner(context.recentHistory, event.senderId, nowMs, THREAD_WINDOW_MS);
+    let scored;
+    const getScore = async () => {
+        if (!scored) {
+            const raw = await input.score();
+            scored = typeof raw === 'number' ? { score: raw } : raw;
+        }
+        return scored;
+    };
     if (partner && partner === selfId) {
-        return { wake: true, reason: 'your_conversation', delayMs: 0, claim: true, direct: false };
+        // Short follow-ups ("Holborn", "the second one?") stay with this agent even when they look
+        // unrelated, but not when the person clearly moved on to another agent's topic.
+        const { score, notMine } = await getScore();
+        if (!notMine) {
+            return { wake: true, reason: 'your_conversation', delayMs: 0, claim: true, direct: false, score };
+        }
+        return drop('topic_moved_on', score);
     }
-    const score = await input.score();
+    const { score } = await getScore();
     const needed = partner ? opts.peerConversationThreshold : opts.threshold;
     if (score < needed)
         return drop(partner ? 'peer_conversation' : 'low_relevance', score);

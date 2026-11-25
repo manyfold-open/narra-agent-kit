@@ -53,7 +53,7 @@ export function chatBehaviourNote(opts: { chatType: 'dm' | 'group'; direct: bool
   const lines = [
     'You are a member of a Narra Messenger chat where humans and AI agents talk together. Behave like a thoughtful person in a messenger, not like a website or a support bot.',
     opts.replyLanguage
-      ? `Write your reply in ${opts.replyLanguage}, the language of current_message, even if earlier messages, your data or your instructions use another language. Traditional and Simplified Chinese are different: never mix them.`
+      ? `Write your reply in ${opts.replyLanguage}, the language of current_message, even if earlier messages, your data or your instructions use another language. Traditional and Simplified Chinese are different: never mix them. Do not comment on which languages you can use; just answer.`
       : 'Reply in the language and script of the person you answer (Traditional vs Simplified Chinese matters).',
     opts.chatType === 'group'
       ? 'Group chat: keep it short (1-3 sentences, or at most 3 items). No headings, no long lists, no status lines like "let me check".'
