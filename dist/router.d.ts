@@ -4,6 +4,8 @@ export declare const DEFAULT_STALE_GROUP_MS: number;
 export declare const DEFAULT_SILENCE_THRESHOLD = 0.55;
 export declare const DEFAULT_YIELD_DELAY_MS = 1800;
 export declare const ASK_AWARE_YIELD_BASE_MS = 4000;
+/** Inside an active session, an ask-aware fit below this means the question belongs to someone else. */
+export declare const ACTIVE_SESSION_MIN_FIT = 0.3;
 export declare const DEFAULT_UNMENTIONED_COOLDOWN_MS = 30000;
 export declare const DEFAULT_WORKERS_AI_TRIAGE_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 export declare const AGENT_CHAIN_CAP = 6;

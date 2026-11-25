@@ -6,6 +6,8 @@ export const DEFAULT_STALE_GROUP_MS = 15 * 60_000;
 export const DEFAULT_SILENCE_THRESHOLD = 0.55;
 export const DEFAULT_YIELD_DELAY_MS = 1_800;
 export const ASK_AWARE_YIELD_BASE_MS = 4_000;
+/** Inside an active session, an ask-aware fit below this means the question belongs to someone else. */
+export const ACTIVE_SESSION_MIN_FIT = 0.3;
 export const DEFAULT_UNMENTIONED_COOLDOWN_MS = 30_000;
 export const DEFAULT_WORKERS_AI_TRIAGE_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 export const AGENT_CHAIN_CAP = 6;
@@ -891,18 +893,33 @@ async function routeEventCore(event, context, spec, options = {}) {
         if (!options.triageModel?.askAware || context.chatType !== 'group')
             return null;
         const res = await options.triageModel.score({ event, context, spec, detectedLang });
-        if (res.ask !== false)
-            return null;
-        return {
-            shouldReply: false,
-            tier: 1,
-            reason: 'active_session_not_ask',
-            confidence: 0.9,
-            detectedLang,
-            shouldQuote: false,
-            isAsk: false,
-            ...(res.lang ? { replyLang: res.lang } : {}),
-        };
+        if (res.ask === false) {
+            return {
+                shouldReply: false,
+                tier: 1,
+                reason: 'active_session_not_ask',
+                confidence: 0.9,
+                detectedLang,
+                shouldQuote: false,
+                isAsk: false,
+                ...(res.lang ? { replyLang: res.lang } : {}),
+            };
+        }
+        // A new question on another agent's topic (a food question while chatting with the news
+        // agent) is not a follow-up, whatever language it is in: leave it to the agent it fits.
+        if (res.ask === true && res.score < ACTIVE_SESSION_MIN_FIT) {
+            return {
+                shouldReply: false,
+                tier: 1,
+                reason: 'active_session_other_topic',
+                confidence: 0.9,
+                detectedLang,
+                shouldQuote: false,
+                isAsk: true,
+                ...(res.lang ? { replyLang: res.lang } : {}),
+            };
+        }
+        return null;
     };
     const peers = context.peers ?? inspectRoomPeers(context.members, spec.matrixId);
     const mentionNames = collectMentionNames(spec, peers);
