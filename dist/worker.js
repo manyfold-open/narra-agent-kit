@@ -2044,7 +2044,10 @@ export class BaseNarraRoomCoordinator {
                 }, { event, context });
                 if (relevance.source === 'embedding')
                     await budget.add('relevance', nowMs);
-                return relevance.score;
+                return {
+                    score: relevance.score,
+                    notMine: relevance.notCosine !== undefined && relevance.cosine !== undefined && relevance.notCosine > relevance.cosine,
+                };
             },
         });
         return { decision, ...(relevance ? { relevance } : {}) };

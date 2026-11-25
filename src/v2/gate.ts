@@ -25,6 +25,7 @@ export type WakeReason =
   | 'mode_quiet'
   | 'agent_tail_cap'
   | 'peer_conversation'
+  | 'topic_moved_on'
   | 'low_relevance'
   | 'budget';
 
@@ -53,7 +54,7 @@ export interface WakeGateOptions {
 
 export const DEFAULT_WAKE_GATE_OPTIONS: WakeGateOptions = {
   threshold: 0.5,
-  peerConversationThreshold: 0.8,
+  peerConversationThreshold: 0.65,
   maxDelayMs: 4_000,
   minDelayMs: 600,
 };
@@ -66,8 +67,11 @@ export interface WakeGateInput {
   nowMs: number;
   /** True when the daily Workers AI budget is used up: no relevance scoring, addressed messages only. */
   budgetExhausted?: boolean;
-  /** Relevance of the message to this agent (0..1), computed only when needed. */
-  score: () => Promise<number>;
+  /**
+   * Relevance of the message to this agent (0..1), computed only when needed. `notMine` means the
+   * message is closer to another agent's requests (`v2.notExamples`) than to this agent's profile.
+   */
+  score: () => Promise<number | { score: number; notMine?: boolean }>;
   options?: Partial<WakeGateOptions>;
 }
 
@@ -116,11 +120,25 @@ export async function decideWake(input: WakeGateInput): Promise<WakeDecision> {
   if (input.budgetExhausted) return drop('budget');
 
   const partner = threadPartner(context.recentHistory, event.senderId, nowMs, THREAD_WINDOW_MS);
+  let scored: { score: number; notMine?: boolean } | undefined;
+  const getScore = async (): Promise<{ score: number; notMine?: boolean }> => {
+    if (!scored) {
+      const raw = await input.score();
+      scored = typeof raw === 'number' ? { score: raw } : raw;
+    }
+    return scored;
+  };
   if (partner && partner === selfId) {
-    return { wake: true, reason: 'your_conversation', delayMs: 0, claim: true, direct: false };
+    // Short follow-ups ("Holborn", "the second one?") stay with this agent even when they look
+    // unrelated, but not when the person clearly moved on to another agent's topic.
+    const { score, notMine } = await getScore();
+    if (!notMine) {
+      return { wake: true, reason: 'your_conversation', delayMs: 0, claim: true, direct: false, score };
+    }
+    return drop('topic_moved_on', score);
   }
 
-  const score = await input.score();
+  const { score } = await getScore();
   const needed = partner ? opts.peerConversationThreshold : opts.threshold;
   if (score < needed) return drop(partner ? 'peer_conversation' : 'low_relevance', score);
 
