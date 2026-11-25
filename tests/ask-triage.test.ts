@@ -36,6 +36,26 @@ const spec: AgentSpec = {
 const verdict = (json: string) => ({ response: json });
 
 describe('createAskTriageModel', () => {
+  it('tells the model when the sender is mid-exchange with another agent', async () => {
+    const run = vi.fn(async () => verdict('{"ask":true,"fit":0.0,"reason":"belongs_to_spotted"}'));
+    const food: AgentSpec = { ...spec, id: 'agt_food', matrixId: '@agent-b2b526f3:matrix.netmind.chat', name: 'London Chinese Food' };
+    const ctx = {
+      ...context,
+      members: [...context.members, { matrixId: spec.matrixId!, displayName: 'Spotted London', isAgent: true }],
+      recentHistory: [
+        { eventId: '$q', senderId: '@cassie:matrix.netmind.chat', senderName: 'Cassie', isAgent: false, text: 'Liverpool Street 附近有什么market', timestampMs: NOW - 8_000 },
+        { eventId: '$a', senderId: spec.matrixId!, senderName: 'Spotted London', isAgent: true, text: '📍 正在帮你查询…', timestampMs: NOW - 3_000, answersEventId: '$q' },
+      ],
+    } as RoomContext;
+    await createAskTriageModel({ run }).score({ event: event('他中午都会有圣诞的东西'), context: ctx, spec: food, detectedLang: 'zh-Hans' });
+    const prompt = JSON.stringify(run.mock.calls[0]);
+    expect(prompt).toContain('ongoing_exchange');
+    expect(prompt).toContain('conversation with Spotted London');
+    run.mockClear();
+    await createAskTriageModel({ run }).score({ event: event('肚子饿了'), context, spec: food, detectedLang: 'zh-Hans' });
+    expect(JSON.stringify(run.mock.calls[0])).not.toContain('ongoing_exchange');
+  });
+
   it.each(['👍', '...', '😂😂', '  '])('drops content-free "%s" without a model call', async (text) => {
     const run = vi.fn();
     expect(await createAskTriageModel({ run }).score({ event: event(text), context, spec, detectedLang: 'en' })).toMatchObject({
