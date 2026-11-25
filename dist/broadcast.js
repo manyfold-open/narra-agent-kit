@@ -1,6 +1,7 @@
 import { runSchemaStatements } from './d1.js';
 import { isNarraAgent, isSilence, sanitizeMobileLinks } from './guard.js';
 import { detectLang } from './lang.js';
+import { localDayStartMs, localHour } from './v2/pipeline.js';
 export const NARRA_BROADCAST_SCHEMA = `
 CREATE TABLE IF NOT EXISTS narra_broadcast_log (
   agent_id TEXT NOT NULL,
@@ -116,6 +117,27 @@ export function roomLanguage(recentHistory, sample = 10) {
     return best;
 }
 const ITEM_KEY_PREFIX = 'item:';
+export const DEFAULT_ROOM_POSTING_RULES = {
+    dailyCap: 3,
+    quietMs: 10 * 60_000,
+    startHour: 9,
+    endHour: 21,
+    timeZone: 'Europe/London',
+};
+/** Why a room should not get a scheduled post right now, or null when it may. */
+export function roomPostingBlock(history, nowMs, rules) {
+    const hour = localHour(nowMs, rules.timeZone);
+    if (hour < rules.startHour || hour >= rules.endHour)
+        return 'outside_hours';
+    const dayStart = localDayStartMs(nowMs, rules.timeZone);
+    if (history.filter((t) => t.isBroadcast && t.timestampMs >= dayStart).length >= rules.dailyCap) {
+        return 'room_daily_cap';
+    }
+    const lastHuman = [...history].reverse().find((t) => !t.isAgent && !isNarraAgent(t.senderId));
+    if (lastHuman && nowMs - lastHuman.timestampMs < rules.quietMs)
+        return 'room_busy';
+    return null;
+}
 /**
  * Staggered proactive update scheduler:
  * - Skips empty `updates` and empty/silent update text
@@ -178,6 +200,14 @@ export class ProactiveBroadcastScheduler {
                         updateKey: item.updateKey,
                         reason: 'agent_only_recent_messages',
                     });
+                    continue;
+                }
+            }
+            const rules = typeof this.opts.roomRules === 'function' ? this.opts.roomRules(item.roomId) : this.opts.roomRules;
+            if (rules) {
+                const block = roomPostingBlock(history, nowMs, rules);
+                if (block) {
+                    result.skipped.push({ roomId: item.roomId, updateKey: item.updateKey, reason: block });
                     continue;
                 }
             }

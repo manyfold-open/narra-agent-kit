@@ -3,6 +3,7 @@ import { isNarraAgent, isSilence, sanitizeMobileLinks } from './guard.js';
 import { detectLang } from './lang.js';
 import type { MemoryStore } from './memory.js';
 import type { AgentUpdateItem, HistoryTurn, LangCode } from './types.js';
+import { localDayStartMs, localHour } from './v2/pipeline.js';
 
 export const NARRA_BROADCAST_SCHEMA = `
 CREATE TABLE IF NOT EXISTS narra_broadcast_log (
@@ -169,7 +170,50 @@ export type BroadcastSkipReason =
   | 'opted_out'
   | 'agent_only_recent_messages'
   | 'outside_stagger_window'
+  | 'room_daily_cap'
+  | 'room_busy'
+  | 'outside_hours'
   | 'send_failed';
+
+/**
+ * Room-level manners for scheduled posts, shared by every agent in the room without coordination:
+ * each agent counts the `ai.narra.broadcast` posts it can see in the room's history.
+ */
+export interface RoomPostingRules {
+  /** All agents together post at most this many scheduled messages per room per local day. */
+  dailyCap: number;
+  /** Do not post within this long after the last human message (people are mid-conversation). */
+  quietMs: number;
+  /** Local posting hours [start, end) in `timeZone`. */
+  startHour: number;
+  endHour: number;
+  timeZone: string;
+}
+
+export const DEFAULT_ROOM_POSTING_RULES: RoomPostingRules = {
+  dailyCap: 3,
+  quietMs: 10 * 60_000,
+  startHour: 9,
+  endHour: 21,
+  timeZone: 'Europe/London',
+};
+
+/** Why a room should not get a scheduled post right now, or null when it may. */
+export function roomPostingBlock(
+  history: HistoryTurn[],
+  nowMs: number,
+  rules: RoomPostingRules,
+): 'room_daily_cap' | 'room_busy' | 'outside_hours' | null {
+  const hour = localHour(nowMs, rules.timeZone);
+  if (hour < rules.startHour || hour >= rules.endHour) return 'outside_hours';
+  const dayStart = localDayStartMs(nowMs, rules.timeZone);
+  if (history.filter((t) => t.isBroadcast && t.timestampMs >= dayStart).length >= rules.dailyCap) {
+    return 'room_daily_cap';
+  }
+  const lastHuman = [...history].reverse().find((t) => !t.isAgent && !isNarraAgent(t.senderId));
+  if (lastHuman && nowMs - lastHuman.timestampMs < rules.quietMs) return 'room_busy';
+  return null;
+}
 
 export interface BroadcastScheduleResult {
   sent: Array<{ roomId: string; updateKey: string; text: string }>;
@@ -186,6 +230,8 @@ export interface BroadcastSchedulerOptions {
   enforceStaggerWindow?: boolean;
   staggerWindowMinutes?: number;
   staggerToleranceMinutes?: number;
+  /** When set, applies room-level posting manners (daily cap, quiet time, daytime hours). */
+  roomRules?: RoomPostingRules | ((roomId: string) => RoomPostingRules | undefined);
   nowMs?: () => number;
 }
 
@@ -258,6 +304,16 @@ export class ProactiveBroadcastScheduler {
             updateKey: item.updateKey,
             reason: 'agent_only_recent_messages',
           });
+          continue;
+        }
+      }
+
+      const rules =
+        typeof this.opts.roomRules === 'function' ? this.opts.roomRules(item.roomId) : this.opts.roomRules;
+      if (rules) {
+        const block = roomPostingBlock(history, nowMs, rules);
+        if (block) {
+          result.skipped.push({ roomId: item.roomId, updateKey: item.updateKey, reason: block });
           continue;
         }
       }

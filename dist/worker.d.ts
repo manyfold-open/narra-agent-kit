@@ -1,6 +1,7 @@
-import { type BroadcastScheduleResult } from './broadcast.js';
+import { type BroadcastScheduleResult, type RoomPostingRules } from './broadcast.js';
 import { type RecallTurnResult } from './memory.js';
 import type { AgentSpec, AgentUpdateItem, InboundEvent, LangCode, RoomContext, RoomMemberInfo, TriageDecision, TriageModel } from './types.js';
+import { type WakeGateOptions } from './v2/gate.js';
 export declare const NARRA_GATEWAY_STATE_SCHEMA = "\nCREATE TABLE IF NOT EXISTS narra_gateway_state (\n  agent_id TEXT PRIMARY KEY,\n  last_broadcast_iso TEXT NOT NULL,\n  updated_at TEXT NOT NULL\n);\n";
 export interface NarraGatewayEnv {
     DB?: D1Database;
@@ -37,6 +38,22 @@ export interface NarraGatewayEnv {
      * question that no agent claims still gets one answer. Anything else keeps the keyword-gated triage.
      */
     NARRA_GROUP_TRIAGE?: string;
+    /** `v1` (default) | `shadow` | `v2`: which turn pipeline runs (see src/v2/pipeline.ts). */
+    NARRA_PIPELINE?: string;
+    /** Comma-separated room ids that `shadow`/`v2` apply to; empty = every room. */
+    NARRA_PIPELINE_ROOMS?: string;
+    /** v2: default reply mode for rooms that never chose one (`ambient` | `mention` | `quiet`). */
+    NARRA_V2_DEFAULT_MODE?: string;
+    /** v2: relevance (0..1) needed to wake on an unaddressed group message. */
+    NARRA_WAKE_THRESHOLD?: string;
+    /** v2: Workers AI embedding model for relevance scoring. */
+    NARRA_EMBEDDING_MODEL?: string;
+    /** v2: max relevance-scoring calls per agent per UTC day; after that the agent answers only when addressed. */
+    NARRA_DAILY_RELEVANCE_LIMIT?: string;
+    /** Scheduled posts per room per local day, across all agents (default 3). */
+    NARRA_ROOM_DAILY_POSTS?: string;
+    /** `on` applies room posting manners to every room, not only shadow/v2 rooms. */
+    NARRA_ROOM_POSTING_RULES?: string;
 }
 export interface NarraA2ACredentialResult {
     url: string;
@@ -69,6 +86,19 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
     enableA2AFailureReply?: boolean;
     /** Custom failure apology text when `enableA2AFailureReply` is enabled or a thinking bubble was already posted. */
     a2aFailureReply?: (lang: LangCode, event: InboundEvent) => string;
+    /** Chat-native (v2) pipeline settings. */
+    v2?: {
+        /** Example requests this agent is good at, in any language; sharpen relevance scoring. */
+        wakeExamples?: string[];
+        gate?: Partial<WakeGateOptions>;
+        /** Timeout for the Manyfold brain call (default 25s). */
+        brainTimeoutMs?: number;
+        /**
+         * Deterministic safety replies that must not depend on the brain (e.g. crisis resources).
+         * Runs on every woken turn before Manyfold; a non-null result is posted as the reply.
+         */
+        safetyReply?: (env: TEnv, event: InboundEvent, context: RoomContext) => Promise<string | null> | string | null;
+    };
     /** Injectable clock for deterministic testing. */
     now?: () => number;
     /** Injectable sleep for deterministic testing. */
@@ -92,6 +122,17 @@ export type NarraMatrixOp = {
     roomId: string;
     typing: boolean;
     timeoutMs?: number;
+} | {
+    op: 'react';
+    roomId: string;
+    eventId: string;
+    key: string;
+    txnId?: string;
+} | {
+    op: 'redact';
+    roomId: string;
+    eventId: string;
+    txnId?: string;
 } | {
     op: 'receipt';
     roomId: string;
@@ -157,6 +198,8 @@ export declare function createDefaultTriageModel(env: NarraGatewayEnv): TriageMo
  * talking to each other: rank by hash of (event, agent). Returns this agent's rank.
  */
 export declare function groupFallbackRank(eventId: string, selfMatrixId: string, members: RoomMemberInfo[]): number;
+/** Room posting manners for scheduled posts: on for shadow/v2 rooms, or everywhere with NARRA_ROOM_POSTING_RULES=on. */
+export declare function roomPostingRulesFor(env: NarraGatewayEnv | undefined | null, roomId: string): RoomPostingRules | undefined;
 /**
  * Returns `true` ONLY when BOTH `NARRA_GATEWAY_ENABLED` is `'on'` AND `NARRA_AGENT_TOKEN` is non-empty.
  */
@@ -287,6 +330,15 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
     private resolveGroupFallback;
     private tryFastRespond;
     private hasLivePeerRepliedAfter;
+    private v2Mode;
+    private v2Budget;
+    private v2Gate;
+    private describeGate;
+    /** Shadow mode: log what v2 would do with this turn, next to v1's decision. No brain call. */
+    private logShadowV2;
+    private releaseV2Claim;
+    private recordOwnReply;
+    private runTurnV2;
     private buildRoomContextForTurn;
     alarm(): Promise<void>;
 }
