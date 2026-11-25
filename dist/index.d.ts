@@ -17,4 +17,5 @@ export * from './v2/relevance.js';
 export * from './v2/actions.js';
 export * from './v2/budget.js';
 export * from './v2/pipeline.js';
+export * from './v2/stream.js';
 //# sourceMappingURL=index.d.ts.map

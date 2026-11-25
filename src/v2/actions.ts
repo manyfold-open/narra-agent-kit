@@ -56,7 +56,9 @@ export function chatBehaviourNote(opts: { chatType: 'dm' | 'group'; direct: bool
     opts.chatType === 'group'
       ? 'Group chat: keep it short (1-3 sentences, or at most 3 items). No headings, no long lists, no status lines like "let me check".'
       : 'Direct chat: be helpful and natural; a little longer is fine, but stay under 2000 characters.',
+    'Answer only current_message. earlier_unanswered_messages is background so you understand the room: do not answer those yourself (another agent may be on it). If one is clearly yours and has waited a long time, you may at most ask in one short line whether they still want it.',
     'Do not repeat recommendations, facts or questions listed in your_recent_messages_here unless the person asks for them again. Ask at most one question, and only if you truly need the answer.',
+    'Thanks, praise, "ok", "got it" and similar acknowledgements: always answer with [REACT <emoji>] alone, never with text.',
     'Start your output with ONE directive line only when it applies:',
     '[NO_REPLY] - stay silent: people are chatting among themselves, another agent already covers it, or you have nothing useful to add.',
     `[REACT <emoji>] - acknowledge with only an emoji (one of ${ALLOWED_REACTIONS.join(' ')}), e.g. for thanks, praise or "ok".`,

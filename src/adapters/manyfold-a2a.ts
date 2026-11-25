@@ -321,6 +321,15 @@ export function applyA2AResult(acc: StreamAccumulator, raw: unknown): void {
   }
 }
 
+/** The answer text streamed so far (artifacts or a direct message), never status/progress text. */
+function streamedAnswerText(acc: StreamAccumulator): string {
+  const artifactText = acc.order
+    .map((id) => acc.artifacts.get(id) ?? '')
+    .filter(Boolean)
+    .join('\n\n');
+  return (artifactText || acc.directText).trim();
+}
+
 export function snapshotFromAccumulator(acc: StreamAccumulator): StreamSnapshot {
   const artifactText = acc.order
     .map((id) => acc.artifacts.get(id) ?? '')
@@ -351,6 +360,8 @@ export interface RunA2AOptions {
   fetchImpl?: typeof fetch;
   /** Optional callback fired when SSE streams intermediate progress text. */
   onProgress?: (progressText: string) => void;
+  /** Optional callback with the answer text received so far, each time it grows (streaming replies). */
+  onText?: (textSoFar: string) => void;
 }
 
 export interface RunA2ATurnResult {
@@ -464,6 +475,7 @@ export async function runManyfoldA2ATurnWithMeta(options: RunA2AOptions): Promis
     let buffer = '';
     let received = false;
     let lastProgress = '';
+    let lastAnswer = '';
 
     try {
       while (true) {
@@ -490,6 +502,17 @@ export async function runManyfoldA2ATurnWithMeta(options: RunA2AOptions): Promis
             if (!snap.terminal && snap.progressText && snap.progressText !== lastProgress) {
               lastProgress = snap.progressText;
               options.onProgress?.(snap.progressText);
+            }
+            if (!snap.terminal && options.onText) {
+              const answerSoFar = streamedAnswerText(acc);
+              if (answerSoFar && answerSoFar !== lastAnswer) {
+                lastAnswer = answerSoFar;
+                try {
+                  options.onText(answerSoFar);
+                } catch {
+                  // A display callback must never break the turn.
+                }
+              }
             }
             if (snap.terminal) {
               if (snap.state && !['completed', 'input-required'].includes(snap.state)) {

@@ -149,7 +149,7 @@ export function buildLedgerSummary(input) {
     }
     const open = unansweredHumanMessages(history, nowMs).filter((t) => t.eventId !== event.eventId).slice(-4);
     if (open.length > 0) {
-        fields.other_unanswered_messages = open
+        fields.earlier_unanswered_messages = open
             .map((t) => `- ${nameOf(t.senderId, members, history)}: ${clip(t.text, 120)}`)
             .join('\n');
     }
