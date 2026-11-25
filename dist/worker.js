@@ -110,18 +110,22 @@ function extractWorkersAiText(rawOutput) {
     }
     return '';
 }
-async function runWorkersAiResilienceFallback(ai, modelName, spec, envelope, lang, wantsSummary) {
+async function runWorkersAiResilienceFallback(ai, modelName, spec, envelope, lang, wantsSummary, 
+/** BCP-47 code when the message is in a language other than zh/en (decision.replyLang). */
+foreignLang) {
     const binding = ai && typeof ai.run === 'function'
         ? ai
         : null;
     if (!binding)
         return null;
     const model = modelName?.trim() || DEFAULT_WORKERS_AI_TRIAGE_MODEL;
-    const langLabel = lang === 'zh-Hant'
-        ? 'Traditional Chinese (繁體中文)'
-        : lang === 'zh-Hans'
-            ? 'Simplified Chinese (简体中文)'
-            : 'English';
+    const langLabel = foreignLang
+        ? `the language of the user's message (${foreignLang}), not Chinese or English`
+        : lang === 'zh-Hant'
+            ? 'Traditional Chinese (繁體中文)'
+            : lang === 'zh-Hans'
+                ? 'Simplified Chinese (简体中文)'
+                : 'English';
     const systemPrompt = [
         `You are "${spec.name}" replying in a Narra Messenger chat.`,
         `Your domain: ${spec.domainDescription}`,
@@ -2366,7 +2370,7 @@ export class BaseNarraRoomCoordinator {
                                 // seamlessly fall back to Workers AI using the exact same pre-fetched envelope so the user
                                 // never hangs staring at a stuck progress bubble during an upstream Manyfold outage.
                                 if (isCommittedTurn && cfg.enableA2AFailureReply === true && this.env.AI) {
-                                    const backup = await runWorkersAiResilienceFallback(this.env.AI, this.env.AI_TRIAGE_MODEL, effectiveSpec, envelope, decision.detectedLang, wantsSummary);
+                                    const backup = await runWorkersAiResilienceFallback(this.env.AI, this.env.AI_TRIAGE_MODEL, effectiveSpec, envelope, decision.detectedLang, wantsSummary, foreignReplyLang);
                                     if (backup) {
                                         rawAnswer = backup;
                                     }

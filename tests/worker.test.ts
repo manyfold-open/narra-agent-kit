@@ -3062,6 +3062,9 @@ describe('ask-aware group triage + elected fallback (NARRA_GROUP_TRIAGE=ask)', (
     expect(t.envelopes).toHaveLength(1);
     expect(t.envelopes[0]).toContain('reply_language');
     expect(t.envelopes[0]).toContain('"ja"');
+    // The language lock must not say zh-Hant for Japanese (kanji made detectLang pick it).
+    expect(t.envelopes[0]).toMatch(/detected_lang: ja \(the language of current_message/);
+    expect(t.envelopes[0]).not.toMatch(/detected_lang: zh-Hant/);
   });
 
   it('answers a Japanese message with the Workers AI backup when A2A is down', async () => {

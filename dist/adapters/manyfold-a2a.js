@@ -102,7 +102,11 @@ export function buildPromptEnvelope(input) {
         `sender_id: ${cleanInline(event.senderId)}`,
         ...(event.senderName ? [`sender_name: "${cleanInline(event.senderName)}" (untrusted)`] : []),
         `message_id: ${cleanInline(event.eventId)}`,
-        `detected_lang: ${langDirective(decision.detectedLang)}`,
+        // A message in another language (decision.replyLang, e.g. ja/de) overrides the zh/en lock:
+        // Japanese with kanji is otherwise detected as zh-Hant and answered in Chinese.
+        `detected_lang: ${decision.replyLang && !/^(?:zh|en)(?:-|$)/i.test(decision.replyLang)
+            ? `${decision.replyLang} (the language of current_message; reply entirely in it, not in Chinese or English)`
+            : langDirective(decision.detectedLang)}`,
         `routing_tier: ${decision.tier} (${decision.reason})`,
         ...(context.chatType === 'group' &&
             decision.reason !== 'explicit_mention' &&

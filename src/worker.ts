@@ -362,6 +362,8 @@ async function runWorkersAiResilienceFallback(
   envelope: string,
   lang: LangCode,
   wantsSummary: boolean,
+  /** BCP-47 code when the message is in a language other than zh/en (decision.replyLang). */
+  foreignLang?: string,
 ): Promise<string | null> {
   const binding =
     ai && typeof (ai as { run?: unknown }).run === 'function'
@@ -379,8 +381,9 @@ async function runWorkersAiResilienceFallback(
   if (!binding) return null;
 
   const model = modelName?.trim() || DEFAULT_WORKERS_AI_TRIAGE_MODEL;
-  const langLabel =
-    lang === 'zh-Hant'
+  const langLabel = foreignLang
+    ? `the language of the user's message (${foreignLang}), not Chinese or English`
+    : lang === 'zh-Hant'
       ? 'Traditional Chinese (繁體中文)'
       : lang === 'zh-Hans'
         ? 'Simplified Chinese (简体中文)'
@@ -3048,6 +3051,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                     envelope,
                     decision.detectedLang,
                     wantsSummary,
+                    foreignReplyLang,
                   );
                   if (backup) {
                     rawAnswer = backup;
