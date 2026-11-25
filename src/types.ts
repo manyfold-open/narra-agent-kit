@@ -142,6 +142,9 @@ export interface TriageDecision {
   /** Set by an ask-aware triage model: the message is a real question/request to the group,
    *  whoever ends up answering it. Lets agents make sure such a message never goes unanswered. */
   isAsk?: boolean;
+  /** BCP-47 code of the message when it is neither Chinese nor English (e.g. `ja`, `es`, `de`):
+   *  zh/en templates can't answer it, so the reply goes through A2A in that language. */
+  replyLang?: string;
 }
 
 export type MemoryScope = 'user' | 'room';
@@ -177,12 +180,14 @@ export interface AgentUpdateItem {
 
 export interface TriageModel {
   name?: string;
+  /** Returns `ask` (question vs statement/chatter): routing also consults it inside an active session. */
+  askAware?: boolean;
   score(input: {
     event: InboundEvent;
     context: RoomContext;
     spec: AgentSpec;
     detectedLang: LangCode;
-  }): Promise<{ score: number; reason?: string; ask?: boolean }>;
+  }): Promise<{ score: number; reason?: string; ask?: boolean; lang?: string }>;
 }
 
 export interface FastPathModel {

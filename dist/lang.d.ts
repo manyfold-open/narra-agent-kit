@@ -26,4 +26,12 @@ export declare function detectLang(text: string, userHint?: LangCode, roomHint?:
 export declare function detectExplicitLangSwitch(text: string): LangCode | null;
 /** Converts Simplified Chinese prose into pure Traditional Chinese with phrase disambiguation. */
 export declare function toZhHant(text: string): string;
+/**
+ * BCP-47 code of `text` when it is clearly neither Chinese nor English, else null. Script-based for
+ * non-Latin writing (kana wins over Han, so Japanese with kanji is `ja`); for Latin script, common
+ * function words of es/fr/de/it/pt/nl must clearly outnumber English ones. Mentions are not stripped.
+ */
+export declare function detectForeignLanguage(text: string): string | null;
+/** True for codes the zh/en templates already answer in. */
+export declare function isZhOrEn(code: string | undefined | null): boolean;
 //# sourceMappingURL=lang.d.ts.map

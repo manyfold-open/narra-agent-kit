@@ -20,7 +20,7 @@ import {
   sanitizeMobileLinks,
   stripLeakedNotes,
 } from './guard.js';
-import { detectExplicitLangSwitch, detectLang, stripAgentMentions } from './lang.js';
+import { detectExplicitLangSwitch, detectLang, isZhOrEn, stripAgentMentions } from './lang.js';
 import {
   MemoryStore,
   handleStandardMemoryCommand,
@@ -2882,7 +2882,16 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
               }
             }
 
-            if (!handledFast && !skipFast && cfg.fastRespond && decision.reason !== 'group_fallback') {
+            // fastRespond templates speak zh/en only: a message in another language goes to A2A,
+            // which gets the same prefetched records and can answer in the asker's language.
+            const foreignReplyLang = decision.replyLang && !isZhOrEn(decision.replyLang) ? decision.replyLang : undefined;
+            if (
+              !handledFast &&
+              !skipFast &&
+              cfg.fastRespond &&
+              decision.reason !== 'group_fallback' &&
+              !foreignReplyLang
+            ) {
               try {
                 const fast = await cfg.fastRespond(
                   this.env,
@@ -2963,6 +2972,12 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
               const envelopeFields = {
                 ...(extraFields ?? {}),
                 ...(decision.reason === 'group_fallback' ? { routing_note: GROUP_FALLBACK_NOTE } : {}),
+                ...(foreignReplyLang
+                  ? {
+                      reply_language: foreignReplyLang,
+                      reply_language_note: `The message is in "${foreignReplyLang}". Reply entirely in that language, keeping names, links and addresses as they are.`,
+                    }
+                  : {}),
               };
               const envelope = buildPromptEnvelope({
                 event: nextTurn.event,
