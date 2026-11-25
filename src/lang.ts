@@ -631,6 +631,46 @@ export function toZhHant(text: string): string {
 }
 
 
+let hansTables: { phrases: Array<readonly [string, string]>; chars: Record<string, string> } | null = null;
+
+function zhHansTables(): { phrases: Array<readonly [string, string]>; chars: Record<string, string> } {
+  if (hansTables) return hansTables;
+  const chars: Record<string, string> = {};
+  for (const [hans, hant] of Object.entries(ZH_HANT_CHARS)) {
+    if (hans !== hant && !(hant in chars)) chars[hant] = hans;
+  }
+  const phrases = ZH_HANT_PHRASES.filter(([hans, hant]) => hans !== hant)
+    .map(([hans, hant]) => [hant, hans] as const)
+    .sort((a, b) => b[0].length - a[0].length);
+  hansTables = { phrases, chars };
+  return hansTables;
+}
+
+/** Converts Traditional Chinese prose into Simplified Chinese (the reverse of `toZhHant`). */
+export function toZhHans(text: string): string {
+  const { phrases, chars } = zhHansTables();
+  const input = text ?? '';
+  let out = '';
+  let i = 0;
+  while (i < input.length) {
+    let matched = false;
+    for (const [src, dst] of phrases) {
+      if (input.startsWith(src, i)) {
+        out += dst;
+        i += src.length;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      const ch = input[i];
+      out += chars[ch] ?? ch;
+      i += 1;
+    }
+  }
+  return out;
+}
+
 const FOREIGN_SCRIPTS: Array<[RegExp, string]> = [
   [/[\p{Script=Hiragana}\p{Script=Katakana}]/u, 'ja'],
   [/\p{Script=Hangul}/u, 'ko'],

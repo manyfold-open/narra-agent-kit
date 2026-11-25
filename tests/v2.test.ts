@@ -13,6 +13,9 @@ import {
   peerClaimHolder,
   shouldFlushStream,
   streamableText,
+  replyLanguageFor,
+  matchScript,
+  toZhHans,
   pipelineForRoom,
   roomPostingBlock,
   runSchemaStatements,
@@ -98,6 +101,26 @@ describe('v2 brain output', () => {
     // A reaction with text: the text wins; an unknown emoji is never sent.
     expect(parseBrainOutput('[REACT ❤️]\n不客氣！')).toEqual({ kind: 'reply', text: '不客氣！' });
     expect(parseBrainOutput('[REACT 🦄]')).toEqual({ kind: 'silent' });
+  });
+});
+
+describe('v2 reply language', () => {
+  it('answers zh-Hant in zh-Hant, zh-Hans in zh-Hans, English in English, anything else in English', () => {
+    expect(replyLanguageFor('今天有什麼 AI 新聞？')).toBe('zh-Hant');
+    expect(replyLanguageFor('今天有什么 AI 新闻？')).toBe('zh-Hans');
+    expect(replyLanguageFor('any AI news today?')).toBe('en');
+    expect(replyLanguageFor('今日のAIニュースは？')).toBe('en');
+    expect(replyLanguageFor('¿Qué noticias de IA hay hoy para nosotros?')).toBe('en');
+    expect(replyLanguageFor('오늘 AI 뉴스 있어?')).toBe('en');
+    // The agent's own name does not decide the language.
+    expect(replyLanguageFor('@AI in 5 有啥新聞', { mentionNames: ['AI in 5'] })).toBe('zh-Hant');
+  });
+
+  it('puts Chinese replies into the asker\'s script', () => {
+    expect(toZhHans('今天還是第 39 期，三條要聞')).toBe('今天还是第 39 期，三条要闻');
+    expect(matchScript('三条要闻', 'zh-Hant')).toBe('三條要聞');
+    expect(matchScript('三條要聞', 'zh-Hans')).toBe('三条要闻');
+    expect(matchScript('Three stories', 'en')).toBe('Three stories');
   });
 });
 
@@ -565,5 +588,20 @@ describe('v2 pipeline end to end', () => {
     await t.runAlarmsFor(10_000);
     expect(t.envelopes[0]).toContain('Answer only current_message');
     expect(t.envelopes[0]).toContain('always answer with [REACT <emoji>] alone');
+  });
+
+  it('tells the brain the reply language and fixes the script if it drifts', async () => {
+    const t = setup('今天還是第 39 期，三條要聞。');
+    await t.post([t.msg('$q', '@AI in 5 今天有什么新闻', ZACK, { 'm.mentions': { user_ids: [NEWS] } })]);
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes[0]).toContain('Write your reply in Simplified Chinese');
+    expect(t.sent.at(-1)?.body.body).toBe('今天还是第 39 期，三条要闻。');
+  });
+
+  it('answers other languages in English', async () => {
+    const t = setup('Today: three AI stories.');
+    await t.post([t.msg('$q', '@AI in 5 今日のAIニュースは？', ZACK, { 'm.mentions': { user_ids: [NEWS] } })]);
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes[0]).toContain('Write your reply in English');
   });
 });

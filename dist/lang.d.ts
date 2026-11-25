@@ -26,6 +26,8 @@ export declare function detectLang(text: string, userHint?: LangCode, roomHint?:
 export declare function detectExplicitLangSwitch(text: string): LangCode | null;
 /** Converts Simplified Chinese prose into pure Traditional Chinese with phrase disambiguation. */
 export declare function toZhHant(text: string): string;
+/** Converts Traditional Chinese prose into Simplified Chinese (the reverse of `toZhHant`). */
+export declare function toZhHans(text: string): string;
 /**
  * BCP-47 code of `text` when it is clearly neither Chinese nor English, else null. Script-based for
  * non-Latin writing (kana wins over Han, so Japanese with kanji is `ja`); for Latin script, common

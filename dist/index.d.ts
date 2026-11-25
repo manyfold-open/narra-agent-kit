@@ -18,4 +18,5 @@ export * from './v2/actions.js';
 export * from './v2/budget.js';
 export * from './v2/pipeline.js';
 export * from './v2/stream.js';
+export * from './v2/language.js';
 //# sourceMappingURL=index.d.ts.map

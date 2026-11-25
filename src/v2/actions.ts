@@ -49,10 +49,12 @@ export function parseBrainOutput(raw: string): BrainAction {
 }
 
 /** Instructions sent with every v2 turn. English on purpose: the brain replies in the user's language. */
-export function chatBehaviourNote(opts: { chatType: 'dm' | 'group'; direct: boolean }): string {
+export function chatBehaviourNote(opts: { chatType: 'dm' | 'group'; direct: boolean; replyLanguage?: string }): string {
   const lines = [
     'You are a member of a Narra Messenger chat where humans and AI agents talk together. Behave like a thoughtful person in a messenger, not like a website or a support bot.',
-    'Reply in the language and script of the person you answer (Traditional vs Simplified Chinese matters).',
+    opts.replyLanguage
+      ? `Write your reply in ${opts.replyLanguage}, the language of current_message, even if earlier messages, your data or your instructions use another language. Traditional and Simplified Chinese are different: never mix them.`
+      : 'Reply in the language and script of the person you answer (Traditional vs Simplified Chinese matters).',
     opts.chatType === 'group'
       ? 'Group chat: keep it short (1-3 sentences, or at most 3 items). No headings, no long lists, no status lines like "let me check".'
       : 'Direct chat: be helpful and natural; a little longer is fine, but stay under 2000 characters.',
