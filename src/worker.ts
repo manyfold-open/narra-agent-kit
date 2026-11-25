@@ -230,7 +230,24 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
      * Deterministic safety replies that must not depend on the brain (e.g. crisis resources).
      * Runs on every woken turn before Manyfold; a non-null result is posted as the reply.
      */
-    safetyReply?: (env: TEnv, event: InboundEvent, context: RoomContext) => Promise<string | null> | string | null;
+    safetyReply?: (
+      env: TEnv,
+      event: InboundEvent,
+      context: RoomContext,
+      info: { replyLang: LangCode },
+    ) => Promise<string | null> | string | null;
+    /**
+     * Crisis replies (e.g. self-harm resources): checked on EVERY human message before the wake gate,
+     * so they are never skipped because a message looked unrelated to this agent. In a group, when the
+     * message is not addressed to this agent, agents wait a short, different time and only the first
+     * one answers. Return null for anything that is not a crisis. Not for ordinary commands.
+     */
+    crisisReply?: (
+      env: TEnv,
+      event: InboundEvent,
+      context: RoomContext,
+      info: { replyLang: LangCode },
+    ) => Promise<string | null> | string | null;
   };
   /** Injectable clock for deterministic testing. */
   now?: () => number;
@@ -339,6 +356,8 @@ interface PendingTurn {
   v2ClaimEventId?: string;
   /** v2: the reply message shown while the brain was still writing (later text arrives as edits). */
   v2StreamEventId?: string;
+  /** v2: crisis reply waiting for its turn ('' = checked, not a crisis). */
+  v2CrisisText?: string;
 }
 
 /** A real question nobody claimed: the first elected agent answers after this long... */
@@ -2748,6 +2767,52 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     const mode = this.v2Mode(state, context);
 
     let decision = turn.v2Decision;
+    const mentionNamesForLang = [spec.name, ...(spec.aliases ?? []), ...context.members.flatMap((m) => (m.displayName ? [m.displayName] : []))];
+    const replyLangForHooks = replyLanguageFor(turn.event.text ?? '', {
+      mentionNames: mentionNamesForLang,
+      ...(context.userLanguageHint ? { userHint: context.userLanguageHint } : {}),
+      ...(context.roomLanguageHint ? { roomHint: context.roomLanguageHint } : {}),
+    });
+
+    // Crisis first: before relevance, so it is never skipped because the message looked unrelated.
+    const fromHuman =
+      turn.event.senderId !== spec.matrixId &&
+      !isNarraAgent(turn.event.senderId) &&
+      (turn.event.kind === 'text' || turn.event.kind === 'voice' || turn.event.kind === 'compound');
+    if (!decision && fromHuman && cfg.v2?.crisisReply && turn.v2CrisisText !== '') {
+      const addressed =
+        context.chatType === 'dm' || isSelfMentioned(turn.event, spec) || Boolean(context.replyToTarget?.isSelf);
+      let crisis = turn.v2CrisisText;
+      if (crisis === undefined) {
+        crisis =
+          (await Promise.resolve(cfg.v2.crisisReply(this.env, turn.event, context, { replyLang: replyLangForHooks })).catch(
+            () => null,
+          )) ?? '';
+        if (crisis && !addressed) {
+          // Several agents may know crisis resources: wait a different short time, first one answers.
+          const wait = 300 + Math.round(hashFraction(`crisis:${turn.event.eventId}:${spec.matrixId ?? spec.id}`) * 3_000);
+          await this.updatePendingTurn({ ...turn, v2CrisisText: crisis, dueAtMs: nowMs + wait });
+          return;
+        }
+      }
+      if (crisis) {
+        const peer = addressed ? undefined : peerAnswered(context.recentHistory, eventIds, spec.matrixId);
+        if (peer) {
+          await appendDoLog(this.ctx.storage, `v2 crisis yield ${turn.event.eventId}: answered by ${peer}`, nowMs, this.env);
+          await this.removePendingTurn(turn.event.eventId);
+          return;
+        }
+        const quote = context.chatType === 'group' ? await this.computeShouldQuote(turn.event, context.chatType) : false;
+        const replyTo = quote ? turn.event.eventId : undefined;
+        const posted = await this.postReplyToRoom(roomId, crisis, `crisis:${turn.event.eventId}`, spec.matrixId, replyTo, turn.event.eventId);
+        await this.recordOwnReply(turn, spec, crisis, posted.eventId, replyTo);
+        await appendDoLog(this.ctx.storage, `v2 crisis reply ${turn.event.eventId}`, this.nowMs(), this.env);
+        await this.removePendingTurn(turn.event.eventId);
+        return;
+      }
+      turn.v2CrisisText = '';
+    }
+
     if (!decision) {
       const gated = await this.v2Gate(turn.event, context, spec, mode, nowMs);
       decision = gated.decision;
@@ -2790,7 +2855,9 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         }
       }
 
-      const safety = cfg.v2?.safetyReply ? await Promise.resolve(cfg.v2.safetyReply(this.env, turn.event, context)).catch(() => null) : null;
+      const safety = cfg.v2?.safetyReply
+        ? await Promise.resolve(cfg.v2.safetyReply(this.env, turn.event, context, { replyLang: replyLangForHooks })).catch(() => null)
+        : null;
       if (safety) {
         const posted = await this.postReplyToRoom(roomId, safety, turn.event.eventId, spec.matrixId, undefined, turn.event.eventId);
         await this.recordOwnReply(turn, spec, safety, posted.eventId);

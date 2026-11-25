@@ -97,7 +97,18 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
          * Deterministic safety replies that must not depend on the brain (e.g. crisis resources).
          * Runs on every woken turn before Manyfold; a non-null result is posted as the reply.
          */
-        safetyReply?: (env: TEnv, event: InboundEvent, context: RoomContext) => Promise<string | null> | string | null;
+        safetyReply?: (env: TEnv, event: InboundEvent, context: RoomContext, info: {
+            replyLang: LangCode;
+        }) => Promise<string | null> | string | null;
+        /**
+         * Crisis replies (e.g. self-harm resources): checked on EVERY human message before the wake gate,
+         * so they are never skipped because a message looked unrelated to this agent. In a group, when the
+         * message is not addressed to this agent, agents wait a short, different time and only the first
+         * one answers. Return null for anything that is not a crisis. Not for ordinary commands.
+         */
+        crisisReply?: (env: TEnv, event: InboundEvent, context: RoomContext, info: {
+            replyLang: LangCode;
+        }) => Promise<string | null> | string | null;
     };
     /** Injectable clock for deterministic testing. */
     now?: () => number;
