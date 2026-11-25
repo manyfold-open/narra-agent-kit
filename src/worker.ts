@@ -3275,7 +3275,9 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         await this.ctx.storage.delete('lastError');
         await appendDoLog(
           this.ctx.storage,
-          `answered ${nextTurn.event.eventId} (quote=${quoteNow})`,
+          `answered ${nextTurn.event.eventId} (quote=${quoteNow}${
+            (nextTurn.decision ?? decision)?.reason ? `, ${(nextTurn.decision ?? decision)!.reason}` : ''
+          })`,
           repliedAtMs,
           this.env,
         );

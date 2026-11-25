@@ -63,6 +63,20 @@ describe('statements inside an active session (ask-aware triage)', () => {
     expect(d).toMatchObject({ shouldReply: false, reason: 'active_session_not_ask', isAsk: false });
   });
 
+  it('answers a new question in its own domain mid-session even without a keyword (Covent Garden tonight)', async () => {
+    const roomWithPeer = {
+      ...context,
+      members: [{ matrixId: '@agent-3add8bb6:matrix.netmind.chat', displayName: 'AI in 5', isAgent: true }],
+    } as unknown as RoomContext;
+    const d = await routeEvent(event('Is there anything fun near Covent Garden tonight?'), roomWithPeer, spec, {
+      nowMs: NOW,
+      triageModel: model(true),
+    });
+    expect(d).toMatchObject({ shouldReply: true, reason: 'active_session' });
+    const chatter = await routeEvent(event('haha nice one'), roomWithPeer, spec, { nowMs: NOW, triageModel: model(false) });
+    expect(chatter.shouldReply).toBe(false);
+  });
+
   it('still answers a follow-up question in the session', async () => {
     const d = await routeEvent(event('還有別家火鍋嗎'), context, spec, { nowMs: NOW, triageModel: model(true) });
     expect(d).toMatchObject({ shouldReply: true, reason: 'active_session' });

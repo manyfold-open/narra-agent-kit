@@ -1436,7 +1436,9 @@ async function routeEventCore(
             shouldQuote: false,
           };
         }
-        if (!isGenuineFollowUp) {
+        // Keyword-free follow-ups ("anything fun near Covent Garden tonight?") are judged by the
+        // ask-aware model below; only the keyword triage needs the follow-up phrase list.
+        if (!isGenuineFollowUp && !options.triageModel?.askAware) {
           return {
             shouldReply: false,
             tier: 0,

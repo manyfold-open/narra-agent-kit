@@ -2540,7 +2540,7 @@ export class BaseNarraRoomCoordinator {
                     }
                 });
                 await this.ctx.storage.delete('lastError');
-                await appendDoLog(this.ctx.storage, `answered ${nextTurn.event.eventId} (quote=${quoteNow})`, repliedAtMs, this.env);
+                await appendDoLog(this.ctx.storage, `answered ${nextTurn.event.eventId} (quote=${quoteNow}${(nextTurn.decision ?? decision)?.reason ? `, ${(nextTurn.decision ?? decision).reason}` : ''})`, repliedAtMs, this.env);
                 await this.removePendingTurn(nextTurn.event.eventId);
             }
             catch (error) {
