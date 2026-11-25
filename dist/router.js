@@ -5,6 +5,7 @@ export const DEFAULT_SESSION_WINDOW_MS = 3 * 60_000;
 export const DEFAULT_STALE_GROUP_MS = 15 * 60_000;
 export const DEFAULT_SILENCE_THRESHOLD = 0.55;
 export const DEFAULT_YIELD_DELAY_MS = 1_800;
+export const ASK_AWARE_YIELD_BASE_MS = 4_000;
 export const DEFAULT_UNMENTIONED_COOLDOWN_MS = 30_000;
 export const DEFAULT_WORKERS_AI_TRIAGE_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 export const AGENT_CHAIN_CAP = 6;
@@ -1205,7 +1206,12 @@ async function routeEventCore(event, context, spec, options = {}) {
     }
     const triageSource = independentGroupReply ? 'fast_path' : options.triageModel ? 'model' : 'heuristic';
     if (score >= effectiveThreshold) {
-        const baseYieldMs = spec.politeYieldDelayMs ?? DEFAULT_YIELD_DELAY_MS;
+        // Ask-aware triage scores every agent in the room independently, so several can claim the same
+        // question. Spread the waits out (top fit ~2 s, mid ~4 s, low ~7 s) so the best fit's
+        // immediate status bubble (worker.ts) lands before the others check whether a peer has answered.
+        const baseYieldMs = options.triageModel?.askAware
+            ? Math.max(ASK_AWARE_YIELD_BASE_MS, spec.politeYieldDelayMs ?? DEFAULT_YIELD_DELAY_MS)
+            : (spec.politeYieldDelayMs ?? DEFAULT_YIELD_DELAY_MS);
         const yieldDelayMs = isMultiAgentMention
             ? baseYieldMs
             : peers.length > 0
