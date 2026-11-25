@@ -62,6 +62,8 @@ export function messageContent(text, optionsOrSelfId = {}, replyToLegacy) {
         ...(opts.replyToEventId
             ? { 'm.relates_to': { 'm.in_reply_to': { event_id: opts.replyToEventId } } }
             : {}),
+        ...(opts.answersEventId ? { 'ai.narra.answers': { event_id: opts.answersEventId } } : {}),
+        ...(opts.broadcast ? { 'ai.narra.broadcast': true } : {}),
     };
 }
 /**

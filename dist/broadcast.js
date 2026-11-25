@@ -1,5 +1,6 @@
 import { runSchemaStatements } from './d1.js';
 import { isNarraAgent, isSilence, sanitizeMobileLinks } from './guard.js';
+import { detectLang } from './lang.js';
 export const NARRA_BROADCAST_SCHEMA = `
 CREATE TABLE IF NOT EXISTS narra_broadcast_log (
   agent_id TEXT NOT NULL,
@@ -87,6 +88,35 @@ export function hasOnlyTrailingAgentMessages(recentHistory, minAgentTail = 2) {
     return trailingAgents >= minAgentTail;
 }
 /**
+ * The language people in the room have been writing in: the most common of the last `sample`
+ * human messages (agents excluded). `null` when nobody has written yet.
+ */
+export function roomLanguage(recentHistory, sample = 10) {
+    const human = recentHistory
+        .filter((turn) => !turn.isAgent && !isNarraAgent(turn.senderId) && turn.text.trim())
+        .slice(-sample);
+    if (human.length === 0)
+        return null;
+    const counts = new Map();
+    for (const turn of human) {
+        const lang = detectLang(turn.text);
+        counts.set(lang, (counts.get(lang) ?? 0) + 1);
+    }
+    let best = null;
+    let bestCount = 0;
+    // Ties go to the most recent message's language.
+    for (const turn of [...human].reverse()) {
+        const lang = detectLang(turn.text);
+        const c = counts.get(lang) ?? 0;
+        if (c > bestCount) {
+            best = lang;
+            bestCount = c;
+        }
+    }
+    return best;
+}
+const ITEM_KEY_PREFIX = 'item:';
+/**
  * Staggered proactive update scheduler:
  * - Skips empty `updates` and empty/silent update text
  * - Strictly dedupes via stored `updateKey`
@@ -139,8 +169,9 @@ export class ProactiveBroadcastScheduler {
                 });
                 continue;
             }
+            let history = [];
             if (this.opts.getRecentHistory) {
-                const history = await this.opts.getRecentHistory(item.roomId);
+                history = await this.opts.getRecentHistory(item.roomId);
                 if (hasOnlyTrailingAgentMessages(history, 2)) {
                     result.skipped.push({
                         roomId: item.roomId,
@@ -162,6 +193,30 @@ export class ProactiveBroadcastScheduler {
                     continue;
                 }
             }
+            const itemKeys = [...new Set(item.itemKeys ?? [])];
+            const freshItemKeys = [];
+            for (const key of itemKeys) {
+                if (!(await this.opts.dedupeStore.hasSentKey(this.opts.agentId, item.roomId, ITEM_KEY_PREFIX + key))) {
+                    freshItemKeys.push(key);
+                }
+            }
+            if (itemKeys.length > 0 && freshItemKeys.length === 0) {
+                result.skipped.push({ roomId: item.roomId, updateKey: item.updateKey, reason: 'duplicate_items' });
+                continue;
+            }
+            let text = cleaned;
+            if (item.render) {
+                const lang = roomLanguage(history) ?? item.lang ?? 'en';
+                let rendered = '';
+                try {
+                    rendered = sanitizeMobileLinks(item.render(lang, itemKeys.length > 0 ? freshItemKeys : []));
+                }
+                catch {
+                    rendered = '';
+                }
+                if (rendered && !isSilence(rendered))
+                    text = rendered;
+            }
             const claimed = await this.opts.dedupeStore.claimUpdateKey(this.opts.agentId, item.roomId, item.updateKey, nowIso);
             if (!claimed) {
                 result.skipped.push({
@@ -172,8 +227,13 @@ export class ProactiveBroadcastScheduler {
                 continue;
             }
             try {
-                await this.opts.send(item, cleaned);
-                result.sent.push({ roomId: item.roomId, updateKey: item.updateKey, text: cleaned });
+                await this.opts.send(item, text);
+                result.sent.push({ roomId: item.roomId, updateKey: item.updateKey, text });
+                for (const key of freshItemKeys) {
+                    await this.opts.dedupeStore
+                        .claimUpdateKey(this.opts.agentId, item.roomId, ITEM_KEY_PREFIX + key, nowIso)
+                        .catch(() => false);
+                }
             }
             catch {
                 result.skipped.push({

@@ -39,6 +39,7 @@ import {
   executePoliteYield,
   hashFraction,
   hasPeerAnsweredTimeline,
+  peerSessionWithSender,
   hasPeerRepliedAfter,
   inspectRoomPeers,
   isChainExhaustedError,
@@ -1782,6 +1783,8 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     const subsequentEvents = findSubsequentHistory(recentHistory, event).map((h) => ({
       eventId: h.eventId,
       senderId: h.senderId,
+      ...(h.answersEventId ? { answersEventId: h.answersEventId } : {}),
+      ...(h.isBroadcast ? { isBroadcast: true } : {}),
     }));
 
     // If the trigger event's own coalesced ID includes the latestHumanEventId, check whether
@@ -1805,11 +1808,13 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     txnSeed: string,
     selfMatrixId: string | undefined,
     replyToEventId: string | undefined,
+    answersEventId?: string,
   ): Promise<{ eventId: string }> {
     const txnId = await deterministicTxnId(txnSeed);
     const content = messageContent(text, {
       selfMatrixId,
       replyToEventId,
+      ...(answersEventId ? { answersEventId } : {}),
     });
 
     if (isNarraSyncEnabled(this.env) && this.env.NARRA_SYNC_DO) {
@@ -1936,6 +1941,8 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         text: ev.text.slice(0, 600),
         timestampMs: ev.timestampMs,
         ...(ev.replyToEventId ? { replyToEventId: ev.replyToEventId } : {}),
+        ...(ev.answersEventId ? { answersEventId: ev.answersEventId } : {}),
+        ...(ev.isBroadcast ? { isBroadcast: true } : {}),
       });
     }
 
@@ -2220,6 +2227,8 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                 text: ev.text.slice(0, 1000),
                 timestampMs: ev.timestampMs,
                 ...(ev.replyToEventId ? { replyToEventId: ev.replyToEventId } : {}),
+                ...(ev.answersEventId ? { answersEventId: ev.answersEventId } : {}),
+                ...(ev.isBroadcast ? { isBroadcast: true } : {}),
               });
               messageCache[ev.eventId] = {
                 eventId: ev.eventId,
@@ -2247,6 +2256,8 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                 text: ev.text.slice(0, 1000),
                 timestampMs: ev.timestampMs,
                 ...(ev.replyToEventId ? { replyToEventId: ev.replyToEventId } : {}),
+                ...(ev.answersEventId ? { answersEventId: ev.answersEventId } : {}),
+                ...(ev.isBroadcast ? { isBroadcast: true } : {}),
               });
               messageCache[ev.eventId] = {
                 eventId: ev.eventId,
@@ -2410,6 +2421,12 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       'chain_cap_exhausted',
     ]);
     if (moot.has(routed.reason)) return { ...routed, shouldReply: false, reason: `fallback_moot:${routed.reason}` };
+    const storedHistory = (await this.ctx.storage.get<HistoryTurn[]>('recentHistory')) ?? [];
+    const seen = new Set(storedHistory.map((t) => t.eventId));
+    const timeline = [...storedHistory, ...context.recentHistory.filter((t) => !seen.has(t.eventId))];
+    if (peerSessionWithSender(turn.event, timeline, spec.matrixId)) {
+      return { ...routed, shouldReply: false, reason: 'fallback_moot:peer_session' };
+    }
     if (await this.hasLivePeerRepliedAfter(turn.event, context, spec.matrixId)) {
       return { ...routed, shouldReply: false, reason: 'fallback_not_needed' };
     }
@@ -2553,6 +2570,8 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     const subsequentEvents = findSubsequentHistory(recentHistory, turn.event).map((h) => ({
       eventId: h.eventId,
       senderId: h.senderId,
+      ...(h.answersEventId ? { answersEventId: h.answersEventId } : {}),
+      ...(h.isBroadcast ? { isBroadcast: true } : {}),
     }));
 
     const effectiveLatestHumanId =
@@ -2938,9 +2957,18 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
 
               // An unmentioned group question this agent claimed shows its status right away: the
               // other agents' polite yield sees it and stands down instead of answering too.
-              const claimedGroupAsk = decision.isAsk === true && context.chatType === 'group' && !isDirectTurn;
+              // An elected fallback is an agent outside its own topic: no themed status bubble for it,
+              // so if it ends up with nothing to say, nothing shows (the typing indicator still does).
+              const isFallbackTurn = decision.reason === 'group_fallback';
+              const claimedGroupAsk =
+                decision.isAsk === true && context.chatType === 'group' && !isDirectTurn && !isFallbackTurn;
               const thinkingDelayMs = claimedGroupAsk ? 0 : (cfg.thinkingDelayMs ?? DEFAULT_THINKING_DELAY_MS);
-              if (isCommittedTurn && (thinkingDelayMs > 0 || claimedGroupAsk) && !nextTurn.thinkingEventId) {
+              if (
+                isCommittedTurn &&
+                !isFallbackTurn &&
+                (thinkingDelayMs > 0 || claimedGroupAsk) &&
+                !nextTurn.thinkingEventId
+              ) {
                 const statusText = wantsSummary
                   ? defaultThinkingMessage(decision.detectedLang, true)
                   : (cfg.thinkingMessage?.(decision.detectedLang, nextTurn.event, decision) ??
@@ -2956,6 +2984,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                         `thinking:${nextTurn.event.eventId}`,
                         effectiveSpec.matrixId,
                         qNow ? nextTurn.event.eventId : undefined,
+                        nextTurn.event.eventId,
                       );
                       if (postedStatus.eventId) {
                         nextTurn.thinkingEventId = postedStatus.eventId;
@@ -3191,6 +3220,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             nextTurn.event.eventId,
             effectiveSpec.matrixId,
             replyToEventId,
+            nextTurn.event.eventId,
           );
         }
 
@@ -3305,6 +3335,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                   `fail:${nextTurn.event.eventId}`,
                   effectiveSpec.matrixId,
                   qNow ? nextTurn.event.eventId : undefined,
+                  nextTurn.event.eventId,
                 );
               }
             } catch {
@@ -3441,7 +3472,7 @@ export async function kickNarraGateway<TEnv extends NarraGatewayEnv = NarraGatew
               op: 'send',
               roomId: item.roomId,
               txnId,
-              content: messageContent(cleanText, { selfMatrixId: config.spec.matrixId }),
+              content: messageContent(cleanText, { selfMatrixId: config.spec.matrixId, broadcast: true }),
             } satisfies NarraMatrixOp),
           });
           const matBody = (await matRes.json().catch(() => null)) as NarraMatrixOpResult | null;

@@ -1,5 +1,5 @@
 import type { MemoryStore } from './memory.js';
-import type { AgentUpdateItem, HistoryTurn } from './types.js';
+import type { AgentUpdateItem, HistoryTurn, LangCode } from './types.js';
 export declare const NARRA_BROADCAST_SCHEMA = "\nCREATE TABLE IF NOT EXISTS narra_broadcast_log (\n  agent_id TEXT NOT NULL,\n  room_id TEXT NOT NULL,\n  update_key TEXT NOT NULL,\n  sent_at TEXT NOT NULL,\n  PRIMARY KEY (agent_id, room_id, update_key)\n);\n";
 export interface BroadcastDedupeStore {
     claimUpdateKey(agentId: string, roomId: string, updateKey: string, sentAtIso: string): Promise<boolean>;
@@ -28,7 +28,12 @@ export declare function isWithinStaggerWindow(agentId: string, roomId: string, n
  * (an agent-only echo chamber with no recent human participation).
  */
 export declare function hasOnlyTrailingAgentMessages(recentHistory: HistoryTurn[], minAgentTail?: number): boolean;
-export type BroadcastSkipReason = 'empty_text' | 'duplicate_update_key' | 'room_muted' | 'opted_out' | 'agent_only_recent_messages' | 'outside_stagger_window' | 'send_failed';
+/**
+ * The language people in the room have been writing in: the most common of the last `sample`
+ * human messages (agents excluded). `null` when nobody has written yet.
+ */
+export declare function roomLanguage(recentHistory: HistoryTurn[], sample?: number): LangCode | null;
+export type BroadcastSkipReason = 'duplicate_items' | 'empty_text' | 'duplicate_update_key' | 'room_muted' | 'opted_out' | 'agent_only_recent_messages' | 'outside_stagger_window' | 'send_failed';
 export interface BroadcastScheduleResult {
     sent: Array<{
         roomId: string;

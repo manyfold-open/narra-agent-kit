@@ -289,6 +289,7 @@ export function parseMatrixEvent(raw, defaults) {
         timeIso,
         mentions: parseMentions(mentionsRaw),
         ...(replyToEventId ? { replyToEventId } : {}),
+        ...narraReplyMarkers(content),
         ...(voiceBlock
             ? {
                 isVoice: true,
@@ -445,5 +446,16 @@ export function sanitizeMobileLinks(text) {
         .join('\n')
         .replace(/\n{3,}/g, '\n\n')
         .trim();
+}
+/** Reads the invisible markers kit agents put on their own messages (see `messageContent`). */
+export function narraReplyMarkers(content) {
+    const answers = content['ai.narra.answers'];
+    const answersEventId = answers && typeof answers === 'object' && typeof answers.event_id === 'string'
+        ? answers.event_id
+        : '';
+    return {
+        ...(answersEventId ? { answersEventId } : {}),
+        ...(content['ai.narra.broadcast'] === true ? { isBroadcast: true } : {}),
+    };
 }
 //# sourceMappingURL=guard.js.map

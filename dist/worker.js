@@ -7,7 +7,7 @@ import { detectExplicitLangSwitch, detectLang, isZhOrEn, stripAgentMentions } fr
 import { MemoryStore, handleStandardMemoryCommand, } from './memory.js';
 import { editContent, messageContent, plainMentions } from './mentions.js';
 import { shouldQuote } from './quote.js';
-import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSION_WINDOW_MS, DEFAULT_WORKERS_AI_TRIAGE_MODEL, createAskTriageModel, createWorkersAiTriageModel, executePoliteYield, hashFraction, hasPeerAnsweredTimeline, hasPeerRepliedAfter, inspectRoomPeers, isChainExhaustedError, isContextualRewrite, isSelfMentioned, routeEvent, } from './router.js';
+import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSION_WINDOW_MS, DEFAULT_WORKERS_AI_TRIAGE_MODEL, createAskTriageModel, createWorkersAiTriageModel, executePoliteYield, hashFraction, hasPeerAnsweredTimeline, peerSessionWithSender, hasPeerRepliedAfter, inspectRoomPeers, isChainExhaustedError, isContextualRewrite, isSelfMentioned, routeEvent, } from './router.js';
 import { fetchEventContext, fetchMatrixCredential, fetchNarraChatMessagesBackstop, fetchRoomMessagesBackstop, matrixSyncRequest, redactSecrets, SyncError, syncOnce, fetchWithDeadline, } from './sync.js';
 const DEFAULT_NARRA_API_ENDPOINT = 'https://api.netmind.chat';
 const DEFAULT_MATRIX_HOMESERVER = 'https://matrix.netmind.chat';
@@ -1326,6 +1326,8 @@ export class BaseNarraRoomCoordinator {
         const subsequentEvents = findSubsequentHistory(recentHistory, event).map((h) => ({
             eventId: h.eventId,
             senderId: h.senderId,
+            ...(h.answersEventId ? { answersEventId: h.answersEventId } : {}),
+            ...(h.isBroadcast ? { isBroadcast: true } : {}),
         }));
         // If the trigger event's own coalesced ID includes the latestHumanEventId, check whether
         // any non-coalesced human event sits strictly after it.
@@ -1338,11 +1340,12 @@ export class BaseNarraRoomCoordinator {
             subsequentEvents,
         });
     }
-    async postReplyToRoom(roomId, text, txnSeed, selfMatrixId, replyToEventId) {
+    async postReplyToRoom(roomId, text, txnSeed, selfMatrixId, replyToEventId, answersEventId) {
         const txnId = await deterministicTxnId(txnSeed);
         const content = messageContent(text, {
             selfMatrixId,
             replyToEventId,
+            ...(answersEventId ? { answersEventId } : {}),
         });
         if (isNarraSyncEnabled(this.env) && this.env.NARRA_SYNC_DO) {
             const matrixRes = await this.matrixOp({
@@ -1447,6 +1450,8 @@ export class BaseNarraRoomCoordinator {
                 text: ev.text.slice(0, 600),
                 timestampMs: ev.timestampMs,
                 ...(ev.replyToEventId ? { replyToEventId: ev.replyToEventId } : {}),
+                ...(ev.answersEventId ? { answersEventId: ev.answersEventId } : {}),
+                ...(ev.isBroadcast ? { isBroadcast: true } : {}),
             });
         }
         return [...byId.values()]
@@ -1698,6 +1703,8 @@ export class BaseNarraRoomCoordinator {
                                 text: ev.text.slice(0, 1000),
                                 timestampMs: ev.timestampMs,
                                 ...(ev.replyToEventId ? { replyToEventId: ev.replyToEventId } : {}),
+                                ...(ev.answersEventId ? { answersEventId: ev.answersEventId } : {}),
+                                ...(ev.isBroadcast ? { isBroadcast: true } : {}),
                             });
                             messageCache[ev.eventId] = {
                                 eventId: ev.eventId,
@@ -1724,6 +1731,8 @@ export class BaseNarraRoomCoordinator {
                                 text: ev.text.slice(0, 1000),
                                 timestampMs: ev.timestampMs,
                                 ...(ev.replyToEventId ? { replyToEventId: ev.replyToEventId } : {}),
+                                ...(ev.answersEventId ? { answersEventId: ev.answersEventId } : {}),
+                                ...(ev.isBroadcast ? { isBroadcast: true } : {}),
                             });
                             messageCache[ev.eventId] = {
                                 eventId: ev.eventId,
@@ -1875,6 +1884,12 @@ export class BaseNarraRoomCoordinator {
         ]);
         if (moot.has(routed.reason))
             return { ...routed, shouldReply: false, reason: `fallback_moot:${routed.reason}` };
+        const storedHistory = (await this.ctx.storage.get('recentHistory')) ?? [];
+        const seen = new Set(storedHistory.map((t) => t.eventId));
+        const timeline = [...storedHistory, ...context.recentHistory.filter((t) => !seen.has(t.eventId))];
+        if (peerSessionWithSender(turn.event, timeline, spec.matrixId)) {
+            return { ...routed, shouldReply: false, reason: 'fallback_moot:peer_session' };
+        }
         if (await this.hasLivePeerRepliedAfter(turn.event, context, spec.matrixId)) {
             return { ...routed, shouldReply: false, reason: 'fallback_not_needed' };
         }
@@ -1979,6 +1994,8 @@ export class BaseNarraRoomCoordinator {
         const subsequentEvents = findSubsequentHistory(recentHistory, turn.event).map((h) => ({
             eventId: h.eventId,
             senderId: h.senderId,
+            ...(h.answersEventId ? { answersEventId: h.answersEventId } : {}),
+            ...(h.isBroadcast ? { isBroadcast: true } : {}),
         }));
         const effectiveLatestHumanId = latestHumanEventId && coalescedSet.has(latestHumanEventId)
             ? turn.event.eventId
@@ -2282,9 +2299,15 @@ export class BaseNarraRoomCoordinator {
                             usedA2A = true;
                             // An unmentioned group question this agent claimed shows its status right away: the
                             // other agents' polite yield sees it and stands down instead of answering too.
-                            const claimedGroupAsk = decision.isAsk === true && context.chatType === 'group' && !isDirectTurn;
+                            // An elected fallback is an agent outside its own topic: no themed status bubble for it,
+                            // so if it ends up with nothing to say, nothing shows (the typing indicator still does).
+                            const isFallbackTurn = decision.reason === 'group_fallback';
+                            const claimedGroupAsk = decision.isAsk === true && context.chatType === 'group' && !isDirectTurn && !isFallbackTurn;
                             const thinkingDelayMs = claimedGroupAsk ? 0 : (cfg.thinkingDelayMs ?? DEFAULT_THINKING_DELAY_MS);
-                            if (isCommittedTurn && (thinkingDelayMs > 0 || claimedGroupAsk) && !nextTurn.thinkingEventId) {
+                            if (isCommittedTurn &&
+                                !isFallbackTurn &&
+                                (thinkingDelayMs > 0 || claimedGroupAsk) &&
+                                !nextTurn.thinkingEventId) {
                                 const statusText = wantsSummary
                                     ? defaultThinkingMessage(decision.detectedLang, true)
                                     : (cfg.thinkingMessage?.(decision.detectedLang, nextTurn.event, decision) ??
@@ -2294,7 +2317,7 @@ export class BaseNarraRoomCoordinator {
                                     thinkingPostPromise = (async () => {
                                         try {
                                             const qNow = await this.computeShouldQuote(nextTurn.event, roomChatType);
-                                            const postedStatus = await this.postReplyToRoom(nextTurn.event.roomId, statusText, `thinking:${nextTurn.event.eventId}`, effectiveSpec.matrixId, qNow ? nextTurn.event.eventId : undefined);
+                                            const postedStatus = await this.postReplyToRoom(nextTurn.event.roomId, statusText, `thinking:${nextTurn.event.eventId}`, effectiveSpec.matrixId, qNow ? nextTurn.event.eventId : undefined, nextTurn.event.eventId);
                                             if (postedStatus.eventId) {
                                                 nextTurn.thinkingEventId = postedStatus.eventId;
                                                 await this.updatePendingTurn(nextTurn);
@@ -2472,7 +2495,7 @@ export class BaseNarraRoomCoordinator {
                     posted = { eventId: nextTurn.thinkingEventId };
                 }
                 else {
-                    posted = await this.postReplyToRoom(nextTurn.event.roomId, answer, nextTurn.event.eventId, effectiveSpec.matrixId, replyToEventId);
+                    posted = await this.postReplyToRoom(nextTurn.event.roomId, answer, nextTurn.event.eventId, effectiveSpec.matrixId, replyToEventId, nextTurn.event.eventId);
                 }
                 const repliedAtMs = this.nowMs();
                 await this.runLocked(async () => {
@@ -2558,7 +2581,7 @@ export class BaseNarraRoomCoordinator {
                             if (!edited) {
                                 const meta = await this.ctx.storage.get('roomMeta');
                                 const qNow = await this.computeShouldQuote(nextTurn.event, meta?.chatType ?? nextTurn.event.chatType);
-                                await this.postReplyToRoom(nextTurn.event.roomId, failText, `fail:${nextTurn.event.eventId}`, effectiveSpec.matrixId, qNow ? nextTurn.event.eventId : undefined);
+                                await this.postReplyToRoom(nextTurn.event.roomId, failText, `fail:${nextTurn.event.eventId}`, effectiveSpec.matrixId, qNow ? nextTurn.event.eventId : undefined, nextTurn.event.eventId);
                             }
                         }
                         catch {
@@ -2677,7 +2700,7 @@ export async function kickNarraGateway(env, config) {
                             op: 'send',
                             roomId: item.roomId,
                             txnId,
-                            content: messageContent(cleanText, { selfMatrixId: config.spec.matrixId }),
+                            content: messageContent(cleanText, { selfMatrixId: config.spec.matrixId, broadcast: true }),
                         }),
                     });
                     const matBody = (await matRes.json().catch(() => null));

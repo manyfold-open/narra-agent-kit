@@ -386,6 +386,51 @@ export interface TimelineTurn {
   isAgent?: boolean;
   timestampMs: number;
   replyToEventId?: string;
+  answersEventId?: string;
+  isBroadcast?: boolean;
+}
+
+/** A kit agent's own marker says which message it answered; digests answer nothing. */
+function markedAnswer(
+  turn: { answersEventId?: string; isBroadcast?: boolean },
+  coalescedIds: Set<string>,
+): boolean | undefined {
+  if (turn.isBroadcast) return false;
+  if (turn.answersEventId) return coalescedIds.has(turn.answersEventId);
+  return undefined;
+}
+
+/** How soon after a peer agent answered this sender a new message still counts as part of that exchange. */
+export const PEER_SESSION_WINDOW_MS = 90_000;
+
+/**
+ * True when a peer agent answered this sender within `windowMs` before `event`: the sender is mid-
+ * conversation with that peer, so a follow-up the peer chose to leave is not an unclaimed question.
+ */
+export function peerSessionWithSender(
+  event: InboundEvent,
+  timeline: ReadonlyArray<TimelineTurn>,
+  selfMatrixId?: string,
+  windowMs = PEER_SESSION_WINDOW_MS,
+): boolean {
+  const earlier = timeline
+    .filter((turn) => turn.timestampMs < event.timestampMs && turn.eventId !== event.eventId)
+    .sort((a, b) => a.timestampMs - b.timestampMs);
+  const senderEventIds = new Set<string>();
+  let lastHumanIsSender = false;
+  for (const turn of earlier) {
+    const turnIsAgent = Boolean(turn.isAgent) || isNarraAgent(turn.senderId);
+    if (!turnIsAgent) {
+      lastHumanIsSender = turn.senderId === event.senderId;
+      if (lastHumanIsSender) senderEventIds.add(turn.eventId);
+      continue;
+    }
+    if (turn.senderId === selfMatrixId || turn.isBroadcast) continue;
+    if (event.timestampMs - turn.timestampMs > windowMs) continue;
+    const target = turn.answersEventId ?? turn.replyToEventId;
+    if (target ? senderEventIds.has(target) : lastHumanIsSender) return true;
+  }
+  return false;
 }
 
 /**
@@ -408,6 +453,11 @@ export function hasPeerAnsweredTimeline(
     const turnIsAgent = Boolean(turn.isAgent) || isNarraAgent(turn.senderId);
     if (turnIsAgent) {
       if (turn.senderId === selfMatrixId) continue;
+      const marked = markedAnswer(turn, coalescedIds);
+      if (marked !== undefined) {
+        if (marked) return true;
+        continue;
+      }
       if (turn.replyToEventId) {
         if (coalescedIds.has(turn.replyToEventId)) return true;
         continue;
@@ -437,8 +487,10 @@ export function hasPeerRepliedAfter(
     for (const ev of context.subsequentEvents) {
       if (coalescedIds.has(ev.eventId)) continue;
       if (isNarraAgent(ev.senderId)) {
-        if (ev.senderId !== selfMatrixId) return true;
-        continue;
+        if (ev.senderId === selfMatrixId) continue;
+        const marked = markedAnswer(ev, coalescedIds);
+        if (marked === false) continue;
+        return true;
       }
       break;
     }
@@ -1157,11 +1209,12 @@ async function routeEventCore(
       shouldQuote: false,
     };
   }
-  if (event.kind === 'reaction' && !context.replyToTarget?.isSelf) {
+  // A reaction in a group is an emoji, not a turn: answering 👍/😂 there is noise (DMs still reply).
+  if (event.kind === 'reaction' && (context.chatType === 'group' || !context.replyToTarget?.isSelf)) {
     return {
       shouldReply: false,
       tier: 0,
-      reason: 'reaction_not_for_self',
+      reason: context.chatType === 'group' ? 'reaction_in_group' : 'reaction_not_for_self',
       confidence: 1,
       detectedLang,
       shouldQuote: false,

@@ -62,6 +62,10 @@ export function plainMentions(text: string, selfMatrixId = ''): string {
 export interface MessageContentOptions {
   selfMatrixId?: string;
   replyToEventId?: string;
+  /** The message this one answers, kept even when not quoted, so peers know what was answered. */
+  answersEventId?: string;
+  /** A scheduled digest, not an answer to anyone. */
+  broadcast?: boolean;
   sanitizeLinks?: boolean;
   msgtype?: 'm.text' | 'm.notice';
 }
@@ -92,6 +96,8 @@ export function messageContent(
     ...(opts.replyToEventId
       ? { 'm.relates_to': { 'm.in_reply_to': { event_id: opts.replyToEventId } } }
       : {}),
+    ...(opts.answersEventId ? { 'ai.narra.answers': { event_id: opts.answersEventId } } : {}),
+    ...(opts.broadcast ? { 'ai.narra.broadcast': true } : {}),
   };
 }
 

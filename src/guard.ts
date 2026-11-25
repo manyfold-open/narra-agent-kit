@@ -321,6 +321,7 @@ export function parseMatrixEvent(
     timeIso,
     mentions: parseMentions(mentionsRaw),
     ...(replyToEventId ? { replyToEventId } : {}),
+    ...narraReplyMarkers(content),
     ...(voiceBlock
       ? {
           isVoice: true,
@@ -499,4 +500,17 @@ export function sanitizeMobileLinks(text: string): string {
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/** Reads the invisible markers kit agents put on their own messages (see `messageContent`). */
+export function narraReplyMarkers(content: Record<string, unknown>): { answersEventId?: string; isBroadcast?: boolean } {
+  const answers = content['ai.narra.answers'];
+  const answersEventId =
+    answers && typeof answers === 'object' && typeof (answers as Record<string, unknown>).event_id === 'string'
+      ? ((answers as Record<string, unknown>).event_id as string)
+      : '';
+  return {
+    ...(answersEventId ? { answersEventId } : {}),
+    ...(content['ai.narra.broadcast'] === true ? { isBroadcast: true } : {}),
+  };
 }

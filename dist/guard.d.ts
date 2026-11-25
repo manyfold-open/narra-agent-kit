@@ -50,4 +50,9 @@ export declare function stripLeakedNotes(answer: string): {
  * - Detaches trailing punctuation and adds spacing around bare URLs so clients tap cleanly
  */
 export declare function sanitizeMobileLinks(text: string): string;
+/** Reads the invisible markers kit agents put on their own messages (see `messageContent`). */
+export declare function narraReplyMarkers(content: Record<string, unknown>): {
+    answersEventId?: string;
+    isBroadcast?: boolean;
+};
 //# sourceMappingURL=guard.d.ts.map
