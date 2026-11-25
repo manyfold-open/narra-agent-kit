@@ -629,3 +629,51 @@ export function toZhHant(text: string): string {
   }
   return out;
 }
+
+
+const FOREIGN_SCRIPTS: Array<[RegExp, string]> = [
+  [/[\p{Script=Hiragana}\p{Script=Katakana}]/u, 'ja'],
+  [/\p{Script=Hangul}/u, 'ko'],
+  [/\p{Script=Cyrillic}/u, 'ru'],
+  [/\p{Script=Arabic}/u, 'ar'],
+  [/\p{Script=Hebrew}/u, 'he'],
+  [/\p{Script=Thai}/u, 'th'],
+  [/\p{Script=Devanagari}/u, 'hi'],
+  [/\p{Script=Greek}/u, 'el'],
+];
+
+const LATIN_MARKERS: Record<string, RegExp> = {
+  en: /\b(?:the|is|are|what|where|can|any|today|tonight|do|does|i|you|we|to|in|of|and|for|with|there|some|how|eat)\b/gi,
+  es: /[¿¡ñ]|\b(?:el|los|las|que|qué|hay|hoy|alguna?|noticias?|dónde|donde|puedo|podemos|esta|noche|comer|para|una?|con|por|mañana)\b/gi,
+  fr: /[çœ]|\b(?:le|les|des|est|je|vous|nous|quoi|ce|soir|où|aujourd'hui|manger|faire|une?|avec|pour|demain)\b/gi,
+  de: /[äöüß]|\b(?:der|die|das|und|ist|ich|kann|heute|abend|was|wo|gibt|es|essen|machen|wir|ein|eine|mit|morgen)\b/gi,
+  it: /\b(?:il|che|di|oggi|cosa|sono|dove|posso|stasera|mangiare|fare|una?|con|per|domani|ci)\b/gi,
+  pt: /[ãõ]|\b(?:os|que|não|hoje|você|onde|posso|podemos|noite|comer|fazer|uma?|com|para|amanhã|tem)\b/gi,
+  nl: /\b(?:het|een|wat|kunnen|vanavond|waar|eten|doen|ik|wij|we|vandaag|morgen|met|voor|zijn|er)\b/gi,
+};
+
+/**
+ * BCP-47 code of `text` when it is clearly neither Chinese nor English, else null. Script-based for
+ * non-Latin writing (kana wins over Han, so Japanese with kanji is `ja`); for Latin script, common
+ * function words of es/fr/de/it/pt/nl must clearly outnumber English ones. Mentions are not stripped.
+ */
+export function detectForeignLanguage(text: string): string | null {
+  const t = (text ?? '').trim();
+  if (!t) return null;
+  for (const [re, code] of FOREIGN_SCRIPTS) if (re.test(t)) return code;
+  if (/[\u3400-\u9FFF]/.test(t)) return null;
+  const counts = Object.fromEntries(
+    Object.entries(LATIN_MARKERS).map(([code, re]) => [code, (t.match(re) ?? []).length]),
+  ) as Record<string, number>;
+  let best: string | null = null;
+  for (const [code, n] of Object.entries(counts)) {
+    if (code === 'en') continue;
+    if (n >= 2 && n > counts.en && (!best || n > counts[best])) best = code;
+  }
+  return best;
+}
+
+/** True for codes the zh/en templates already answer in. */
+export function isZhOrEn(code: string | undefined | null): boolean {
+  return !code || /^(?:zh|en)(?:-|$)/i.test(code);
+}

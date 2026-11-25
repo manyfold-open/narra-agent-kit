@@ -2966,13 +2966,13 @@ describe('ask-aware group triage + elected fallback (NARRA_GROUP_TRIAGE=ask)', (
       }) as unknown as typeof fetch,
     });
     const room = new gateway.BaseNarraRoomCoordinator(state, env);
-    const send = (eventId: string, body: string, sender = human, ts = nowMs) =>
+    const send = (eventId: string, body: string, sender = human, ts = nowMs, chatType: 'group' | 'dm' = 'group') =>
       room.fetch(
         new Request('https://narra-room/events', {
           method: 'POST',
           body: JSON.stringify({
             roomId,
-            chatType: 'group',
+            chatType,
             members,
             events: [{ event_id: eventId, sender, type: 'm.room.message', origin_server_ts: ts, content: { msgtype: 'm.text', body } }],
           }),
@@ -3044,6 +3044,17 @@ describe('ask-aware group triage + elected fallback (NARRA_GROUP_TRIAGE=ask)', (
     t.advance(60_000);
     await t.room.alarm();
     expect(t.envelopes).toEqual([]);
+  });
+
+  it('answers a Japanese message through A2A in Japanese instead of the zh/en templates', async () => {
+    const t = setup();
+    await t.send('$ja_dm', '明日の夜、ロンドンで何か食べたいな', human, t.now(), 'dm');
+    t.advance(2_000);
+    await t.room.alarm();
+    expect(t.fastCalls).toEqual([]);
+    expect(t.envelopes).toHaveLength(1);
+    expect(t.envelopes[0]).toContain('reply_language');
+    expect(t.envelopes[0]).toContain('"ja"');
   });
 
   it('ranks the agents the same way on every agent, so exactly one answers first', () => {
