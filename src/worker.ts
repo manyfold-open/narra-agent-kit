@@ -94,6 +94,7 @@ import {
   type V2RoomState,
 } from './v2/ledger.js';
 import { pipelineForRoom } from './v2/pipeline.js';
+import { shouldFlushStream, streamableText } from './v2/stream.js';
 import { scoreRelevance, type RelevanceResult } from './v2/relevance.js';
 
 const DEFAULT_NARRA_API_ENDPOINT = 'https://api.netmind.chat';
@@ -335,6 +336,8 @@ interface PendingTurn {
   v2Decision?: WakeDecision;
   /** v2: this agent's 👀 claim reaction on the message. */
   v2ClaimEventId?: string;
+  /** v2: the reply message shown while the brain was still writing (later text arrives as edits). */
+  v2StreamEventId?: string;
 }
 
 /** A real question nobody claimed: the first elected agent answers after this long... */
@@ -2802,6 +2805,53 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       }, TYPING_REFRESH_MS);
 
       let raw = '';
+      const streamLang = detectForeignLanguage(turn.event.text ?? '') ? 'en' : detectLang(turn.event.text ?? '');
+      const stream = {
+        shown: '',
+        lastAt: 0,
+        edits: 0,
+        replyToEventId: undefined as string | undefined,
+        chain: Promise.resolve() as Promise<unknown>,
+      };
+      const onText = (partial: string): void => {
+        const candidate = streamableText(partial);
+        if (!candidate) return;
+        const display = normalizeA2AOutput(candidate, streamLang).text;
+        if (!display) return;
+        const at = this.nowMs();
+        if (!shouldFlushStream({ shown: stream.shown, next: display, msSinceLastFlush: at - stream.lastAt })) return;
+        stream.shown = display;
+        stream.lastAt = at;
+        stream.chain = stream.chain
+          .then(async () => {
+            if (!turn.v2StreamEventId) {
+              const quote = await this.computeShouldQuote(turn.event, context.chatType);
+              stream.replyToEventId = quote ? turn.event.eventId : undefined;
+              const posted = await this.postReplyToRoom(
+                roomId,
+                display,
+                turn.event.eventId,
+                spec.matrixId,
+                stream.replyToEventId,
+                turn.event.eventId,
+              );
+              if (posted.eventId) {
+                turn.v2StreamEventId = posted.eventId;
+                await this.updatePendingTurn(turn);
+              }
+            } else {
+              stream.edits++;
+              await this.editReplyInRoom(
+                roomId,
+                turn.v2StreamEventId,
+                display,
+                `stream:${turn.event.eventId}:${stream.edits}`,
+                spec.matrixId,
+              );
+            }
+          })
+          .catch(() => undefined);
+      };
       try {
         const memories = memoryStore
           ? await memoryStore.recallForTurn({ roomId, userId: turn.event.senderId, chatType: context.chatType })
@@ -2859,7 +2909,9 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           ...(storedContextId ? { contextId: storedContextId } : {}),
           timeoutMs: cfg.v2?.brainTimeoutMs ?? 25_000,
           fetchImpl: cfg.fetchImpl,
+          onText,
         });
+        await stream.chain;
         await this.v2Budget(spec).add('brain', this.nowMs());
         raw = res.text;
         if (res.contextId && res.contextId !== storedContextId) {
@@ -2872,6 +2924,16 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
 
       const action = parseBrainOutput(raw);
       nowMs = this.nowMs();
+      if (action.kind !== 'reply' && turn.v2StreamEventId) {
+        // Text was already showing but the brain ended up choosing not to reply: take it back.
+        await this.matrixOp({
+          op: 'redact',
+          roomId,
+          eventId: turn.v2StreamEventId,
+          txnId: await deterministicTxnId(`unstream:${turn.v2StreamEventId}`),
+        }).catch(() => undefined);
+        turn.v2StreamEventId = undefined;
+      }
       if (action.kind === 'silent') {
         await this.releaseV2Claim(turn);
         await appendDoLog(this.ctx.storage, `v2 silent ${turn.event.eventId} (${decision.reason})`, nowMs, this.env);
@@ -2906,21 +2968,38 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         await this.removePendingTurn(turn.event.eventId);
         return;
       }
-      const quote = await this.computeShouldQuote(turn.event, context.chatType);
-      const replyToEventId = quote ? turn.event.eventId : undefined;
-      const posted = await this.postReplyToRoom(
-        roomId,
-        text,
-        turn.event.eventId,
-        spec.matrixId,
-        replyToEventId,
-        turn.event.eventId,
-      );
+      let posted: { eventId: string };
+      let replyToEventId: string | undefined;
+      if (turn.v2StreamEventId) {
+        // The reply is already on screen: bring it to its final text.
+        replyToEventId = stream.replyToEventId;
+        if (text !== stream.shown) {
+          await this.editReplyInRoom(
+            roomId,
+            turn.v2StreamEventId,
+            text,
+            `stream:${turn.event.eventId}:final`,
+            spec.matrixId,
+          );
+        }
+        posted = { eventId: turn.v2StreamEventId };
+      } else {
+        const quote = await this.computeShouldQuote(turn.event, context.chatType);
+        replyToEventId = quote ? turn.event.eventId : undefined;
+        posted = await this.postReplyToRoom(
+          roomId,
+          text,
+          turn.event.eventId,
+          spec.matrixId,
+          replyToEventId,
+          turn.event.eventId,
+        );
+      }
       await this.recordOwnReply(turn, spec, text, posted.eventId, replyToEventId);
       await this.releaseV2Claim(turn);
       await appendDoLog(
         this.ctx.storage,
-        `v2 answered ${turn.event.eventId} (${decision.reason}${action.mode ? `, mode=${action.mode}` : ''}) in ${this.nowMs() - turn.event.timestampMs}ms`,
+        `v2 answered ${turn.event.eventId} (${decision.reason}${action.mode ? `, mode=${action.mode}` : ''}${stream.shown ? `, streamed edits=${stream.edits}` : ''}) in ${this.nowMs() - turn.event.timestampMs}ms`,
         this.nowMs(),
         this.env,
       );

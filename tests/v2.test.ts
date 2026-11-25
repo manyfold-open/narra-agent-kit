@@ -11,6 +11,8 @@ import {
   emptyRoomState,
   parseBrainOutput,
   peerClaimHolder,
+  shouldFlushStream,
+  streamableText,
   pipelineForRoom,
   roomPostingBlock,
   runSchemaStatements,
@@ -96,6 +98,26 @@ describe('v2 brain output', () => {
     // A reaction with text: the text wins; an unknown emoji is never sent.
     expect(parseBrainOutput('[REACT ❤️]\n不客氣！')).toEqual({ kind: 'reply', text: '不客氣！' });
     expect(parseBrainOutput('[REACT 🦄]')).toEqual({ kind: 'silent' });
+  });
+});
+
+describe('v2 streaming', () => {
+  it('shows reply text only once it is safe', () => {
+    expect(streamableText('[NO_REP')).toBeNull();
+    expect(streamableText('[NO_REPLY]')).toBeNull();
+    expect(streamableText('[REACT ❤️]')).toBeNull();
+    expect(streamableText('[MODE mention]\n好')).toBeNull();
+    expect(streamableText('Thought: the user wants')).toBeNull();
+    expect(streamableText('今天三則：OpenAI')).toBe('今天三則：OpenAI');
+  });
+
+  it('posts after a first sentence, then edits sparingly', () => {
+    expect(shouldFlushStream({ shown: '', next: '今天', msSinceLastFlush: 0 })).toBe(false);
+    expect(shouldFlushStream({ shown: '', next: '今天有三則 AI 新聞值得看：OpenAI 發新模型', msSinceLastFlush: 0 })).toBe(true);
+    const shown = '今天有三則 AI 新聞值得看：OpenAI 發新模型';
+    expect(shouldFlushStream({ shown, next: shown + '，Google 也有', msSinceLastFlush: 5_000 })).toBe(false);
+    expect(shouldFlushStream({ shown, next: shown + '，Google DeepMind 推出新的可靠性基準測試，百度開源 ERNIE', msSinceLastFlush: 500 })).toBe(false);
+    expect(shouldFlushStream({ shown, next: shown + '，Google DeepMind 推出新的可靠性基準測試，百度開源 ERNIE', msSinceLastFlush: 2_000 })).toBe(true);
   });
 });
 
@@ -199,6 +221,13 @@ describe('v2 room ledger', () => {
     expect(summary.reply_mode).toBe('ambient');
     expect(summary.sender_is_talking_with).toContain('with you');
     expect(summary.your_recent_messages_here).toContain('OpenAI');
+  });
+
+  it('lists earlier unanswered messages as background only', () => {
+    const history = [turn('$old', CASSIE, NOW - 60_000, { text: '最近有啥AI新聞嗎' })];
+    const summary = buildLedgerSummary({ history, members: ctx().members, selfId: NEWS, event: ev('$q', '@AI in 5 之後你可以主動回了'), nowMs: NOW, mode: 'mention', wakeReason: 'mentioned' });
+    expect(summary.earlier_unanswered_messages).toContain('最近有啥AI新聞嗎');
+    expect(summary.other_unanswered_messages).toBeUndefined();
   });
 });
 
@@ -341,7 +370,7 @@ function sse(text: string): Response {
 
 const ROOM = '!zacktest:matrix.netmind.chat';
 
-function setup(brainReply: string | (() => string), extraConfig: Partial<NarraGatewayConfig<NarraGatewayEnv>> = {}) {
+function setup(brainReply: string | (() => string | Response), extraConfig: Partial<NarraGatewayConfig<NarraGatewayEnv>> = {}) {
   let nowMs = Date.UTC(2026, 10, 25, 12, 0, 0);
   const sent: Array<{ type: string; body: Record<string, unknown> }> = [];
   const redactions: string[] = [];
@@ -364,7 +393,8 @@ function setup(brainReply: string | (() => string), extraConfig: Partial<NarraGa
     if (url === 'https://a2a.test/rpc') {
       const req = JSON.parse(String(init?.body ?? '{}')) as { params: { message: { parts: Array<{ text: string }> } } };
       envelopes.push(req.params.message.parts[0].text);
-      return sse(typeof brainReply === 'function' ? brainReply() : brainReply);
+      const reply = typeof brainReply === 'function' ? brainReply() : brainReply;
+      return reply instanceof Response ? reply : sse(reply);
     }
     return new Response('not found', { status: 404 });
   });
@@ -508,5 +538,32 @@ describe('v2 pipeline end to end', () => {
     await t.runAlarmsFor(10_000);
     expect(t.envelopes).toHaveLength(0);
     expect(t.sent.at(-1)?.body.body).toContain('116 123');
+  });
+
+  it('streams a long reply: shows the first part, then edits the same message to the full text', async () => {
+    const parts = ['今天第 39 期三則重點：', 'Google DeepMind 推出 AI 可靠性基準測試；', 'Anthropic 推出 Claude Ship；百度開源 ERNIE 5.5。'];
+    const events = [
+      ...parts.map((text, i) => ({ kind: 'artifact-update', append: i > 0, artifact: { artifactId: 'a1', parts: [{ kind: 'text', text }] } })),
+      { kind: 'status-update', status: { state: 'completed' } },
+    ];
+    const body = events.map((r) => `data: ${JSON.stringify({ jsonrpc: '2.0', id: '1', result: r })}\n\n`).join('');
+    const t = setup(() => new Response(body, { headers: { 'content-type': 'text/event-stream' } }));
+    await t.post([t.msg('$q', '有啥 AI 新聞')]);
+    await t.runAlarmsFor(10_000);
+    const messages = t.sent.filter((s) => s.type === 'm.room.message');
+    expect(messages.length).toBe(2);
+    expect(messages[0].body.body).toBe(parts.slice(0, 2).join(''));
+    const final = messages[1].body as { 'm.new_content'?: { body: string }; 'm.relates_to'?: { rel_type: string; event_id: string } };
+    expect(final['m.relates_to']).toMatchObject({ rel_type: 'm.replace', event_id: '$out_2' });
+    expect(final['m.new_content']?.body).toBe(parts.join(''));
+    expect(await t.log()).toMatch(/v2 answered \$q .*streamed/);
+  });
+
+  it('tells the brain to answer only the newest message and to thank with an emoji', async () => {
+    const t = setup('好的。');
+    await t.post([t.msg('$q', '@AI in 5 在嗎', ZACK, { 'm.mentions': { user_ids: [NEWS] } })]);
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes[0]).toContain('Answer only current_message');
+    expect(t.envelopes[0]).toContain('always answer with [REACT <emoji>] alone');
   });
 });

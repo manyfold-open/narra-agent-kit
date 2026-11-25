@@ -242,6 +242,14 @@ export function applyA2AResult(acc, raw) {
         acc.artifacts.set(id, partsText(artifact.parts));
     }
 }
+/** The answer text streamed so far (artifacts or a direct message), never status/progress text. */
+function streamedAnswerText(acc) {
+    const artifactText = acc.order
+        .map((id) => acc.artifacts.get(id) ?? '')
+        .filter(Boolean)
+        .join('\n\n');
+    return (artifactText || acc.directText).trim();
+}
 export function snapshotFromAccumulator(acc) {
     const artifactText = acc.order
         .map((id) => acc.artifacts.get(id) ?? '')
@@ -356,6 +364,7 @@ export async function runManyfoldA2ATurnWithMeta(options) {
         let buffer = '';
         let received = false;
         let lastProgress = '';
+        let lastAnswer = '';
         try {
             while (true) {
                 const chunk = await reader.read();
@@ -382,6 +391,18 @@ export async function runManyfoldA2ATurnWithMeta(options) {
                         if (!snap.terminal && snap.progressText && snap.progressText !== lastProgress) {
                             lastProgress = snap.progressText;
                             options.onProgress?.(snap.progressText);
+                        }
+                        if (!snap.terminal && options.onText) {
+                            const answerSoFar = streamedAnswerText(acc);
+                            if (answerSoFar && answerSoFar !== lastAnswer) {
+                                lastAnswer = answerSoFar;
+                                try {
+                                    options.onText(answerSoFar);
+                                }
+                                catch {
+                                    // A display callback must never break the turn.
+                                }
+                            }
                         }
                         if (snap.terminal) {
                             if (snap.state && !['completed', 'input-required'].includes(snap.state)) {

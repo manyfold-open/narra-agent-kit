@@ -61,6 +61,8 @@ export interface RunA2AOptions {
     fetchImpl?: typeof fetch;
     /** Optional callback fired when SSE streams intermediate progress text. */
     onProgress?: (progressText: string) => void;
+    /** Optional callback with the answer text received so far, each time it grows (streaming replies). */
+    onText?: (textSoFar: string) => void;
 }
 export interface RunA2ATurnResult {
     text: string;
