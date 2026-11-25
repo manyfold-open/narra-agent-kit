@@ -2918,7 +2918,7 @@ describe('ask-aware group triage + elected fallback (NARRA_GROUP_TRIAGE=ask)', (
     { matrixId: peerB, displayName: 'AI in 5', isAgent: true },
   ];
 
-  function setup() {
+  function setup(opts: { a2aDown?: boolean; aiBackup?: string | null; local?: string } = {}) {
     let nowMs = 1_790_100_000_000;
     const posted: string[] = [];
     const envelopes: string[] = [];
@@ -2927,6 +2927,11 @@ describe('ask-aware group triage + elected fallback (NARRA_GROUP_TRIAGE=ask)', (
     const fakeAi = {
       async run(_m: string, input: { messages: Array<{ content: string }> }) {
         const all = input.messages.map((m) => m.content).join('\n');
+        if (!all.includes('newest_message:')) {
+          // Resilience backup after an A2A failure.
+          if (opts.aiBackup === null) throw new Error('workers ai down');
+          return { response: opts.aiBackup ?? 'backup answer' };
+        }
         aiPrompts.push(all);
         if (all.includes('jajaja')) return { response: '{"ask":false,"fit":0,"reason":"laughing"}' };
         return { response: '{"ask":true,"fit":0.1,"reason":"plans_not_mine"}' };
@@ -2947,9 +2952,10 @@ describe('ask-aware group triage + elected fallback (NARRA_GROUP_TRIAGE=ask)', (
       sleep: async (ms: number) => {
         nowMs += ms;
       },
+      enableA2AFailureReply: true,
       fastRespond: async (_env, ev) => {
         fastCalls.push(ev.text);
-        return '[NO_REPLY]';
+        return opts.local ?? '[NO_REPLY]';
       },
       resolveA2ACredential: async () => ({ url: 'https://a2a.example.test/rpc', token: 'a2a_tok' }),
       fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -2957,6 +2963,7 @@ describe('ask-aware group triage + elected fallback (NARRA_GROUP_TRIAGE=ask)', (
         if (url === 'https://a2a.example.test/rpc') {
           const body = JSON.parse(String(init?.body ?? '{}')) as { params: { message: { parts: Array<{ text: string }> } } };
           envelopes.push(body.params.message.parts[0].text);
+          if (opts.a2aDown) return new Response('upstream down', { status: 503 });
           return makeSseResponse('Prueba el Southbank Centre mañana por la tarde.');
         }
         if (url.includes('/chat/messages')) return Response.json({ status: 'ok', data: { messages: [] } });
@@ -3055,6 +3062,23 @@ describe('ask-aware group triage + elected fallback (NARRA_GROUP_TRIAGE=ask)', (
     expect(t.envelopes).toHaveLength(1);
     expect(t.envelopes[0]).toContain('reply_language');
     expect(t.envelopes[0]).toContain('"ja"');
+  });
+
+  it('answers a Japanese message with the Workers AI backup when A2A is down', async () => {
+    const t = setup({ a2aDown: true, aiBackup: 'ソーホーの点心はいかがですか。' });
+    await t.send('$ja_down', '明日の夜、ロンドンで何か食べたいな', human, t.now(), 'dm');
+    t.advance(2_000);
+    await t.room.alarm();
+    expect(t.posted).toContain('ソーホーの点心はいかがですか。');
+  });
+
+  it("falls back to the agent's own zh/en answer when A2A and Workers AI are both down", async () => {
+    const t = setup({ a2aDown: true, aiBackup: null, local: '🍜 Soho: Dumplings Legend' });
+    await t.send('$ja_down2', '明日の夜、ロンドンで何か食べたいな', human, t.now(), 'dm');
+    t.advance(2_000);
+    await t.room.alarm();
+    expect(t.fastCalls).toEqual(['明日の夜、ロンドンで何か食べたいな']);
+    expect(t.posted).toContain('🍜 Soho: Dumplings Legend');
   });
 
   it('ranks the agents the same way on every agent, so exactly one answers first', () => {
