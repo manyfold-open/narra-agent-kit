@@ -244,6 +244,7 @@ describe('v2 room ledger', () => {
     expect(summary.reply_mode).toBe('ambient');
     expect(summary.sender_is_talking_with).toContain('with you');
     expect(summary.your_recent_messages_here).toContain('OpenAI');
+    expect(summary.conversation_so_far).toMatch(/Zack: 有啥新聞嗎今天\n- \[1m ago\] you: 今天/);
   });
 
   it('lists earlier unanswered messages as background only', () => {
@@ -603,5 +604,41 @@ describe('v2 pipeline end to end', () => {
     await t.post([t.msg('$q', '@AI in 5 今日のAIニュースは？', ZACK, { 'm.mentions': { user_ids: [NEWS] } })]);
     await t.runAlarmsFor(10_000);
     expect(t.envelopes[0]).toContain('Write your reply in English');
+  });
+
+  it('answers a crisis message even when it looks unrelated and nobody addressed the agent', async () => {
+    const crisisReply = (_env: unknown, event: InboundEvent) =>
+      /不想活/.test(event.text) ? '如果你有危險，請打 999 或 Samaritans 116 123。' : null;
+    const t = setup('should not be called', { v2: { crisisReply } });
+    await t.post([t.msg('$c', '我最近真的不想活了')]);
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes).toHaveLength(0);
+    expect(t.sent.at(-1)?.body.body).toContain('116 123');
+    expect(await t.log()).toMatch(/v2 crisis reply \$c/);
+  });
+
+  it('lets only one agent answer a crisis message in a group', async () => {
+    const t = setup('should not be called', { v2: { crisisReply: () => '請打 116 123。' } });
+    await t.post([t.msg('$c', '我最近真的不想活了')]);
+    await t.runAlarmsFor(200); // debounce flushed, agent is waiting its turn
+    await t.post([
+      {
+        event_id: '$peer_crisis',
+        sender: SPOTTED,
+        type: 'm.room.message',
+        origin_server_ts: Date.UTC(2026, 10, 25, 12, 0, 2),
+        content: { msgtype: 'm.text', body: '請打 116 123。', 'ai.narra.answers': { event_id: '$c' } },
+      },
+    ]);
+    await t.runAlarmsFor(10_000);
+    expect(t.sent).toHaveLength(0);
+    expect(await t.log()).toMatch(/v2 crisis yield \$c/);
+  });
+
+  it('ordinary messages pass the crisis check untouched', async () => {
+    const t = setup('今天三則 AI 新聞。', { v2: { crisisReply: () => null } });
+    await t.post([t.msg('$q', '有啥新聞嗎今天')]);
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes).toHaveLength(1);
   });
 });

@@ -203,6 +203,19 @@ export function buildLedgerSummary(input: LedgerSummaryInput): Record<string, st
       .join('\n');
   }
 
+  // The last few turns in order (people and agents), so follow-ups like a place name answering
+  // "where are you?" read naturally.
+  const timeline = history.filter((t) => t.eventId !== event.eventId && t.text.trim()).slice(-8);
+  if (timeline.length > 0) {
+    fields.conversation_so_far = timeline
+      .map((t) => {
+        const who = t.senderId === selfId ? 'you' : nameOf(t.senderId, members, history);
+        const mins = Math.max(0, Math.round((nowMs - t.timestampMs) / 60_000));
+        return `- [${mins}m ago] ${who}${t.isBroadcast ? ' (scheduled post)' : ''}: ${clip(t.text, 160)}`;
+      })
+      .join('\n');
+  }
+
   const mine = history.filter((t) => t.senderId === selfId && !t.isBroadcast).slice(-5);
   if (mine.length > 0) {
     fields.your_recent_messages_here = mine.map((t) => `- ${clip(t.text, 200)}`).join('\n');
