@@ -321,11 +321,16 @@ export const PEER_SESSION_WINDOW_MS = 90_000;
  * conversation with that peer, so a follow-up the peer chose to leave is not an unclaimed question.
  */
 export function peerSessionWithSender(event, timeline, selfMatrixId, windowMs = PEER_SESSION_WINDOW_MS) {
+    return peerSessionPartner(event, timeline, selfMatrixId, windowMs) !== null;
+}
+/** The peer agent the sender is mid-exchange with (see `peerSessionWithSender`), or null. */
+export function peerSessionPartner(event, timeline, selfMatrixId, windowMs = PEER_SESSION_WINDOW_MS) {
     const earlier = timeline
         .filter((turn) => turn.timestampMs < event.timestampMs && turn.eventId !== event.eventId)
         .sort((a, b) => a.timestampMs - b.timestampMs);
     const senderEventIds = new Set();
     let lastHumanIsSender = false;
+    let partner = null;
     for (const turn of earlier) {
         const turnIsAgent = Boolean(turn.isAgent) || isNarraAgent(turn.senderId);
         if (!turnIsAgent) {
@@ -339,10 +344,11 @@ export function peerSessionWithSender(event, timeline, selfMatrixId, windowMs = 
         if (event.timestampMs - turn.timestampMs > windowMs)
             continue;
         const target = turn.answersEventId ?? turn.replyToEventId;
-        if (target ? senderEventIds.has(target) : lastHumanIsSender)
-            return true;
+        if (target ? senderEventIds.has(target) : lastHumanIsSender) {
+            partner = { senderId: turn.senderId, ...(turn.senderName ? { senderName: turn.senderName } : {}) };
+        }
     }
-    return false;
+    return partner;
 }
 /**
  * Checks whether a peer `@agent-*` already answered THIS specific `event`
@@ -763,6 +769,7 @@ export function createWorkersAiTriageModel(ai, options = {}) {
             ].join('\n');
             const userPrompt = [
                 ...(historyLines.length > 0 ? ['recent_history:', ...historyLines] : []),
+                ...ongoingExchangeLines(event, context, spec),
                 `current_message: ${sig.text.slice(0, 320)}`,
             ].join('\n');
             let timer;
@@ -848,6 +855,23 @@ function parseAskVerdict(rawOutput) {
  * real question nobody claims can still be answered (see the group fallback in worker.ts).
  * Only content-free messages (emoji, punctuation) are dropped before the model.
  */
+/**
+ * Tells a triage model the sender is mid-exchange with another agent: added details and follow-ups
+ * belong to that agent ("他中午都会有圣诞的东西" after Spotted listed markets is not a food ask).
+ */
+function ongoingExchangeLines(event, context, spec) {
+    const partner = peerSessionPartner(event, context.recentHistory, spec.matrixId);
+    if (!partner)
+        return [];
+    const name = (partner.senderName ||
+        context.members.find((m) => m.matrixId === partner.senderId)?.displayName ||
+        'another agent').replace(/[\r\n]+/g, ' ').trim();
+    return [
+        `ongoing_exchange: the sender is in the middle of a conversation with ${name}, which just answered them. ` +
+            `If the newest message continues that conversation (adds a detail, narrows it down, reacts to it), it belongs to ${name}: ` +
+            `fit 0 for ${spec.name}. Only a clearly new need in ${spec.name}'s own domain gets a fit above 0.`,
+    ];
+}
 export function createAskTriageModel(ai, options = {}) {
     const model = options.model?.trim() || DEFAULT_WORKERS_AI_TRIAGE_MODEL;
     const timeoutMs = options.timeoutMs ?? 6_000;
@@ -887,6 +911,7 @@ export function createAskTriageModel(ai, options = {}) {
             ].join('\n');
             const userPrompt = [
                 ...(historyLines.length > 0 ? ['recent_history:', ...historyLines] : []),
+                ...ongoingExchangeLines(event, context, spec),
                 `newest_message: ${text.slice(0, 400)}`,
             ].join('\n');
             for (let attempt = 0; attempt <= retries; attempt++) {

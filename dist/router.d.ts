@@ -81,6 +81,13 @@ export declare const PEER_SESSION_WINDOW_MS = 90000;
  * conversation with that peer, so a follow-up the peer chose to leave is not an unclaimed question.
  */
 export declare function peerSessionWithSender(event: InboundEvent, timeline: ReadonlyArray<TimelineTurn>, selfMatrixId?: string, windowMs?: number): boolean;
+/** The peer agent the sender is mid-exchange with (see `peerSessionWithSender`), or null. */
+export declare function peerSessionPartner(event: InboundEvent, timeline: ReadonlyArray<TimelineTurn & {
+    senderName?: string;
+}>, selfMatrixId?: string, windowMs?: number): {
+    senderId: string;
+    senderName?: string;
+} | null;
 /**
  * Checks whether a peer `@agent-*` already answered THIS specific `event`
  * (either quoting it/any coalesced fragment, or answering unquoted BEFORE any subsequent human turn).
@@ -147,17 +154,6 @@ export interface AskTriageOptions {
     retries?: number;
     peerDirectory?: Record<string, string>;
 }
-/**
- * Language-agnostic group triage. No keyword lists: the model reads the message (any language),
- * the agent's domain, the other agents in the room and the recent turns, and answers two things:
- * - `ask`: is this a real question / request / expressed need to the group (not chatter, not a
- *   statement or acknowledgement, not talk between humans)?
- * - `fit`: how well can THIS agent help, counting reasonable adjacent needs (hunger for a food
- *   agent, "what to do tonight" for an events agent), lower when another agent here fits better.
- * The score is `fit` for asks and near zero otherwise; `ask` travels on the decision so that a
- * real question nobody claims can still be answered (see the group fallback in worker.ts).
- * Only content-free messages (emoji, punctuation) are dropped before the model.
- */
 export declare function createAskTriageModel(ai: unknown, options?: AskTriageOptions): TriageModel;
 export declare function routeEvent(event: InboundEvent, context: RoomContext, spec: AgentSpec, options?: RouteOptions): Promise<TriageDecision>;
 export declare const routeInboundEvent: typeof routeEvent;
