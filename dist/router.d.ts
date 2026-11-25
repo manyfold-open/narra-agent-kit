@@ -71,7 +71,16 @@ export interface TimelineTurn {
     isAgent?: boolean;
     timestampMs: number;
     replyToEventId?: string;
+    answersEventId?: string;
+    isBroadcast?: boolean;
 }
+/** How soon after a peer agent answered this sender a new message still counts as part of that exchange. */
+export declare const PEER_SESSION_WINDOW_MS = 90000;
+/**
+ * True when a peer agent answered this sender within `windowMs` before `event`: the sender is mid-
+ * conversation with that peer, so a follow-up the peer chose to leave is not an unclaimed question.
+ */
+export declare function peerSessionWithSender(event: InboundEvent, timeline: ReadonlyArray<TimelineTurn>, selfMatrixId?: string, windowMs?: number): boolean;
 /**
  * Checks whether a peer `@agent-*` already answered THIS specific `event`
  * (either quoting it/any coalesced fragment, or answering unquoted BEFORE any subsequent human turn).

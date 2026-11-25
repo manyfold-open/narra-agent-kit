@@ -65,6 +65,10 @@ export interface InboundEvent {
   timeIso: string;
   mentions: string[];
   replyToEventId?: string;
+  /** Kit agents' replies name the message they answer (`ai.narra.answers`), quoted or not. */
+  answersEventId?: string;
+  /** Kit agents' scheduled digests (`ai.narra.broadcast`): never an answer to anyone. */
+  isBroadcast?: boolean;
   replacesEventId?: string;
   redactsEventId?: string;
   reactionKey?: string;
@@ -90,6 +94,8 @@ export interface HistoryTurn {
   text: string;
   timestampMs: number;
   replyToEventId?: string;
+  answersEventId?: string;
+  isBroadcast?: boolean;
 }
 
 export interface ReplyTargetContext {
@@ -123,7 +129,7 @@ export interface RoomContext {
   roomThreshold?: number;
   activeSession?: ActiveSessionInfo;
   lastUnmentionedReplyAtMs?: number;
-  subsequentEvents?: Array<{ eventId: string; senderId: string; kind?: string }>;
+  subsequentEvents?: Array<{ eventId: string; senderId: string; kind?: string; answersEventId?: string; isBroadcast?: boolean }>;
   latestEventId?: string;
   latestHumanEventId?: string;
 }
@@ -176,6 +182,16 @@ export interface AgentUpdateItem {
   priority?: 'normal' | 'high';
   createdAt?: string;
   metadata?: Record<string, unknown>;
+  /**
+   * Keys of the things this update lists (e.g. pop-up ids). Each is remembered per room once sent,
+   * so a later digest skips what the room already saw, and skips the room if nothing is new.
+   */
+  itemKeys?: string[];
+  /**
+   * Renders the text in the room's language (from its recent human messages) for the items the room
+   * has not seen yet (all `itemKeys`, minus sent ones). Without it, `text` is posted as is.
+   */
+  render?: (lang: LangCode, freshItemKeys: string[]) => string;
 }
 
 export interface TriageModel {
