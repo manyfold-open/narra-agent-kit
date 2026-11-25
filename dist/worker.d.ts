@@ -54,6 +54,11 @@ export interface NarraGatewayEnv {
     NARRA_ROOM_DAILY_POSTS?: string;
     /** `on` applies room posting manners to every room, not only shadow/v2 rooms. */
     NARRA_ROOM_POSTING_RULES?: string;
+    /**
+     * `on`: rooms not listed in NARRA_PIPELINE_ROOMS are ignored entirely (no v1 replies, no
+     * broadcasts), so an agent's older gateway can keep serving them during a room-by-room move.
+     */
+    NARRA_PIPELINE_ONLY_LISTED?: string;
 }
 export interface NarraA2ACredentialResult {
     url: string;
@@ -96,6 +101,22 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
         profile?: string;
         /** Requests that belong to other agents; a message closer to these than to this agent never wakes it. */
         notExamples?: string[];
+        /** Reactions on this agent's own messages that count as a reply (e.g. ['👍','👌','✅'] to confirm). */
+        reactionsToSelf?: string[];
+        /** Start a fresh Manyfold conversation for every turn instead of one per room. */
+        freshContext?: boolean;
+        /**
+         * Agent-specific wake decision from its own state (not phrase lists), checked before relevance:
+         * 'wake' answers the message, 'skip' ignores it, null lets the kit decide.
+         */
+        wakeHint?: (env: TEnv, event: InboundEvent, context: RoomContext) => Promise<'wake' | 'skip' | null> | 'wake' | 'skip' | null;
+        /**
+         * Things the agent may want to say without being asked (a daily recap, a welcome). On every
+         * cron kick the kit asks for them, applies the room's posting manners (daily cap shared with
+         * other agents, daytime, quiet) unless an item overrides them, dedupes by `key`, and lets the
+         * brain write the message from `note` (it can still answer [NO_REPLY]). v2 rooms only.
+         */
+        proactive?: (env: TEnv, nowMs: number) => Promise<V2ProactiveItem[]> | V2ProactiveItem[];
         gate?: Partial<WakeGateOptions>;
         /** Timeout for the Manyfold brain call (default 25s). */
         brainTimeoutMs?: number;
@@ -120,6 +141,17 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
     now?: () => number;
     /** Injectable sleep for deterministic testing. */
     sleep?: (ms: number) => Promise<void>;
+}
+export interface V2ProactiveItem {
+    roomId: string;
+    /** Sent once per room per key (e.g. `daily:2026-11-25`). */
+    key: string;
+    /** What the brain should do, e.g. "[penny nudge] daily 2026-11-25". Passed as the turn's text. */
+    note: string;
+    /** Override room posting manners for this item (e.g. a 21:00 recap: { endHour: 23 }). */
+    rules?: Partial<RoomPostingRules>;
+    /** Skip room posting manners entirely (e.g. a welcome right after being added). */
+    ignoreRoomRules?: boolean;
 }
 export type NarraMatrixOp = {
     op: 'send';
@@ -179,6 +211,7 @@ export interface NarraGatewayKickResult {
     syncKicked: boolean;
     syncRunning: boolean;
     broadcast: BroadcastScheduleResult | null;
+    proactiveQueued?: number;
 }
 export interface NarraGatewayStatus {
     enabled: boolean;
@@ -215,6 +248,8 @@ export declare function createDefaultTriageModel(env: NarraGatewayEnv): TriageMo
  * talking to each other: rank by hash of (event, agent). Returns this agent's rank.
  */
 export declare function groupFallbackRank(eventId: string, selfMatrixId: string, members: RoomMemberInfo[]): number;
+/** True when this room is outside NARRA_PIPELINE_ROOMS and NARRA_PIPELINE_ONLY_LISTED=on. */
+export declare function isUnlistedRoomIgnored(env: NarraGatewayEnv | undefined | null, roomId: string): boolean;
 /** Room posting manners for scheduled posts: on for shadow/v2 rooms, or everywhere with NARRA_ROOM_POSTING_RULES=on. */
 export declare function roomPostingRulesFor(env: NarraGatewayEnv | undefined | null, roomId: string): RoomPostingRules | undefined;
 /**

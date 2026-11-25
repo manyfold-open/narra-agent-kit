@@ -17,6 +17,9 @@ export type WakeReason =
   | 'reply_to_you'
   | 'your_conversation'
   | 'handoff'
+  | 'reaction_to_you'
+  | 'proactive'
+  | 'agent_hint'
   | 'relevant'
   | 'not_text'
   | 'from_agent'
@@ -50,6 +53,8 @@ export interface WakeGateOptions {
   maxDelayMs: number;
   /** Shortest wait before claiming an unaddressed message. */
   minDelayMs: number;
+  /** Reactions on this agent's own messages that count as a reply to it (e.g. 👍 to confirm). */
+  reactionsToSelf?: readonly string[];
 }
 
 export const DEFAULT_WAKE_GATE_OPTIONS: WakeGateOptions = {
@@ -93,6 +98,20 @@ export async function decideWake(input: WakeGateInput): Promise<WakeDecision> {
   const opts = { ...DEFAULT_WAKE_GATE_OPTIONS, ...(input.options ?? {}) };
   const selfId = spec.matrixId;
 
+  if (event.kind === 'reaction') {
+    const key = (event.reactionKey ?? event.text ?? '').replace(/[\uFE0F\u{1F3FB}-\u{1F3FF}]/gu, '').trim();
+    const wanted = (opts.reactionsToSelf ?? []).map((r) => r.replace(/[\uFE0F\u{1F3FB}-\u{1F3FF}]/gu, '').trim());
+    if (
+      key &&
+      wanted.includes(key) &&
+      context.replyToTarget?.isSelf &&
+      event.senderId !== selfId &&
+      !isNarraAgent(event.senderId)
+    ) {
+      return direct('reaction_to_you');
+    }
+    return drop('not_text');
+  }
   if (event.kind !== 'text' && event.kind !== 'compound' && event.kind !== 'voice' && event.kind !== 'image') {
     return drop('not_text');
   }

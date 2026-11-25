@@ -7,6 +7,7 @@ import {
   applyClaimRedaction,
   buildLedgerSummary,
   createNarraWorkerGateway,
+  kickNarraGateway,
   decideWake,
   emptyRoomState,
   parseBrainOutput,
@@ -421,11 +422,16 @@ function sse(text: string): Response {
 
 const ROOM = '!zacktest:matrix.netmind.chat';
 
-function setup(brainReply: string | (() => string | Response), extraConfig: Partial<NarraGatewayConfig<NarraGatewayEnv>> = {}) {
+function setup(
+  brainReply: string | (() => string | Response),
+  extraConfig: Partial<NarraGatewayConfig<NarraGatewayEnv>> = {},
+  extraEnv: Partial<NarraGatewayEnv> = {},
+) {
   let nowMs = Date.UTC(2026, 10, 25, 12, 0, 0);
   const sent: Array<{ type: string; body: Record<string, unknown> }> = [];
   const redactions: string[] = [];
   const envelopes: string[] = [];
+  const rawRequests: string[] = [];
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     if (url.endsWith('/api/agent-runtime/matrix-credential')) {
@@ -444,6 +450,7 @@ function setup(brainReply: string | (() => string | Response), extraConfig: Part
     if (url === 'https://a2a.test/rpc') {
       const req = JSON.parse(String(init?.body ?? '{}')) as { params: { message: { parts: Array<{ text: string }> } } };
       envelopes.push(req.params.message.parts[0].text);
+      rawRequests.push(String(init?.body ?? ''));
       const reply = typeof brainReply === 'function' ? brainReply() : brainReply;
       return reply instanceof Response ? reply : sse(reply);
     }
@@ -477,6 +484,7 @@ function setup(brainReply: string | (() => string | Response), extraConfig: Part
     NARRA_ROOM_DO: rooms.namespace,
     NARRA_PIPELINE: 'v2',
     NARRA_PIPELINE_ROOMS: ROOM,
+    ...extraEnv,
   };
   const room = rooms.ensure(ROOM);
   const post = (events: unknown[]) =>
@@ -505,7 +513,10 @@ function setup(brainReply: string | (() => string | Response), extraConfig: Part
     nowMs += ms;
   };
   const log = async () => ((await room.storage.get<string[]>('log')) ?? []).join('\n');
-  return { sent, redactions, envelopes, post, msg, runAlarmsFor, advance, log, room };
+  const kick = () => kickNarraGateway(env, config);
+  const storage = room.storage;
+  const rawBodies = rawRequests;
+  return { sent, redactions, envelopes, post, msg, runAlarmsFor, advance, log, room, kick, storage, rawBodies, rooms };
 }
 
 describe('v2 pipeline end to end', () => {
@@ -688,5 +699,75 @@ describe('v2 pipeline end to end', () => {
     await t.runAlarmsFor(10_000);
     expect(t.sent.filter((s) => s.type === 'm.room.message')).toHaveLength(0);
     expect(await t.log()).toMatch(/v2 yield_after_brain \$q/);
+  });
+
+  it('a 👍 on its own message counts as a reply when the agent asks for it', async () => {
+    let n = 0;
+    const t = setup(() => (n++ === 0 ? '#21 晚餐 £120，大家回 OK 或按 👍 確認。' : '好，#21 已確認。'), { v2: { reactionsToSelf: ['👍'] } });
+    await t.post([t.msg('$q', '@AI in 5 記一下晚餐 120', ZACK, { 'm.mentions': { user_ids: [NEWS] } })]);
+    await t.runAlarmsFor(10_000);
+    const proposalId = '$out_' + t.sent.length;
+    await t.post([
+      { event_id: '$like', sender: ZACK, type: 'm.reaction', origin_server_ts: Date.UTC(2026, 10, 25, 12, 1, 0), content: { 'm.relates_to': { rel_type: 'm.annotation', event_id: proposalId, key: '👍' } } },
+    ]);
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes).toHaveLength(2);
+    expect(t.envelopes[1]).toContain('reacted_to_you');
+    expect(t.sent.at(-1)?.body.body).toBe('好，#21 已確認。');
+  });
+
+  it('ignores reactions when the agent did not ask for them', async () => {
+    const t = setup('should not be called');
+    await t.post([
+      { event_id: '$like', sender: ZACK, type: 'm.reaction', origin_server_ts: Date.UTC(2026, 10, 25, 12, 0, 0), content: { 'm.relates_to': { rel_type: 'm.annotation', event_id: '$x', key: '👍' } } },
+    ]);
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes).toHaveLength(0);
+  });
+
+  it('an agent hint wakes it for messages that look unrelated, or keeps it out', async () => {
+    const t = setup('好，#21 已確認。', { v2: { wakeHint: (_env, event) => (event.text === '好' ? 'wake' : /晚餐/.test(event.text) ? 'skip' : null) } });
+    await t.post([t.msg('$ok', '好')]);
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes).toHaveLength(1);
+    await t.post([t.msg('$n', '有啥 AI 新聞')]);
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes).toHaveLength(2);
+    await t.post([t.msg('$d', '晚餐 AI 新聞')]);
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes).toHaveLength(2);
+  });
+
+  it('can start every turn in a fresh conversation', async () => {
+    const t = setup('ok', { v2: { freshContext: true } });
+    await t.storage.put('a2aContextId', 'ctx-room');
+    await t.post([t.msg('$q', '@AI in 5 在嗎', ZACK, { 'm.mentions': { user_ids: [NEWS] } })]);
+    await t.runAlarmsFor(10_000);
+    expect(t.rawBodies[0]).not.toContain('ctx-room');
+  });
+
+  it('with ONLY_LISTED, ignores rooms outside the list entirely', async () => {
+    const t = setup('should not be called', {}, { NARRA_PIPELINE_ROOMS: '!other:matrix.netmind.chat', NARRA_PIPELINE_ONLY_LISTED: 'on' });
+    await t.post([t.msg('$q', '@AI in 5 在嗎', ZACK, { 'm.mentions': { user_ids: [NEWS] } })]);
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes).toHaveLength(0);
+    expect(t.sent).toHaveLength(0);
+  });
+
+  it('lets the brain write a scheduled post once per key, marked as a scheduled post', async () => {
+    const t = setup('今天記了 3 筆，共 £86。', {
+      v2: { proactive: () => [{ roomId: ROOM, key: 'daily:2026-11-25', note: '[penny nudge] daily 2026-11-25' }] },
+    });
+    await t.post([]);
+    await t.kick();
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes[0]).toContain('[penny nudge] daily 2026-11-25');
+    expect(t.envelopes[0]).toContain('your own scheduled turn');
+    const post = t.sent.find((s) => s.type === 'm.room.message');
+    expect(post?.body.body).toBe('今天記了 3 筆，共 £86。');
+    expect(JSON.stringify(post?.body)).toContain('ai.narra.broadcast');
+    await t.kick();
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes).toHaveLength(1);
   });
 });

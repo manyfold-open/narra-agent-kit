@@ -28,6 +28,18 @@ export async function decideWake(input) {
     const { event, context, spec, mode, nowMs } = input;
     const opts = { ...DEFAULT_WAKE_GATE_OPTIONS, ...(input.options ?? {}) };
     const selfId = spec.matrixId;
+    if (event.kind === 'reaction') {
+        const key = (event.reactionKey ?? event.text ?? '').replace(/[\uFE0F\u{1F3FB}-\u{1F3FF}]/gu, '').trim();
+        const wanted = (opts.reactionsToSelf ?? []).map((r) => r.replace(/[\uFE0F\u{1F3FB}-\u{1F3FF}]/gu, '').trim());
+        if (key &&
+            wanted.includes(key) &&
+            context.replyToTarget?.isSelf &&
+            event.senderId !== selfId &&
+            !isNarraAgent(event.senderId)) {
+            return direct('reaction_to_you');
+        }
+        return drop('not_text');
+    }
     if (event.kind !== 'text' && event.kind !== 'compound' && event.kind !== 'voice' && event.kind !== 'image') {
         return drop('not_text');
     }

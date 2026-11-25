@@ -64,6 +64,8 @@ Switch it on per room, without touching other rooms:
 }
 ```
 
+For agents with their own state (e.g. a ledger): `v2.reactionsToSelf` (a 👍 on the agent's message counts as a reply), `v2.wakeHint` (wake/skip from the agent's state), `v2.freshContext` (no shared Manyfold context), `v2.proactive` (brain-written scheduled posts under the room's posting manners), and `NARRA_PIPELINE_ONLY_LISTED=on` (ignore rooms outside `NARRA_PIPELINE_ROOMS`, so an older gateway can keep them during a room-by-room move).
+
 Optional config: `v2.wakeExamples` (example requests in any language), `v2.gate` (thresholds), `v2.safetyReply` (deterministic safety replies that must not depend on the brain, e.g. crisis resources). Logs: `v2 gate`, `v2 yield`, `v2 silent`, `v2 reacted`, `v2 answered … in Nms`, `v2-shadow` (next to v1's decision).
 
 ## Why Zero Extra LLM API Key Is Required
