@@ -45,6 +45,27 @@ BurstCoalescer (Durable Object / in-memory, 1800ms window)
 
 ---
 
+## Chat-native pipeline (v2, opt-in)
+
+v2 treats the Manyfold agent as the agent itself and the Worker as its ears and hands. Per turn:
+
+1. **Wake gate** (`src/v2/gate.ts`): DMs, @mentions, replies and the agent's own ongoing conversation always wake it. Other group messages are scored against the agent's profile with one small multilingual embedding call (`src/v2/relevance.ts`, default `@cf/baai/bge-m3`); below the threshold nothing else runs. More relevant agents wait less before claiming.
+2. **Claim**: the agent reacts 👀 on the message. Other agents that see a live 👀 from a peer, or a marked answer, step back. The 👀 is removed once the agent has answered, reacted or stayed silent.
+3. **Brain**: Manyfold gets the usual envelope plus a compact room ledger (`src/v2/ledger.ts`: who is talking with whom, unanswered messages, what this agent already said here, reply mode) and chat-behaviour notes. It replies, or starts with `[NO_REPLY]`, `[REACT ❤️]` or `[MODE mention|ambient|quiet]` (`src/v2/actions.ts`). Silence leaves no trace; only someone who addressed the agent directly is told when it failed.
+4. **Room manners for scheduled posts**: in v2/shadow rooms, all agents together post at most `NARRA_ROOM_DAILY_POSTS` (default 3) per room per London day, 09:00–21:00, never within 10 minutes of a human message.
+5. **Budget**: relevance calls are counted per agent per day in D1 (`narra_usage_daily`); past `NARRA_DAILY_RELEVANCE_LIMIT` (default 3000) the agent answers only when addressed.
+
+Switch it on per room, without touching other rooms:
+
+```jsonc
+"vars": {
+  "NARRA_PIPELINE": "shadow",              // v1 | shadow (log what v2 would do) | v2
+  "NARRA_PIPELINE_ROOMS": "!roomA:matrix.netmind.chat"
+}
+```
+
+Optional config: `v2.wakeExamples` (example requests in any language), `v2.gate` (thresholds), `v2.safetyReply` (deterministic safety replies that must not depend on the brain, e.g. crisis resources). Logs: `v2 gate`, `v2 yield`, `v2 silent`, `v2 reacted`, `v2 answered … in Nms`, `v2-shadow` (next to v1's decision).
+
 ## Why Zero Extra LLM API Key Is Required
 
 1. **Tier 0 runs deterministically in ~1ms at \$0**: self/agent filtering, `aimed_elsewhere`, stale group cutoff, mute checks, 1v1 DM routing, explicit `@mention` routing, reply-to-self, and 3-minute multi-turn `activeSession[room, user]` require zero model calls.

@@ -6,9 +6,11 @@ import {
 } from './adapters/manyfold-a2a.js';
 import {
   D1BroadcastStore,
+  DEFAULT_ROOM_POSTING_RULES,
   InMemoryBroadcastStore,
   ProactiveBroadcastScheduler,
   type BroadcastScheduleResult,
+  type RoomPostingRules,
 } from './broadcast.js';
 import { runSchemaStatements } from './d1.js';
 import { BurstCoalescer, type PendingBurstBuffer } from './debounce.js';
@@ -20,7 +22,7 @@ import {
   sanitizeMobileLinks,
   stripLeakedNotes,
 } from './guard.js';
-import { detectExplicitLangSwitch, detectLang, isZhOrEn, stripAgentMentions } from './lang.js';
+import { detectExplicitLangSwitch, detectForeignLanguage, detectLang, isZhOrEn, stripAgentMentions } from './lang.js';
 import {
   MemoryStore,
   handleStandardMemoryCommand,
@@ -76,6 +78,23 @@ import type {
   TriageDecision,
   TriageModel,
 } from './types.js';
+import { chatBehaviourNote, parseBrainOutput } from './v2/actions.js';
+import { DEFAULT_DAILY_RELEVANCE_LIMIT, NARRA_USAGE_SCHEMA, parseLimit, UsageBudget } from './v2/budget.js';
+import { decideWake, type WakeDecision, type WakeGateOptions } from './v2/gate.js';
+import {
+  CLAIM_REACTION,
+  applyClaimReaction,
+  applyClaimRedaction,
+  buildLedgerSummary,
+  emptyRoomState,
+  peerAnswered,
+  peerClaimHolder,
+  pruneClaims,
+  type ReplyMode,
+  type V2RoomState,
+} from './v2/ledger.js';
+import { pipelineForRoom } from './v2/pipeline.js';
+import { scoreRelevance, type RelevanceResult } from './v2/relevance.js';
 
 const DEFAULT_NARRA_API_ENDPOINT = 'https://api.netmind.chat';
 const DEFAULT_MATRIX_HOMESERVER = 'https://matrix.netmind.chat';
@@ -136,6 +155,22 @@ export interface NarraGatewayEnv {
    * question that no agent claims still gets one answer. Anything else keeps the keyword-gated triage.
    */
   NARRA_GROUP_TRIAGE?: string;
+  /** `v1` (default) | `shadow` | `v2`: which turn pipeline runs (see src/v2/pipeline.ts). */
+  NARRA_PIPELINE?: string;
+  /** Comma-separated room ids that `shadow`/`v2` apply to; empty = every room. */
+  NARRA_PIPELINE_ROOMS?: string;
+  /** v2: default reply mode for rooms that never chose one (`ambient` | `mention` | `quiet`). */
+  NARRA_V2_DEFAULT_MODE?: string;
+  /** v2: relevance (0..1) needed to wake on an unaddressed group message. */
+  NARRA_WAKE_THRESHOLD?: string;
+  /** v2: Workers AI embedding model for relevance scoring. */
+  NARRA_EMBEDDING_MODEL?: string;
+  /** v2: max relevance-scoring calls per agent per UTC day; after that the agent answers only when addressed. */
+  NARRA_DAILY_RELEVANCE_LIMIT?: string;
+  /** Scheduled posts per room per local day, across all agents (default 3). */
+  NARRA_ROOM_DAILY_POSTS?: string;
+  /** `on` applies room posting manners to every room, not only shadow/v2 rooms. */
+  NARRA_ROOM_POSTING_RULES?: string;
 }
 
 export interface NarraA2ACredentialResult {
@@ -182,6 +217,19 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
   enableA2AFailureReply?: boolean;
   /** Custom failure apology text when `enableA2AFailureReply` is enabled or a thinking bubble was already posted. */
   a2aFailureReply?: (lang: LangCode, event: InboundEvent) => string;
+  /** Chat-native (v2) pipeline settings. */
+  v2?: {
+    /** Example requests this agent is good at, in any language; sharpen relevance scoring. */
+    wakeExamples?: string[];
+    gate?: Partial<WakeGateOptions>;
+    /** Timeout for the Manyfold brain call (default 25s). */
+    brainTimeoutMs?: number;
+    /**
+     * Deterministic safety replies that must not depend on the brain (e.g. crisis resources).
+     * Runs on every woken turn before Manyfold; a non-null result is posted as the reply.
+     */
+    safetyReply?: (env: TEnv, event: InboundEvent, context: RoomContext) => Promise<string | null> | string | null;
+  };
   /** Injectable clock for deterministic testing. */
   now?: () => number;
   /** Injectable sleep for deterministic testing. */
@@ -200,6 +248,8 @@ export type NarraMatrixOp =
       content?: Record<string, unknown>;
     }
   | { op: 'typing'; roomId: string; typing: boolean; timeoutMs?: number }
+  | { op: 'react'; roomId: string; eventId: string; key: string; txnId?: string }
+  | { op: 'redact'; roomId: string; eventId: string; txnId?: string }
   | { op: 'receipt'; roomId: string; eventId: string }
   | { op: 'fetchEvent'; roomId: string; eventId: string }
   | { op: 'recentMessages'; roomId: string; limit?: number };
@@ -281,6 +331,10 @@ interface PendingTurn {
   decision?: TriageDecision;
   thinkingEventId?: string;
   lastError?: string;
+  /** v2: the wake decision, kept while the turn waits for better-fitting agents. */
+  v2Decision?: WakeDecision;
+  /** v2: this agent's 👀 claim reaction on the message. */
+  v2ClaimEventId?: string;
 }
 
 /** A real question nobody claimed: the first elected agent answers after this long... */
@@ -446,7 +500,7 @@ async function ensureGatewaySchemas(db: D1Database): Promise<void> {
       await mem.ensureSchema();
       const bcast = new D1BroadcastStore(db);
       await bcast.ensureSchema();
-      await runSchemaStatements(db, NARRA_GATEWAY_STATE_SCHEMA);
+      await runSchemaStatements(db, NARRA_GATEWAY_STATE_SCHEMA + NARRA_USAGE_SCHEMA);
     })().catch((err) => {
       schemaInitCache.delete(db);
       throw err;
@@ -454,6 +508,19 @@ async function ensureGatewaySchemas(db: D1Database): Promise<void> {
     schemaInitCache.set(db, pending);
   }
   await pending;
+}
+
+/** Room posting manners for scheduled posts: on for shadow/v2 rooms, or everywhere with NARRA_ROOM_POSTING_RULES=on. */
+export function roomPostingRulesFor(
+  env: NarraGatewayEnv | undefined | null,
+  roomId: string,
+): RoomPostingRules | undefined {
+  const forced = (env?.NARRA_ROOM_POSTING_RULES ?? '').trim().toLowerCase() === 'on';
+  if (!forced && pipelineForRoom(env, roomId) === 'v1') return undefined;
+  return {
+    ...DEFAULT_ROOM_POSTING_RULES,
+    dailyCap: parseLimit(env?.NARRA_ROOM_DAILY_POSTS, DEFAULT_ROOM_POSTING_RULES.dailyCap),
+  };
 }
 
 /**
@@ -969,7 +1036,15 @@ export class BaseNarraMatrixSync<TEnv extends NarraGatewayEnv = NarraGatewayEnv>
     let url: string;
     let body: unknown;
 
-    if (op.op === 'send') {
+    if (op.op === 'react') {
+      const txnId = op.txnId || crypto.randomUUID();
+      url = `${roomBase}/send/m.reaction/${enc(txnId)}`;
+      body = { 'm.relates_to': { rel_type: 'm.annotation', event_id: op.eventId, key: op.key } };
+    } else if (op.op === 'redact') {
+      const txnId = op.txnId || crypto.randomUUID();
+      url = `${roomBase}/redact/${enc(op.eventId)}/${enc(txnId)}`;
+      body = {};
+    } else if (op.op === 'send') {
       const txnId = op.txnId || crypto.randomUUID();
       url = `${roomBase}/send/m.room.message/${enc(txnId)}`;
       body = op.content;
@@ -2106,6 +2181,8 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         const storedBursts = (await this.ctx.storage.get<PendingBurstBuffer[]>('bursts')) ?? [];
         let pendingTurns = (await this.ctx.storage.get<PendingTurn[]>('pendingTurns')) ?? [];
         const coalescer = this.createCoalescer(nowMs, storedBursts);
+        const v2State = (await this.ctx.storage.get<V2RoomState>('v2State')) ?? emptyRoomState();
+        let v2Dirty = false;
 
         let accepted = 0;
 
@@ -2150,6 +2227,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
 
           if (ev.kind === 'redaction' && ev.redactsEventId) {
             const targetId = ev.redactsEventId;
+            if (applyClaimRedaction(v2State, targetId)) v2Dirty = true;
             if (!redactedSet.has(targetId)) {
               redactedSet.add(targetId);
               redactedList.push(targetId);
@@ -2207,6 +2285,8 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             }
             continue;
           }
+
+          if (ev.kind === 'reaction' && applyClaimReaction(v2State, ev, selfMatrixId)) v2Dirty = true;
 
           const isSelf = Boolean(selfMatrixId && ev.senderId === selfMatrixId);
           const isAgent = isSelf || isNarraAgent(ev.senderId);
@@ -2327,6 +2407,10 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           }
         }
 
+        if (v2Dirty) {
+          pruneClaims(v2State, nowMs);
+          await this.ctx.storage.put('v2State', v2State);
+        }
         await this.ctx.storage.put('handledIds', handledList.slice(-MAX_HANDLED_IDS));
         await this.ctx.storage.put('redactedIds', redactedList.slice(-MAX_REDACTED_IDS));
         await this.ctx.storage.put('recentHistory', history.slice(-MAX_RECENT_HISTORY));
@@ -2517,6 +2601,362 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     return false;
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // Chat-native (v2) pipeline. The Worker is the agent's ears and hands: it decides cheaply whether
+  // the Manyfold brain should look at a message, claims it with 👀 so other agents step back, hands
+  // the brain a compact picture of the room, and carries out what the brain decides (reply, react,
+  // stay silent, change how often it speaks). The brain decides what is said.
+  // ---------------------------------------------------------------------------------------------
+
+  private v2Mode(state: V2RoomState, context: RoomContext): ReplyMode {
+    if (state.mode) return state.mode;
+    if (context.roomMuted) return 'quiet';
+    const raw = (this.env.NARRA_V2_DEFAULT_MODE ?? '').trim().toLowerCase();
+    return raw === 'mention' || raw === 'quiet' ? raw : 'ambient';
+  }
+
+  private v2Budget(spec: AgentSpec): UsageBudget {
+    return new UsageBudget(this.env.DB as never, spec.id);
+  }
+
+  private async v2Gate(
+    event: InboundEvent,
+    context: RoomContext,
+    spec: AgentSpec,
+    mode: ReplyMode,
+    nowMs: number,
+  ): Promise<{ decision: WakeDecision; relevance?: RelevanceResult }> {
+    const cfg = this.getConfig();
+    const budget = this.v2Budget(spec);
+    const limit = parseLimit(this.env.NARRA_DAILY_RELEVANCE_LIMIT, DEFAULT_DAILY_RELEVANCE_LIMIT);
+    const budgetExhausted = await budget.relevanceExhausted(nowMs, limit);
+    let relevance: RelevanceResult | undefined;
+    const threshold = Number(this.env.NARRA_WAKE_THRESHOLD);
+    const decision = await decideWake({
+      event,
+      context,
+      spec,
+      mode,
+      nowMs,
+      budgetExhausted,
+      options: {
+        ...(cfg.v2?.gate ?? {}),
+        ...(Number.isFinite(threshold) && (this.env.NARRA_WAKE_THRESHOLD ?? '').trim() !== '' ? { threshold } : {}),
+      },
+      score: async () => {
+        const mentionNames = [spec.name, ...(spec.aliases ?? []), ...context.members.flatMap((m) => (m.displayName ? [m.displayName] : []))];
+        relevance = await scoreRelevance(
+          stripAgentMentions(event.text ?? '', mentionNames),
+          spec,
+          cfg.v2?.wakeExamples ?? [],
+          {
+            ai: this.env.AI,
+            ...(this.env.NARRA_EMBEDDING_MODEL ? { model: this.env.NARRA_EMBEDDING_MODEL } : {}),
+            cache: {
+              get: (key) => this.ctx.storage.get<number[][]>(key),
+              put: (key, value) => this.ctx.storage.put(key, value),
+            },
+          },
+          { event, context },
+        );
+        if (relevance.source === 'embedding') await budget.add('relevance', nowMs);
+        return relevance.score;
+      },
+    });
+    return { decision, ...(relevance ? { relevance } : {}) };
+  }
+
+  private describeGate(decision: WakeDecision, relevance?: RelevanceResult): string {
+    const parts = [`wake=${decision.wake}`, decision.reason];
+    if (decision.score !== undefined) parts.push(`score=${decision.score.toFixed(2)}`);
+    if (relevance?.cosine !== undefined) parts.push(`cos=${relevance.cosine}`);
+    if (relevance) parts.push(`via=${relevance.source}`);
+    if (decision.delayMs) parts.push(`delay=${decision.delayMs}`);
+    return parts.join(' ');
+  }
+
+  /** Shadow mode: log what v2 would do with this turn, next to v1's decision. No brain call. */
+  private async logShadowV2(
+    turn: PendingTurn,
+    context: RoomContext,
+    spec: AgentSpec,
+    v1Decision: TriageDecision,
+  ): Promise<void> {
+    const state = (await this.ctx.storage.get<V2RoomState>('v2State')) ?? emptyRoomState();
+    const nowMs = this.nowMs();
+    const { decision, relevance } = await this.v2Gate(turn.event, context, spec, this.v2Mode(state, context), nowMs);
+    await appendDoLog(
+      this.ctx.storage,
+      `v2-shadow ${turn.event.eventId}: ${this.describeGate(decision, relevance)} | v1 reply=${v1Decision.shouldReply} ${v1Decision.reason}`,
+      nowMs,
+      this.env,
+    );
+  }
+
+  private async releaseV2Claim(turn: PendingTurn): Promise<void> {
+    if (!turn.v2ClaimEventId) return;
+    const claimId = turn.v2ClaimEventId;
+    turn.v2ClaimEventId = undefined;
+    await this.matrixOp({
+      op: 'redact',
+      roomId: turn.event.roomId,
+      eventId: claimId,
+      txnId: await deterministicTxnId(`unclaim:${claimId}`),
+    }).catch(() => undefined);
+  }
+
+  private async recordOwnReply(turn: PendingTurn, spec: AgentSpec, text: string, eventId: string, replyToEventId?: string): Promise<void> {
+    const at = this.nowMs();
+    await this.runLocked(async () => {
+      const postedId = eventId || `sent:${turn.event.eventId}`;
+      const ownMessages = (await this.ctx.storage.get<StoredOwnMessage[]>('ownMessages')) ?? [];
+      ownMessages.push({ eventId: postedId, text: text.slice(0, 1000), timestampMs: at });
+      await this.ctx.storage.put('ownMessages', ownMessages.slice(-MAX_OWN_MESSAGES));
+      const history = (await this.ctx.storage.get<HistoryTurn[]>('recentHistory')) ?? [];
+      history.push({
+        eventId: postedId,
+        senderId: spec.matrixId ?? '',
+        senderName: spec.name,
+        isAgent: true,
+        isSelf: true,
+        text: text.slice(0, 1000),
+        timestampMs: at,
+        answersEventId: turn.event.eventId,
+        ...(replyToEventId ? { replyToEventId } : {}),
+      });
+      await this.ctx.storage.put('recentHistory', history.slice(-MAX_RECENT_HISTORY));
+      const consec = ((await this.ctx.storage.get<number>('consecutiveAgentMessages')) ?? 0) + 1;
+      await this.ctx.storage.put('consecutiveAgentMessages', consec);
+      if (eventId) {
+        await this.ctx.storage.put('latestEventId', eventId);
+        await this.markEventHandled(eventId);
+      }
+    });
+  }
+
+  private async runTurnV2(turn: PendingTurn, spec: AgentSpec, memoryStore: MemoryStore | null): Promise<void> {
+    const cfg = this.getConfig();
+    const roomId = turn.event.roomId;
+    const eventIds = turn.event.coalescedEventIds ?? [turn.event.eventId];
+    let nowMs = this.nowMs();
+    const context = await this.buildRoomContextForTurn(turn, spec, memoryStore, nowMs);
+    const state = (await this.ctx.storage.get<V2RoomState>('v2State')) ?? emptyRoomState();
+    const mode = this.v2Mode(state, context);
+
+    let decision = turn.v2Decision;
+    if (!decision) {
+      const gated = await this.v2Gate(turn.event, context, spec, mode, nowMs);
+      decision = gated.decision;
+      await appendDoLog(this.ctx.storage, `v2 gate ${turn.event.eventId}: ${this.describeGate(decision, gated.relevance)}`, nowMs, this.env);
+      if (!decision.wake) {
+        await this.removePendingTurn(turn.event.eventId);
+        return;
+      }
+      if (decision.delayMs > 0) {
+        // Let better-fitting agents claim first; come back without blocking the room's queue.
+        await this.updatePendingTurn({ ...turn, v2Decision: decision, dueAtMs: nowMs + decision.delayMs });
+        return;
+      }
+      turn.v2Decision = decision;
+    }
+
+    if (!decision.direct && !turn.v2ClaimEventId) {
+      const holder =
+        peerClaimHolder(state, eventIds, spec.matrixId, nowMs) ??
+        peerAnswered(context.recentHistory, eventIds, spec.matrixId);
+      if (holder) {
+        await appendDoLog(this.ctx.storage, `v2 yield ${turn.event.eventId}: handled by ${holder}`, nowMs, this.env);
+        await this.removePendingTurn(turn.event.eventId);
+        return;
+      }
+    }
+
+    try {
+      if (decision.claim && context.chatType === 'group' && !turn.v2ClaimEventId) {
+        const claim = await this.matrixOp({
+          op: 'react',
+          roomId,
+          eventId: turn.event.eventId,
+          key: CLAIM_REACTION,
+          txnId: await deterministicTxnId(`claim:${turn.event.eventId}`),
+        });
+        if (claim.ok && claim.eventId) {
+          turn.v2ClaimEventId = claim.eventId;
+          await this.updatePendingTurn(turn);
+        }
+      }
+
+      const safety = cfg.v2?.safetyReply ? await Promise.resolve(cfg.v2.safetyReply(this.env, turn.event, context)).catch(() => null) : null;
+      if (safety) {
+        const posted = await this.postReplyToRoom(roomId, safety, turn.event.eventId, spec.matrixId, undefined, turn.event.eventId);
+        await this.recordOwnReply(turn, spec, safety, posted.eventId);
+        await this.releaseV2Claim(turn);
+        await appendDoLog(this.ctx.storage, `v2 safety reply ${turn.event.eventId}`, this.nowMs(), this.env);
+        await this.removePendingTurn(turn.event.eventId);
+        return;
+      }
+
+      void this.matrixOp({ op: 'typing', roomId, typing: true }).catch(() => undefined);
+      const typingTimer = setInterval(() => {
+        void this.matrixOp({ op: 'typing', roomId, typing: true }).catch(() => undefined);
+      }, TYPING_REFRESH_MS);
+
+      let raw = '';
+      try {
+        const memories = memoryStore
+          ? await memoryStore.recallForTurn({ roomId, userId: turn.event.senderId, chatType: context.chatType })
+          : emptyMemories();
+        const foreign = detectForeignLanguage(turn.event.text ?? '');
+        const lang = detectLang(turn.event.text ?? '');
+        const triageLike: TriageDecision = {
+          shouldReply: true,
+          tier: decision.direct ? 0 : 1,
+          reason: decision.direct
+            ? decision.reason === 'reply_to_you'
+              ? 'reply_to_self'
+              : decision.reason === 'dm'
+                ? 'dm'
+                : 'explicit_mention'
+            : `v2_${decision.reason}`,
+          confidence: decision.score ?? 1,
+          detectedLang: lang,
+          shouldQuote: false,
+          ...(foreign ? { replyLang: foreign } : {}),
+        };
+        const [cred, extraFields, storedContextId] = await Promise.all([
+          Promise.resolve(cfg.resolveA2ACredential?.(this.env) ?? defaultResolveA2ACredential(this.env, spec)),
+          cfg.buildExtraEnvelopeFields
+            ? cfg.buildExtraEnvelopeFields(this.env, turn.event, triageLike, memories, context).catch(() => undefined)
+            : Promise.resolve(undefined),
+          this.ctx.storage.get<string>('a2aContextId').catch(() => undefined),
+        ]);
+        if (!cred || !cred.url || !cred.token) throw new A2AError('No A2A credential available for Narra gateway.', false);
+
+        const envelope = buildPromptEnvelope({
+          event: turn.event,
+          context,
+          decision: triageLike,
+          memories,
+          spec,
+          extraFields: {
+            ...(extraFields ?? {}),
+            ...buildLedgerSummary({
+              history: context.recentHistory,
+              members: context.members,
+              selfId: spec.matrixId,
+              event: turn.event,
+              nowMs: this.nowMs(),
+              mode,
+              wakeReason: decision.reason,
+            }),
+            chat_behaviour: chatBehaviourNote({ chatType: context.chatType, direct: decision.direct }),
+          },
+        });
+        const res = await runManyfoldA2ATurnWithMeta({
+          credential: { rpcUrl: cred.url, token: cred.token, label: cred.label ?? spec.name },
+          envelope,
+          eventId: turn.event.eventId,
+          ...(storedContextId ? { contextId: storedContextId } : {}),
+          timeoutMs: cfg.v2?.brainTimeoutMs ?? 25_000,
+          fetchImpl: cfg.fetchImpl,
+        });
+        await this.v2Budget(spec).add('brain', this.nowMs());
+        raw = res.text;
+        if (res.contextId && res.contextId !== storedContextId) {
+          await this.ctx.storage.put('a2aContextId', res.contextId).catch(() => undefined);
+        }
+      } finally {
+        clearInterval(typingTimer);
+        await this.matrixOp({ op: 'typing', roomId, typing: false }).catch(() => undefined);
+      }
+
+      const action = parseBrainOutput(raw);
+      nowMs = this.nowMs();
+      if (action.kind === 'silent') {
+        await this.releaseV2Claim(turn);
+        await appendDoLog(this.ctx.storage, `v2 silent ${turn.event.eventId} (${decision.reason})`, nowMs, this.env);
+        await this.removePendingTurn(turn.event.eventId);
+        return;
+      }
+      if (action.kind === 'react') {
+        await this.matrixOp({
+          op: 'react',
+          roomId,
+          eventId: turn.event.eventId,
+          key: action.emoji,
+          txnId: await deterministicTxnId(`react:${turn.event.eventId}:${action.emoji}`),
+        });
+        await this.releaseV2Claim(turn);
+        await appendDoLog(this.ctx.storage, `v2 reacted ${turn.event.eventId} ${action.emoji}`, nowMs, this.env);
+        await this.removePendingTurn(turn.event.eventId);
+        return;
+      }
+
+      if (action.mode) {
+        await this.runLocked(async () => {
+          const latest = (await this.ctx.storage.get<V2RoomState>('v2State')) ?? emptyRoomState();
+          latest.mode = action.mode;
+          await this.ctx.storage.put('v2State', latest);
+        });
+      }
+      const foreign = detectForeignLanguage(turn.event.text ?? '');
+      const text = normalizeA2AOutput(action.text, foreign ? 'en' : detectLang(turn.event.text ?? '')).text;
+      if (!text) {
+        await this.releaseV2Claim(turn);
+        await this.removePendingTurn(turn.event.eventId);
+        return;
+      }
+      const quote = await this.computeShouldQuote(turn.event, context.chatType);
+      const replyToEventId = quote ? turn.event.eventId : undefined;
+      const posted = await this.postReplyToRoom(
+        roomId,
+        text,
+        turn.event.eventId,
+        spec.matrixId,
+        replyToEventId,
+        turn.event.eventId,
+      );
+      await this.recordOwnReply(turn, spec, text, posted.eventId, replyToEventId);
+      await this.releaseV2Claim(turn);
+      await appendDoLog(
+        this.ctx.storage,
+        `v2 answered ${turn.event.eventId} (${decision.reason}${action.mode ? `, mode=${action.mode}` : ''}) in ${this.nowMs() - turn.event.timestampMs}ms`,
+        this.nowMs(),
+        this.env,
+      );
+      await this.removePendingTurn(turn.event.eventId);
+    } catch (error) {
+      const attempts = turn.attempts + 1;
+      const failNow = this.nowMs();
+      const errMsg = scrubSecrets(error instanceof Error ? error.message : error, this.env);
+      await this.ctx.storage.put('lastError', errMsg);
+      const retryable =
+        isChainExhaustedError(error)
+          ? false
+          : error instanceof A2AError
+            ? error.retryable
+            : typeof (error as Partial<SendFailureError>)?.retryable === 'boolean'
+              ? (error as SendFailureError).retryable
+              : true;
+      if (retryable && attempts < MAX_POST_ATTEMPTS) {
+        await this.updatePendingTurn({ ...turn, attempts, dueAtMs: failNow + 4_000 * 2 ** (attempts - 1), lastError: errMsg });
+        await appendDoLog(this.ctx.storage, `v2 retry ${turn.event.eventId} attempt=${attempts}: ${errMsg}`, failNow, this.env);
+        return;
+      }
+      await this.releaseV2Claim(turn);
+      // Only someone who spoke to this agent directly gets told it failed; never a fake error elsewhere.
+      if (decision.direct && cfg.enableA2AFailureReply === true && !isChainExhaustedError(error)) {
+        const lang = detectLang(turn.event.text ?? '');
+        const failText = cfg.a2aFailureReply?.(lang, turn.event) ?? defaultA2AFailureReply(lang);
+        await this.postReplyToRoom(roomId, failText, `fail:${turn.event.eventId}`, spec.matrixId, undefined, turn.event.eventId).catch(
+          () => undefined,
+        );
+      }
+      await appendDoLog(this.ctx.storage, `v2 gave up ${turn.event.eventId} after ${attempts}: ${errMsg}`, failNow, this.env);
+      await this.removePendingTurn(turn.event.eventId);
+    }
+  }
+
   private async buildRoomContextForTurn(
     turn: PendingTurn,
     effectiveSpec: AgentSpec,
@@ -2663,6 +3103,11 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
 
       const effectiveSpec = await this.getEffectiveSpec();
       const memoryStore = await this.getMemoryStore();
+      const pipeline = pipelineForRoom(this.env, nextTurn.event.roomId);
+      if (pipeline === 'v2') {
+        await this.runTurnV2(nextTurn, effectiveSpec, memoryStore);
+        continue;
+      }
       let lastDecision: TriageDecision | undefined = nextTurn.decision;
 
       try {
@@ -2688,6 +3133,10 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                   chainCap: AGENT_CHAIN_CAP,
                 });
           lastDecision = decision;
+
+          if (pipeline === 'shadow' && nextTurn.fallbackRank === undefined) {
+            await this.logShadowV2(nextTurn, context, effectiveSpec, decision).catch(() => undefined);
+          }
 
           if (!decision.shouldReply) {
             // A real question nobody may claim: join the fallback election instead of dropping it.
@@ -3446,6 +3895,7 @@ export async function kickNarraGateway<TEnv extends NarraGatewayEnv = NarraGatew
       dedupeStore,
       memoryStore,
       enforceStaggerWindow,
+      roomRules: (roomId: string) => roomPostingRulesFor(env, roomId),
       nowMs: () => nowMs,
       ...(config.isRoomOptedOut
         ? { isRoomOptedOut: (roomId: string) => config.isRoomOptedOut!(env, roomId) }

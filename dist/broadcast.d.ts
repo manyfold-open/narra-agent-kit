@@ -33,7 +33,24 @@ export declare function hasOnlyTrailingAgentMessages(recentHistory: HistoryTurn[
  * human messages (agents excluded). `null` when nobody has written yet.
  */
 export declare function roomLanguage(recentHistory: HistoryTurn[], sample?: number): LangCode | null;
-export type BroadcastSkipReason = 'duplicate_items' | 'empty_text' | 'duplicate_update_key' | 'room_muted' | 'opted_out' | 'agent_only_recent_messages' | 'outside_stagger_window' | 'send_failed';
+export type BroadcastSkipReason = 'duplicate_items' | 'empty_text' | 'duplicate_update_key' | 'room_muted' | 'opted_out' | 'agent_only_recent_messages' | 'outside_stagger_window' | 'room_daily_cap' | 'room_busy' | 'outside_hours' | 'send_failed';
+/**
+ * Room-level manners for scheduled posts, shared by every agent in the room without coordination:
+ * each agent counts the `ai.narra.broadcast` posts it can see in the room's history.
+ */
+export interface RoomPostingRules {
+    /** All agents together post at most this many scheduled messages per room per local day. */
+    dailyCap: number;
+    /** Do not post within this long after the last human message (people are mid-conversation). */
+    quietMs: number;
+    /** Local posting hours [start, end) in `timeZone`. */
+    startHour: number;
+    endHour: number;
+    timeZone: string;
+}
+export declare const DEFAULT_ROOM_POSTING_RULES: RoomPostingRules;
+/** Why a room should not get a scheduled post right now, or null when it may. */
+export declare function roomPostingBlock(history: HistoryTurn[], nowMs: number, rules: RoomPostingRules): 'room_daily_cap' | 'room_busy' | 'outside_hours' | null;
 export interface BroadcastScheduleResult {
     sent: Array<{
         roomId: string;
@@ -56,6 +73,8 @@ export interface BroadcastSchedulerOptions {
     enforceStaggerWindow?: boolean;
     staggerWindowMinutes?: number;
     staggerToleranceMinutes?: number;
+    /** When set, applies room-level posting manners (daily cap, quiet time, daytime hours). */
+    roomRules?: RoomPostingRules | ((roomId: string) => RoomPostingRules | undefined);
     nowMs?: () => number;
 }
 /**
