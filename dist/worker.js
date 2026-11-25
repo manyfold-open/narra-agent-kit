@@ -2035,6 +2035,8 @@ export class BaseNarraRoomCoordinator {
                 relevance = await scoreRelevance(stripAgentMentions(event.text ?? '', mentionNames), spec, cfg.v2?.wakeExamples ?? [], {
                     ai: this.env.AI,
                     ...(this.env.NARRA_EMBEDDING_MODEL ? { model: this.env.NARRA_EMBEDDING_MODEL } : {}),
+                    ...(cfg.v2?.profile ? { profile: cfg.v2.profile } : {}),
+                    ...(cfg.v2?.notExamples?.length ? { notExamples: cfg.v2.notExamples } : {}),
                     cache: {
                         get: (key) => this.ctx.storage.get(key),
                         put: (key, value) => this.ctx.storage.put(key, value),
@@ -2053,6 +2055,8 @@ export class BaseNarraRoomCoordinator {
             parts.push(`score=${decision.score.toFixed(2)}`);
         if (relevance?.cosine !== undefined)
             parts.push(`cos=${relevance.cosine}`);
+        if (relevance?.notCosine !== undefined)
+            parts.push(`not=${relevance.notCosine}`);
         if (relevance)
             parts.push(`via=${relevance.source}`);
         if (decision.delayMs)
@@ -2275,7 +2279,7 @@ export class BaseNarraRoomCoordinator {
                 const [cred, extraFields, storedContextId] = await Promise.all([
                     Promise.resolve(cfg.resolveA2ACredential?.(this.env) ?? defaultResolveA2ACredential(this.env, spec)),
                     cfg.buildExtraEnvelopeFields
-                        ? cfg.buildExtraEnvelopeFields(this.env, turn.event, triageLike, memories, context).catch(() => undefined)
+                        ? cfg.buildExtraEnvelopeFields(this.env, turn.event, triageLike, memories, context, { pipeline: 'v2' }).catch(() => undefined)
                         : Promise.resolve(undefined),
                     this.ctx.storage.get('a2aContextId').catch(() => undefined),
                 ]);
@@ -2804,7 +2808,7 @@ export class BaseNarraRoomCoordinator {
                                         defaultResolveA2ACredential(this.env, effectiveSpec)),
                                 cfg.buildExtraEnvelopeFields
                                     ? cfg
-                                        .buildExtraEnvelopeFields(this.env, nextTurn.event, decision, memories, context)
+                                        .buildExtraEnvelopeFields(this.env, nextTurn.event, decision, memories, context, { pipeline: 'v1' })
                                         .catch(() => undefined)
                                     : Promise.resolve(undefined),
                                 wantsSummary

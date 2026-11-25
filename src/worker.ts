@@ -210,6 +210,7 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
     decision: TriageDecision,
     memories: RecallTurnResult,
     context: RoomContext,
+    info?: { pipeline: 'v1' | 'v2' },
   ) => Promise<Record<string, string> | null | undefined>;
   /** Custom progress status text shown if a directly addressed A2A turn exceeds `thinkingDelayMs`. */
   thinkingMessage?: (lang: LangCode, event: InboundEvent, decision: TriageDecision) => string;
@@ -223,6 +224,10 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
   v2?: {
     /** Example requests this agent is good at, in any language; sharpen relevance scoring. */
     wakeExamples?: string[];
+    /** Profile text for v2 relevance instead of `spec.domainDescription` (which v1 also reads). */
+    profile?: string;
+    /** Requests that belong to other agents; a message closer to these than to this agent never wakes it. */
+    notExamples?: string[];
     gate?: Partial<WakeGateOptions>;
     /** Timeout for the Manyfold brain call (default 25s). */
     brainTimeoutMs?: number;
@@ -2675,6 +2680,8 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           {
             ai: this.env.AI,
             ...(this.env.NARRA_EMBEDDING_MODEL ? { model: this.env.NARRA_EMBEDDING_MODEL } : {}),
+            ...(cfg.v2?.profile ? { profile: cfg.v2.profile } : {}),
+            ...(cfg.v2?.notExamples?.length ? { notExamples: cfg.v2.notExamples } : {}),
             cache: {
               get: (key) => this.ctx.storage.get<number[][]>(key),
               put: (key, value) => this.ctx.storage.put(key, value),
@@ -2693,6 +2700,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     const parts = [`wake=${decision.wake}`, decision.reason];
     if (decision.score !== undefined) parts.push(`score=${decision.score.toFixed(2)}`);
     if (relevance?.cosine !== undefined) parts.push(`cos=${relevance.cosine}`);
+    if (relevance?.notCosine !== undefined) parts.push(`not=${relevance.notCosine}`);
     if (relevance) parts.push(`via=${relevance.source}`);
     if (decision.delayMs) parts.push(`delay=${decision.delayMs}`);
     return parts.join(' ');
@@ -2948,7 +2956,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         const [cred, extraFields, storedContextId] = await Promise.all([
           Promise.resolve(cfg.resolveA2ACredential?.(this.env) ?? defaultResolveA2ACredential(this.env, spec)),
           cfg.buildExtraEnvelopeFields
-            ? cfg.buildExtraEnvelopeFields(this.env, turn.event, triageLike, memories, context).catch(() => undefined)
+            ? cfg.buildExtraEnvelopeFields(this.env, turn.event, triageLike, memories, context, { pipeline: 'v2' }).catch(() => undefined)
             : Promise.resolve(undefined),
           this.ctx.storage.get<string>('a2aContextId').catch(() => undefined),
         ]);
@@ -3609,7 +3617,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
                     ),
                 cfg.buildExtraEnvelopeFields
                   ? cfg
-                      .buildExtraEnvelopeFields(this.env, nextTurn.event, decision, memories, context)
+                      .buildExtraEnvelopeFields(this.env, nextTurn.event, decision, memories, context, { pipeline: 'v1' })
                       .catch(() => undefined)
                   : Promise.resolve(undefined),
                 wantsSummary
