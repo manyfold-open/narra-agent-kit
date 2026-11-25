@@ -1,5 +1,5 @@
 import { A2AError, buildPromptEnvelope, normalizeA2AOutput, runManyfoldA2ATurnWithMeta, } from './adapters/manyfold-a2a.js';
-import { D1BroadcastStore, DEFAULT_ROOM_POSTING_RULES, InMemoryBroadcastStore, ProactiveBroadcastScheduler, } from './broadcast.js';
+import { D1BroadcastStore, DEFAULT_ROOM_POSTING_RULES, InMemoryBroadcastStore, roomPostingBlock, ProactiveBroadcastScheduler, } from './broadcast.js';
 import { runSchemaStatements } from './d1.js';
 import { BurstCoalescer } from './debounce.js';
 import { isNarraAgent, isSilence, isSummaryOrRecapRequest, parseMatrixEvent, sanitizeMobileLinks, stripLeakedNotes, } from './guard.js';
@@ -193,6 +193,13 @@ async function ensureGatewaySchemas(db) {
         schemaInitCache.set(db, pending);
     }
     await pending;
+}
+/** True when this room is outside NARRA_PIPELINE_ROOMS and NARRA_PIPELINE_ONLY_LISTED=on. */
+export function isUnlistedRoomIgnored(env, roomId) {
+    if ((env?.NARRA_PIPELINE_ONLY_LISTED ?? '').trim().toLowerCase() !== 'on')
+        return false;
+    const rooms = (env?.NARRA_PIPELINE_ROOMS ?? '').split(',').map((r) => r.trim()).filter(Boolean);
+    return !rooms.includes(roomId);
 }
 /** Room posting manners for scheduled posts: on for shadow/v2 rooms, or everywhere with NARRA_ROOM_POSTING_RULES=on. */
 export function roomPostingRulesFor(env, roomId) {
@@ -1560,6 +1567,7 @@ export class BaseNarraRoomCoordinator {
                     isSelf: true,
                     text: body.text.slice(0, 1000),
                     timestampMs: nowMs,
+                    ...(body.isBroadcast ? { isBroadcast: true } : {}),
                 });
                 await this.ctx.storage.put('recentHistory', history.slice(-MAX_RECENT_HISTORY));
                 const consec = ((await this.ctx.storage.get('consecutiveAgentMessages')) ?? 0) + 1;
@@ -1567,6 +1575,44 @@ export class BaseNarraRoomCoordinator {
                 if (eventId)
                     await this.ctx.storage.put('latestEventId', eventId);
                 await this.markEventHandled(body.eventId);
+            });
+            return Response.json({ ok: true });
+        }
+        if (request.method === 'POST' && path.endsWith('/proactive')) {
+            if (!isNarraGatewayEnabled(this.env))
+                return Response.json({ ok: true, enabled: false });
+            const body = (await request.json().catch(() => null));
+            if (!body?.roomId || !body.key || !body.note) {
+                return Response.json({ ok: false, error: 'bad_payload' }, { status: 400 });
+            }
+            await this.runLocked(async () => {
+                const nowMs = this.nowMs();
+                const meta = await this.ctx.storage.get('roomMeta');
+                const pendingTurns = (await this.ctx.storage.get('pendingTurns')) ?? [];
+                const eventId = `proactive:${body.key}`;
+                if (!pendingTurns.some((t) => t.event.eventId === eventId) && pendingTurns.length < MAX_QUEUE_SIZE) {
+                    pendingTurns.push({
+                        event: {
+                            roomId: body.roomId,
+                            chatType: meta?.chatType ?? 'group',
+                            ...(meta?.roomName ? { roomName: meta.roomName } : {}),
+                            eventId,
+                            senderId: '',
+                            type: 'm.room.message',
+                            kind: 'text',
+                            text: body.note.slice(0, 1000),
+                            timestampMs: nowMs,
+                            timeIso: new Date(nowMs).toISOString(),
+                            mentions: [],
+                        },
+                        attempts: 0,
+                        enqueuedAtMs: nowMs,
+                        dueAtMs: nowMs,
+                        v2Proactive: true,
+                    });
+                    await this.ctx.storage.put('pendingTurns', pendingTurns);
+                }
+                await this.scheduleNextAlarm(nowMs);
             });
             return Response.json({ ok: true });
         }
@@ -2030,6 +2076,7 @@ export class BaseNarraRoomCoordinator {
             budgetExhausted,
             options: {
                 ...(cfg.v2?.gate ?? {}),
+                ...(cfg.v2?.reactionsToSelf?.length ? { reactionsToSelf: cfg.v2.reactionsToSelf } : {}),
                 ...(Number.isFinite(threshold) && (this.env.NARRA_WAKE_THRESHOLD ?? '').trim() !== '' ? { threshold } : {}),
             },
             score: async () => {
@@ -2092,7 +2139,7 @@ export class BaseNarraRoomCoordinator {
             txnId: await deterministicTxnId(`unclaim:${claimId}`),
         }).catch(() => undefined);
     }
-    async recordOwnReply(turn, spec, text, eventId, replyToEventId) {
+    async recordOwnReply(turn, spec, text, eventId, replyToEventId, isBroadcast = false) {
         const at = this.nowMs();
         await this.runLocked(async () => {
             const postedId = eventId || `sent:${turn.event.eventId}`;
@@ -2108,7 +2155,7 @@ export class BaseNarraRoomCoordinator {
                 isSelf: true,
                 text: text.slice(0, 1000),
                 timestampMs: at,
-                answersEventId: turn.event.eventId,
+                ...(isBroadcast ? { isBroadcast: true } : { answersEventId: turn.event.eventId }),
                 ...(replyToEventId ? { replyToEventId } : {}),
             });
             await this.ctx.storage.put('recentHistory', history.slice(-MAX_RECENT_HISTORY));
@@ -2129,6 +2176,10 @@ export class BaseNarraRoomCoordinator {
         const state = (await this.ctx.storage.get('v2State')) ?? emptyRoomState();
         const mode = this.v2Mode(state, context);
         let decision = turn.v2Decision;
+        if (turn.v2Proactive && !decision) {
+            decision = { wake: true, reason: 'proactive', delayMs: 0, claim: false, direct: false };
+            turn.v2Decision = decision;
+        }
         const mentionNamesForLang = [spec.name, ...(spec.aliases ?? []), ...context.members.flatMap((m) => (m.displayName ? [m.displayName] : []))];
         const replyLangForHooks = replyLanguageFor(turn.event.text ?? '', {
             mentionNames: mentionNamesForLang,
@@ -2136,7 +2187,8 @@ export class BaseNarraRoomCoordinator {
             ...(context.roomLanguageHint ? { roomHint: context.roomLanguageHint } : {}),
         });
         // Crisis first: before relevance, so it is never skipped because the message looked unrelated.
-        const fromHuman = turn.event.senderId !== spec.matrixId &&
+        const fromHuman = !turn.v2Proactive &&
+            turn.event.senderId !== spec.matrixId &&
             !isNarraAgent(turn.event.senderId) &&
             (turn.event.kind === 'text' || turn.event.kind === 'voice' || turn.event.kind === 'compound');
         if (!decision && fromHuman && cfg.v2?.crisisReply && turn.v2CrisisText !== '') {
@@ -2173,6 +2225,19 @@ export class BaseNarraRoomCoordinator {
                 return;
             }
             turn.v2CrisisText = '';
+        }
+        if (!decision && fromHuman && cfg.v2?.wakeHint) {
+            const hint = await Promise.resolve(cfg.v2.wakeHint(this.env, turn.event, context)).catch(() => null);
+            if (hint === 'skip') {
+                await appendDoLog(this.ctx.storage, `v2 gate ${turn.event.eventId}: wake=false agent_hint`, nowMs, this.env);
+                await this.removePendingTurn(turn.event.eventId);
+                return;
+            }
+            if (hint === 'wake') {
+                decision = { wake: true, reason: 'agent_hint', delayMs: 0, claim: context.chatType === 'group', direct: false };
+                turn.v2Decision = decision;
+                await appendDoLog(this.ctx.storage, `v2 gate ${turn.event.eventId}: wake=true agent_hint`, nowMs, this.env);
+            }
         }
         if (!decision) {
             const gated = await this.v2Gate(turn.event, context, spec, mode, nowMs);
@@ -2236,7 +2301,7 @@ export class BaseNarraRoomCoordinator {
             });
             const streamLang = replyLang;
             const stream = {
-                suppressed: false,
+                suppressed: Boolean(turn.v2Proactive),
                 shown: '',
                 lastAt: 0,
                 edits: 0,
@@ -2303,7 +2368,7 @@ export class BaseNarraRoomCoordinator {
                     cfg.buildExtraEnvelopeFields
                         ? cfg.buildExtraEnvelopeFields(this.env, turn.event, triageLike, memories, context, { pipeline: 'v2' }).catch(() => undefined)
                         : Promise.resolve(undefined),
-                    this.ctx.storage.get('a2aContextId').catch(() => undefined),
+                    cfg.v2?.freshContext ? Promise.resolve(undefined) : this.ctx.storage.get('a2aContextId').catch(() => undefined),
                 ]);
                 if (!cred || !cred.url || !cred.token)
                     throw new A2AError('No A2A credential available for Narra gateway.', false);
@@ -2324,9 +2389,15 @@ export class BaseNarraRoomCoordinator {
                             mode,
                             wakeReason: decision.reason,
                         }),
+                        ...(turn.event.kind !== 'text' ? { message_type: turn.event.kind } : {}),
+                        ...(turn.event.mediaUrl ? { media_url: turn.event.mediaUrl } : {}),
+                        ...(decision.reason === 'reaction_to_you' && context.replyToTarget
+                            ? { reacted_to_you: `${turn.event.reactionKey ?? turn.event.text} on your message: "${context.replyToTarget.text.replace(/\s+/g, ' ').slice(0, 300)}" (untrusted)` }
+                            : {}),
                         chat_behaviour: chatBehaviourNote({
                             chatType: context.chatType,
                             direct: decision.direct,
+                            proactive: Boolean(turn.v2Proactive),
                             replyLanguage: languageName(replyLang),
                         }),
                     },
@@ -2343,7 +2414,7 @@ export class BaseNarraRoomCoordinator {
                 await stream.chain;
                 await this.v2Budget(spec).add('brain', this.nowMs());
                 raw = res.text;
-                if (res.contextId && res.contextId !== storedContextId) {
+                if (!cfg.v2?.freshContext && res.contextId && res.contextId !== storedContextId) {
                     await this.ctx.storage.put('a2aContextId', res.contextId).catch(() => undefined);
                 }
             }
@@ -2405,6 +2476,20 @@ export class BaseNarraRoomCoordinator {
                     await this.removePendingTurn(turn.event.eventId);
                     return;
                 }
+            }
+            if (turn.v2Proactive) {
+                const sent = await this.matrixOp({
+                    op: 'send',
+                    roomId,
+                    txnId: await deterministicTxnId(`proactive:${spec.id}:${turn.event.eventId}`),
+                    content: messageContent(text, { selfMatrixId: spec.matrixId, broadcast: true }),
+                });
+                if (!sent.ok)
+                    throw makeSendFailure(`Proactive send failed: HTTP ${sent.status}`, sent.status, { errcode: sent.errcode, narraCode: sent.narraCode });
+                await this.recordOwnReply(turn, spec, text, sent.eventId ?? '', undefined, true);
+                await appendDoLog(this.ctx.storage, `v2 proactive posted ${turn.event.eventId}`, this.nowMs(), this.env);
+                await this.removePendingTurn(turn.event.eventId);
+                return;
             }
             let posted;
             let replyToEventId;
@@ -2572,6 +2657,10 @@ export class BaseNarraRoomCoordinator {
             const effectiveSpec = await this.getEffectiveSpec();
             const memoryStore = await this.getMemoryStore();
             const pipeline = pipelineForRoom(this.env, nextTurn.event.roomId);
+            if (isUnlistedRoomIgnored(this.env, nextTurn.event.roomId)) {
+                await this.removePendingTurn(nextTurn.event.eventId);
+                continue;
+            }
             if (pipeline === 'v2') {
                 await this.runTurnV2(nextTurn, effectiveSpec, memoryStore);
                 continue;
@@ -3167,7 +3256,7 @@ export async function kickNarraGateway(env, config) {
                 return new D1BroadcastStore(env.DB);
             })()
             : new InMemoryBroadcastStore();
-        const updates = await config.fetchUpdates(env, sinceIso);
+        const updates = (await config.fetchUpdates(env, sinceIso)).filter((u) => !isUnlistedRoomIgnored(env, u.roomId));
         const enforceStaggerWindow = config.enforceBroadcastStagger ?? (env.NARRA_BROADCAST_STAGGER ?? '').trim() !== 'off';
         const scheduler = new ProactiveBroadcastScheduler({
             agentId: config.spec.id,
@@ -3247,6 +3336,7 @@ export async function kickNarraGateway(env, config) {
                                 senderId: config.spec.matrixId,
                                 text: cleanText,
                                 timestampMs: nowMs,
+                                isBroadcast: true,
                             }),
                         });
                     }
@@ -3268,11 +3358,71 @@ export async function kickNarraGateway(env, config) {
                 .run();
         }
     }
+    let proactiveQueued = 0;
+    if (config?.v2?.proactive && env.NARRA_ROOM_DO) {
+        const nowMs = config.now?.() ?? Date.now();
+        const nowIso = new Date(nowMs).toISOString();
+        const store = env.DB
+            ? await (async () => {
+                await ensureGatewaySchemas(env.DB);
+                return new D1BroadcastStore(env.DB);
+            })()
+            : new InMemoryBroadcastStore();
+        let items = [];
+        try {
+            items = await config.v2.proactive(env, nowMs);
+        }
+        catch {
+            items = [];
+        }
+        for (const item of items) {
+            if (!item?.roomId || !item.key || !item.note)
+                continue;
+            if (isUnlistedRoomIgnored(env, item.roomId) || pipelineForRoom(env, item.roomId) !== 'v2')
+                continue;
+            const key = `proactive:${item.key}`;
+            if (await store.hasSentKey(config.spec.id, item.roomId, key))
+                continue;
+            const stub = env.NARRA_ROOM_DO.get(env.NARRA_ROOM_DO.idFromName(item.roomId));
+            if (!item.ignoreRoomRules) {
+                let history = [];
+                try {
+                    const res = await stub.fetch('https://narra-room/history');
+                    const body = (await res.json().catch(() => null));
+                    history = Array.isArray(body?.history) ? body.history : [];
+                }
+                catch {
+                    history = [];
+                }
+                const rules = {
+                    ...DEFAULT_ROOM_POSTING_RULES,
+                    dailyCap: parseLimit(env.NARRA_ROOM_DAILY_POSTS, DEFAULT_ROOM_POSTING_RULES.dailyCap),
+                    ...(item.rules ?? {}),
+                };
+                if (roomPostingBlock(history, nowMs, rules))
+                    continue;
+            }
+            if (!(await store.claimUpdateKey(config.spec.id, item.roomId, key, nowIso)))
+                continue;
+            try {
+                await stub.fetch('https://narra-room/proactive', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ roomId: item.roomId, key: item.key, note: item.note }),
+                });
+                proactiveQueued++;
+            }
+            catch {
+                // Already claimed: not retried, like a scheduled post that failed to send.
+            }
+        }
+    }
     return {
         enabled: true,
         syncKicked,
         syncRunning,
         broadcast,
+        ...(proactiveQueued ? { proactiveQueued } : {}),
     };
 }
 /**

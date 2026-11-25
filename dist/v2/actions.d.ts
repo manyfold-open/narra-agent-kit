@@ -22,5 +22,6 @@ export declare function chatBehaviourNote(opts: {
     chatType: 'dm' | 'group';
     direct: boolean;
     replyLanguage?: string;
+    proactive?: boolean;
 }): string;
 //# sourceMappingURL=actions.d.ts.map

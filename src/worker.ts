@@ -8,6 +8,7 @@ import {
   D1BroadcastStore,
   DEFAULT_ROOM_POSTING_RULES,
   InMemoryBroadcastStore,
+  roomPostingBlock,
   ProactiveBroadcastScheduler,
   type BroadcastScheduleResult,
   type RoomPostingRules,
@@ -173,6 +174,11 @@ export interface NarraGatewayEnv {
   NARRA_ROOM_DAILY_POSTS?: string;
   /** `on` applies room posting manners to every room, not only shadow/v2 rooms. */
   NARRA_ROOM_POSTING_RULES?: string;
+  /**
+   * `on`: rooms not listed in NARRA_PIPELINE_ROOMS are ignored entirely (no v1 replies, no
+   * broadcasts), so an agent's older gateway can keep serving them during a room-by-room move.
+   */
+  NARRA_PIPELINE_ONLY_LISTED?: string;
 }
 
 export interface NarraA2ACredentialResult {
@@ -228,6 +234,22 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
     profile?: string;
     /** Requests that belong to other agents; a message closer to these than to this agent never wakes it. */
     notExamples?: string[];
+    /** Reactions on this agent's own messages that count as a reply (e.g. ['👍','👌','✅'] to confirm). */
+    reactionsToSelf?: string[];
+    /** Start a fresh Manyfold conversation for every turn instead of one per room. */
+    freshContext?: boolean;
+    /**
+     * Agent-specific wake decision from its own state (not phrase lists), checked before relevance:
+     * 'wake' answers the message, 'skip' ignores it, null lets the kit decide.
+     */
+    wakeHint?: (env: TEnv, event: InboundEvent, context: RoomContext) => Promise<'wake' | 'skip' | null> | 'wake' | 'skip' | null;
+    /**
+     * Things the agent may want to say without being asked (a daily recap, a welcome). On every
+     * cron kick the kit asks for them, applies the room's posting manners (daily cap shared with
+     * other agents, daytime, quiet) unless an item overrides them, dedupes by `key`, and lets the
+     * brain write the message from `note` (it can still answer [NO_REPLY]). v2 rooms only.
+     */
+    proactive?: (env: TEnv, nowMs: number) => Promise<V2ProactiveItem[]> | V2ProactiveItem[];
     gate?: Partial<WakeGateOptions>;
     /** Timeout for the Manyfold brain call (default 25s). */
     brainTimeoutMs?: number;
@@ -260,6 +282,18 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
   sleep?: (ms: number) => Promise<void>;
 }
 
+export interface V2ProactiveItem {
+  roomId: string;
+  /** Sent once per room per key (e.g. `daily:2026-11-25`). */
+  key: string;
+  /** What the brain should do, e.g. "[penny nudge] daily 2026-11-25". Passed as the turn's text. */
+  note: string;
+  /** Override room posting manners for this item (e.g. a 21:00 recap: { endHour: 23 }). */
+  rules?: Partial<RoomPostingRules>;
+  /** Skip room posting manners entirely (e.g. a welcome right after being added). */
+  ignoreRoomRules?: boolean;
+}
+
 export type NarraMatrixOp =
   | { op: 'send'; roomId: string; txnId?: string; content: Record<string, unknown> }
   | {
@@ -287,6 +321,7 @@ export interface NarraGatewayKickResult {
   syncKicked: boolean;
   syncRunning: boolean;
   broadcast: BroadcastScheduleResult | null;
+  proactiveQueued?: number;
 }
 
 export interface NarraGatewayStatus {
@@ -363,6 +398,8 @@ interface PendingTurn {
   v2StreamEventId?: string;
   /** v2: crisis reply waiting for its turn ('' = checked, not a crisis). */
   v2CrisisText?: string;
+  /** v2: a turn the agent starts on its own (see `v2.proactive`); its reply is a scheduled post. */
+  v2Proactive?: boolean;
 }
 
 /** A real question nobody claimed: the first elected agent answers after this long... */
@@ -538,6 +575,13 @@ async function ensureGatewaySchemas(db: D1Database): Promise<void> {
     schemaInitCache.set(db, pending);
   }
   await pending;
+}
+
+/** True when this room is outside NARRA_PIPELINE_ROOMS and NARRA_PIPELINE_ONLY_LISTED=on. */
+export function isUnlistedRoomIgnored(env: NarraGatewayEnv | undefined | null, roomId: string): boolean {
+  if ((env?.NARRA_PIPELINE_ONLY_LISTED ?? '').trim().toLowerCase() !== 'on') return false;
+  const rooms = (env?.NARRA_PIPELINE_ROOMS ?? '').split(',').map((r) => r.trim()).filter(Boolean);
+  return !rooms.includes(roomId);
 }
 
 /** Room posting manners for scheduled posts: on for shadow/v2 rooms, or everywhere with NARRA_ROOM_POSTING_RULES=on. */
@@ -2120,6 +2164,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         senderId?: string;
         text?: string;
         timestampMs?: number;
+        isBroadcast?: boolean;
       } | null;
       if (!body || typeof body.text !== 'string') {
         return Response.json({ ok: false, error: 'bad_payload' }, { status: 400 });
@@ -2138,12 +2183,51 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           isSelf: true,
           text: body.text!.slice(0, 1000),
           timestampMs: nowMs,
+          ...(body.isBroadcast ? { isBroadcast: true } : {}),
         });
         await this.ctx.storage.put('recentHistory', history.slice(-MAX_RECENT_HISTORY));
         const consec = ((await this.ctx.storage.get<number>('consecutiveAgentMessages')) ?? 0) + 1;
         await this.ctx.storage.put('consecutiveAgentMessages', consec);
         if (eventId) await this.ctx.storage.put('latestEventId', eventId);
         await this.markEventHandled(body.eventId);
+      });
+      return Response.json({ ok: true });
+    }
+
+    if (request.method === 'POST' && path.endsWith('/proactive')) {
+      if (!isNarraGatewayEnabled(this.env)) return Response.json({ ok: true, enabled: false });
+      const body = (await request.json().catch(() => null)) as { roomId?: string; key?: string; note?: string } | null;
+      if (!body?.roomId || !body.key || !body.note) {
+        return Response.json({ ok: false, error: 'bad_payload' }, { status: 400 });
+      }
+      await this.runLocked(async () => {
+        const nowMs = this.nowMs();
+        const meta = await this.ctx.storage.get<RoomMeta>('roomMeta');
+        const pendingTurns = (await this.ctx.storage.get<PendingTurn[]>('pendingTurns')) ?? [];
+        const eventId = `proactive:${body.key}`;
+        if (!pendingTurns.some((t) => t.event.eventId === eventId) && pendingTurns.length < MAX_QUEUE_SIZE) {
+          pendingTurns.push({
+            event: {
+              roomId: body.roomId!,
+              chatType: meta?.chatType ?? 'group',
+              ...(meta?.roomName ? { roomName: meta.roomName } : {}),
+              eventId,
+              senderId: '',
+              type: 'm.room.message',
+              kind: 'text',
+              text: body.note!.slice(0, 1000),
+              timestampMs: nowMs,
+              timeIso: new Date(nowMs).toISOString(),
+              mentions: [],
+            },
+            attempts: 0,
+            enqueuedAtMs: nowMs,
+            dueAtMs: nowMs,
+            v2Proactive: true,
+          });
+          await this.ctx.storage.put('pendingTurns', pendingTurns);
+        }
+        await this.scheduleNextAlarm(nowMs);
       });
       return Response.json({ ok: true });
     }
@@ -2671,6 +2755,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       budgetExhausted,
       options: {
         ...(cfg.v2?.gate ?? {}),
+        ...(cfg.v2?.reactionsToSelf?.length ? { reactionsToSelf: cfg.v2.reactionsToSelf } : {}),
         ...(Number.isFinite(threshold) && (this.env.NARRA_WAKE_THRESHOLD ?? '').trim() !== '' ? { threshold } : {}),
       },
       score: async () => {
@@ -2747,7 +2832,14 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     }).catch(() => undefined);
   }
 
-  private async recordOwnReply(turn: PendingTurn, spec: AgentSpec, text: string, eventId: string, replyToEventId?: string): Promise<void> {
+  private async recordOwnReply(
+    turn: PendingTurn,
+    spec: AgentSpec,
+    text: string,
+    eventId: string,
+    replyToEventId?: string,
+    isBroadcast = false,
+  ): Promise<void> {
     const at = this.nowMs();
     await this.runLocked(async () => {
       const postedId = eventId || `sent:${turn.event.eventId}`;
@@ -2763,7 +2855,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         isSelf: true,
         text: text.slice(0, 1000),
         timestampMs: at,
-        answersEventId: turn.event.eventId,
+        ...(isBroadcast ? { isBroadcast: true } : { answersEventId: turn.event.eventId }),
         ...(replyToEventId ? { replyToEventId } : {}),
       });
       await this.ctx.storage.put('recentHistory', history.slice(-MAX_RECENT_HISTORY));
@@ -2786,6 +2878,10 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     const mode = this.v2Mode(state, context);
 
     let decision = turn.v2Decision;
+    if (turn.v2Proactive && !decision) {
+      decision = { wake: true, reason: 'proactive', delayMs: 0, claim: false, direct: false };
+      turn.v2Decision = decision;
+    }
     const mentionNamesForLang = [spec.name, ...(spec.aliases ?? []), ...context.members.flatMap((m) => (m.displayName ? [m.displayName] : []))];
     const replyLangForHooks = replyLanguageFor(turn.event.text ?? '', {
       mentionNames: mentionNamesForLang,
@@ -2795,6 +2891,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
 
     // Crisis first: before relevance, so it is never skipped because the message looked unrelated.
     const fromHuman =
+      !turn.v2Proactive &&
       turn.event.senderId !== spec.matrixId &&
       !isNarraAgent(turn.event.senderId) &&
       (turn.event.kind === 'text' || turn.event.kind === 'voice' || turn.event.kind === 'compound');
@@ -2836,6 +2933,20 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         return;
       }
       turn.v2CrisisText = '';
+    }
+
+    if (!decision && fromHuman && cfg.v2?.wakeHint) {
+      const hint = await Promise.resolve(cfg.v2.wakeHint(this.env, turn.event, context)).catch(() => null);
+      if (hint === 'skip') {
+        await appendDoLog(this.ctx.storage, `v2 gate ${turn.event.eventId}: wake=false agent_hint`, nowMs, this.env);
+        await this.removePendingTurn(turn.event.eventId);
+        return;
+      }
+      if (hint === 'wake') {
+        decision = { wake: true, reason: 'agent_hint', delayMs: 0, claim: context.chatType === 'group', direct: false };
+        turn.v2Decision = decision;
+        await appendDoLog(this.ctx.storage, `v2 gate ${turn.event.eventId}: wake=true agent_hint`, nowMs, this.env);
+      }
     }
 
     if (!decision) {
@@ -2906,7 +3017,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       });
       const streamLang = replyLang;
       const stream = {
-        suppressed: false,
+        suppressed: Boolean(turn.v2Proactive),
         shown: '',
         lastAt: 0,
         edits: 0,
@@ -2981,7 +3092,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           cfg.buildExtraEnvelopeFields
             ? cfg.buildExtraEnvelopeFields(this.env, turn.event, triageLike, memories, context, { pipeline: 'v2' }).catch(() => undefined)
             : Promise.resolve(undefined),
-          this.ctx.storage.get<string>('a2aContextId').catch(() => undefined),
+          cfg.v2?.freshContext ? Promise.resolve(undefined) : this.ctx.storage.get<string>('a2aContextId').catch(() => undefined),
         ]);
         if (!cred || !cred.url || !cred.token) throw new A2AError('No A2A credential available for Narra gateway.', false);
 
@@ -3002,9 +3113,15 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
               mode,
               wakeReason: decision.reason,
             }),
+            ...(turn.event.kind !== 'text' ? { message_type: turn.event.kind } : {}),
+            ...(turn.event.mediaUrl ? { media_url: turn.event.mediaUrl } : {}),
+            ...(decision.reason === 'reaction_to_you' && context.replyToTarget
+              ? { reacted_to_you: `${turn.event.reactionKey ?? turn.event.text} on your message: "${context.replyToTarget.text.replace(/\s+/g, ' ').slice(0, 300)}" (untrusted)` }
+              : {}),
             chat_behaviour: chatBehaviourNote({
               chatType: context.chatType,
               direct: decision.direct,
+              proactive: Boolean(turn.v2Proactive),
               replyLanguage: languageName(replyLang),
             }),
           },
@@ -3021,7 +3138,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         await stream.chain;
         await this.v2Budget(spec).add('brain', this.nowMs());
         raw = res.text;
-        if (res.contextId && res.contextId !== storedContextId) {
+        if (!cfg.v2?.freshContext && res.contextId && res.contextId !== storedContextId) {
           await this.ctx.storage.put('a2aContextId', res.contextId).catch(() => undefined);
         }
       } finally {
@@ -3084,6 +3201,19 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           await this.removePendingTurn(turn.event.eventId);
           return;
         }
+      }
+      if (turn.v2Proactive) {
+        const sent = await this.matrixOp({
+          op: 'send',
+          roomId,
+          txnId: await deterministicTxnId(`proactive:${spec.id}:${turn.event.eventId}`),
+          content: messageContent(text, { selfMatrixId: spec.matrixId, broadcast: true }),
+        });
+        if (!sent.ok) throw makeSendFailure(`Proactive send failed: HTTP ${sent.status}`, sent.status, { errcode: sent.errcode, narraCode: sent.narraCode });
+        await this.recordOwnReply(turn, spec, text, sent.eventId ?? '', undefined, true);
+        await appendDoLog(this.ctx.storage, `v2 proactive posted ${turn.event.eventId}`, this.nowMs(), this.env);
+        await this.removePendingTurn(turn.event.eventId);
+        return;
       }
       let posted: { eventId: string };
       let replyToEventId: string | undefined;
@@ -3300,6 +3430,10 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       const effectiveSpec = await this.getEffectiveSpec();
       const memoryStore = await this.getMemoryStore();
       const pipeline = pipelineForRoom(this.env, nextTurn.event.roomId);
+      if (isUnlistedRoomIgnored(this.env, nextTurn.event.roomId)) {
+        await this.removePendingTurn(nextTurn.event.eventId);
+        continue;
+      }
       if (pipeline === 'v2') {
         await this.runTurnV2(nextTurn, effectiveSpec, memoryStore);
         continue;
@@ -4082,7 +4216,7 @@ export async function kickNarraGateway<TEnv extends NarraGatewayEnv = NarraGatew
         })()
       : new InMemoryBroadcastStore();
 
-    const updates = await config.fetchUpdates(env, sinceIso);
+    const updates = (await config.fetchUpdates(env, sinceIso)).filter((u) => !isUnlistedRoomIgnored(env, u.roomId));
     const enforceStaggerWindow =
       config.enforceBroadcastStagger ?? (env.NARRA_BROADCAST_STAGGER ?? '').trim() !== 'off';
 
@@ -4163,6 +4297,7 @@ export async function kickNarraGateway<TEnv extends NarraGatewayEnv = NarraGatew
                 senderId: config.spec.matrixId,
                 text: cleanText,
                 timestampMs: nowMs,
+                isBroadcast: true,
               }),
             });
           } catch {
@@ -4188,11 +4323,64 @@ export async function kickNarraGateway<TEnv extends NarraGatewayEnv = NarraGatew
     }
   }
 
+  let proactiveQueued = 0;
+  if (config?.v2?.proactive && env.NARRA_ROOM_DO) {
+    const nowMs = config.now?.() ?? Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const store = env.DB
+      ? await (async () => {
+          await ensureGatewaySchemas(env.DB!);
+          return new D1BroadcastStore(env.DB!);
+        })()
+      : new InMemoryBroadcastStore();
+    let items: V2ProactiveItem[] = [];
+    try {
+      items = await config.v2.proactive(env, nowMs);
+    } catch {
+      items = [];
+    }
+    for (const item of items) {
+      if (!item?.roomId || !item.key || !item.note) continue;
+      if (isUnlistedRoomIgnored(env, item.roomId) || pipelineForRoom(env, item.roomId) !== 'v2') continue;
+      const key = `proactive:${item.key}`;
+      if (await store.hasSentKey(config.spec.id, item.roomId, key)) continue;
+      const stub = env.NARRA_ROOM_DO.get(env.NARRA_ROOM_DO.idFromName(item.roomId));
+      if (!item.ignoreRoomRules) {
+        let history: HistoryTurn[] = [];
+        try {
+          const res = await stub.fetch('https://narra-room/history');
+          const body = (await res.json().catch(() => null)) as { history?: HistoryTurn[] } | null;
+          history = Array.isArray(body?.history) ? body!.history! : [];
+        } catch {
+          history = [];
+        }
+        const rules: RoomPostingRules = {
+          ...DEFAULT_ROOM_POSTING_RULES,
+          dailyCap: parseLimit(env.NARRA_ROOM_DAILY_POSTS, DEFAULT_ROOM_POSTING_RULES.dailyCap),
+          ...(item.rules ?? {}),
+        };
+        if (roomPostingBlock(history, nowMs, rules)) continue;
+      }
+      if (!(await store.claimUpdateKey(config.spec.id, item.roomId, key, nowIso))) continue;
+      try {
+        await stub.fetch('https://narra-room/proactive', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ roomId: item.roomId, key: item.key, note: item.note }),
+        });
+        proactiveQueued++;
+      } catch {
+        // Already claimed: not retried, like a scheduled post that failed to send.
+      }
+    }
+  }
+
   return {
     enabled: true,
     syncKicked,
     syncRunning,
     broadcast,
+    ...(proactiveQueued ? { proactiveQueued } : {}),
   };
 }
 

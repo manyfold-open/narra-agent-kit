@@ -63,6 +63,10 @@ export function chatBehaviourNote(opts) {
         '[MODE mention] / [MODE ambient] / [MODE quiet] - the group asked you to change how often you speak (mention = only when @mentioned or replied to; ambient = also join in when you can clearly help; quiet = only short answers when called). Follow it with one short confirmation line.',
         'Otherwise write just the reply text.',
     ];
+    if (opts.proactive) {
+        lines.push('Nobody wrote to you: this is your own scheduled turn, and current_message is your instruction for it, not something a person said. Post only if it is worth the group\'s attention right now; otherwise answer [NO_REPLY]. One short message, no greeting.');
+        return lines.join('\n');
+    }
     if (opts.chatType === 'group' && !opts.direct) {
         lines.push('Nobody addressed you directly: answer only if this is a real question or need you can clearly help with. If another agent in the room fits much better and nobody has answered, you may say so in one short line that names it with @ (for example "@Spotted London knows this better"), at most once per question.');
     }
