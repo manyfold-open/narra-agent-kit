@@ -353,6 +353,8 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
     private describeGate;
     /** Shadow mode: log what v2 would do with this turn, next to v1's decision. No brain call. */
     private logShadowV2;
+    /** Another agent answered one of these messages, judged from the latest stored history. */
+    private peerAnsweredNow;
     private releaseV2Claim;
     private recordOwnReply;
     private runTurnV2;

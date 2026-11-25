@@ -371,6 +371,8 @@ const GROUP_FALLBACK_BASE_MS = 15_000;
 const GROUP_FALLBACK_STEP_MS = 8_000;
 /** Only this many agents per message take part in the fallback election. */
 const GROUP_FALLBACK_MAX_RANK = 3;
+/** v2: gap between agents' turns to answer an unaddressed crisis message, in room-agent order. */
+const V2_CRISIS_STEP_MS = 2_500;
 const GROUP_FALLBACK_NOTE =
   'No other AI agent in this group answered this question. Answer it yourself, briefly and helpfully, ' +
   'even if it is outside your speciality. If another agent in this group clearly fits better, say so and name them. ' +
@@ -2727,6 +2729,12 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     );
   }
 
+  /** Another agent answered one of these messages, judged from the latest stored history. */
+  private async peerAnsweredNow(eventIds: string[], selfId: string | undefined): Promise<string | undefined> {
+    const history = (await this.ctx.storage.get<HistoryTurn[]>('recentHistory')) ?? [];
+    return peerAnswered(history, eventIds, selfId);
+  }
+
   private async releaseV2Claim(turn: PendingTurn): Promise<void> {
     if (!turn.v2ClaimEventId) return;
     const claimId = turn.v2ClaimEventId;
@@ -2801,7 +2809,13 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           )) ?? '';
         if (crisis && !addressed) {
           // Several agents may know crisis resources: wait a different short time, first one answers.
-          const wait = 300 + Math.round(hashFraction(`crisis:${turn.event.eventId}:${spec.matrixId ?? spec.id}`) * 3_000);
+          // Every agent computes the same order of the room's agents for this message, so the
+          // first crisis-capable agent in that order answers and the others see it and yield.
+          const rank = spec.matrixId ? groupFallbackRank(turn.event.eventId, spec.matrixId, context.members) : -1;
+          const wait =
+            rank >= 0
+              ? 300 + rank * V2_CRISIS_STEP_MS
+              : 300 + Math.round(hashFraction(`crisis:${turn.event.eventId}:${spec.id}`) * 3_000);
           await this.updatePendingTurn({ ...turn, v2CrisisText: crisis, dueAtMs: nowMs + wait });
           return;
         }
@@ -2892,6 +2906,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       });
       const streamLang = replyLang;
       const stream = {
+        suppressed: false,
         shown: '',
         lastAt: 0,
         edits: 0,
@@ -2909,7 +2924,12 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         stream.lastAt = at;
         stream.chain = stream.chain
           .then(async () => {
+            if (stream.suppressed) return;
             if (!turn.v2StreamEventId) {
+              if (!decision.direct && (await this.peerAnsweredNow(eventIds, spec.matrixId))) {
+                stream.suppressed = true;
+                return;
+              }
               const quote = await this.computeShouldQuote(turn.event, context.chatType);
               stream.replyToEventId = quote ? turn.event.eventId : undefined;
               const posted = await this.postReplyToRoom(
@@ -3053,6 +3073,17 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         await this.releaseV2Claim(turn);
         await this.removePendingTurn(turn.event.eventId);
         return;
+      }
+      // While the brain was writing, another agent may have answered (e.g. a crisis reply). Unless
+      // this agent was addressed directly, a second answer to the same message is noise.
+      if (!decision.direct && !turn.v2StreamEventId) {
+        const peer = await this.peerAnsweredNow(eventIds, spec.matrixId);
+        if (peer) {
+          await this.releaseV2Claim(turn);
+          await appendDoLog(this.ctx.storage, `v2 yield_after_brain ${turn.event.eventId}: answered by ${peer}`, this.nowMs(), this.env);
+          await this.removePendingTurn(turn.event.eventId);
+          return;
+        }
       }
       let posted: { eventId: string };
       let replyToEventId: string | undefined;

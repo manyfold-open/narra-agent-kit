@@ -668,4 +668,25 @@ describe('v2 pipeline end to end', () => {
     await t.runAlarmsFor(10_000);
     expect(t.envelopes).toHaveLength(1);
   });
+
+  it('does not post a brain reply when another agent answered while it was thinking', async () => {
+    let t!: ReturnType<typeof setup>;
+    t = setup(() => {
+      // The peer's answer arrives while the brain is still working.
+      void t.post([
+        {
+          event_id: '$peer_answer',
+          sender: SPOTTED,
+          type: 'm.room.message',
+          origin_server_ts: Date.UTC(2026, 10, 25, 12, 0, 3),
+          content: { msgtype: 'm.text', body: '這週末有這些。', 'ai.narra.answers': { event_id: '$q' } },
+        },
+      ]);
+      return '今天三則 AI 新聞：…';
+    });
+    await t.post([t.msg('$q', '有啥新聞嗎今天')]);
+    await t.runAlarmsFor(10_000);
+    expect(t.sent.filter((s) => s.type === 'm.room.message')).toHaveLength(0);
+    expect(await t.log()).toMatch(/v2 yield_after_brain \$q/);
+  });
 });
