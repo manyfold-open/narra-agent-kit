@@ -25,6 +25,11 @@ export interface RelevanceScorerOptions {
 }
 export interface RelevanceResult {
     score: number;
+    /**
+     * The fit to this agent's profile alone (scaled best cosine), even when another agent's asks are
+     * closer (`score` is then 0). Used only to stand by as a fallback, never to go first.
+     */
+    rawScore?: number;
     /** Raw best cosine, logged so thresholds can be calibrated from real traffic. */
     cosine?: number;
     /** Best cosine against `notExamples`, when given. */

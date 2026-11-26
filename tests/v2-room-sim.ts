@@ -84,6 +84,11 @@ function sse(text: string): Response {
 
 /** Topic axes for the fake embedding: food, events, data, money, chatter, fortune. */
 const TOPICS: Array<[RegExp, number[]]> = [
+  // Live zack test 2026-11-26 (G10, G14): closest to the events agent, but data fits on its own.
+  [/房租.*資料集/, [0, 0.8, 0.6, 0, 0]],
+  [/天氣|好喔哈哈/, [0, 0.8, 0.5, 0, 0.3]],
+  // G17: food and events both fit fully.
+  [/點心/, [1, 1, 0, 0, 0]],
   [/£|付了|欠|帳|記帳|split|owe|bill|expense|\bOK\b|^好$|#\d/i, [0, 0, 0, 1, 0]],
   [/黑客松|hackathon|資料集|dataset|融資|funding|研討會/i, [0, 0, 1, 0, 0]],
   // Vague asks: clearly closer to events than to anything else, but not by much.

@@ -283,6 +283,63 @@ describe('v2 room: the best fit wins, not the fastest claim', () => {
   });
 });
 
+describe('v2 room: a real ask nobody claims still gets one answer (zack test, 2026-11-26)', () => {
+  // G10: the events agent fits best by topic but stays silent; the data agent is the right one, yet
+  // its message is "closer to another agent's asks", which used to zero it and empty the stand-by pool.
+  it('a question the better fit declines goes to the agent that fits it on its own (房租資料集)', async () => {
+    const sim = createRoomSim(
+      [
+        food(),
+        events({ brain: () => '[NO_REPLY]' }),
+        data({ brain: (t) => (/資料集|黑客松/.test(t) ? 'DATA: 倫敦房租資料集' : '[NO_REPLY]') }),
+      ],
+      HUMANS,
+    );
+    const q = await sim.say(PIKA, '有沒有倫敦房租的公開資料集？');
+    await sim.run(120_000);
+    expect(sim.answersTo(q)).toEqual(['DATA']);
+  });
+
+  // G14: nobody's topic. The agents that woke stay silent; one stand-by answers as the room's catch-all.
+  it('a question outside every speciality gets one answer from a stand-by (天氣)', async () => {
+    const standByBrain = (t: string, prompt: string) =>
+      /天氣/.test(t) && prompt.includes('stand-by') ? 'DATA: 今天多雲，帶把傘' : '[NO_REPLY]';
+    const sim = createRoomSim([food(), events({ brain: () => '[NO_REPLY]' }), data({ brain: standByBrain })], HUMANS);
+    const q = await sim.say(PIKA, '倫敦今天天氣怎麼樣？');
+    await sim.run(120_000);
+    expect(sim.answersTo(q)).toEqual(['DATA']);
+  });
+
+  // The stand-by is a last resort, not a cascade: chatter one stand-by passed on is not retried.
+  it('chatter a stand-by passed on is not tried again by the next one', async () => {
+    const sim = createRoomSim(
+      [food(), events({ brain: () => '[NO_REPLY]' }), data({ brain: () => '[NO_REPLY]' })],
+      HUMANS,
+    );
+    const q = await sim.say(PIKA, '好喔哈哈');
+    await sim.run(120_000);
+    expect(sim.answersTo(q)).toEqual([]);
+    expect(sim.agent('DATA').brainCalls.length).toBeLessThanOrEqual(1);
+    expect(sim.agent('FOOD').brainCalls).toEqual([]);
+  });
+
+  // G17: two agents fit equally; the one that claimed first only pointed to the other.
+  it('a reply that points to another agent is a handoff, not an answer (Soho 點心)', async () => {
+    const sim = createRoomSim(
+      [
+        food({ brain: (t) => (/點心|吃/.test(t) ? 'FOOD: Soho 三家點心' : '[NO_REPLY]'), extra: { v2: later } }),
+        events({ brain: (t) => (/點心/.test(t) ? '這個問 @FOOD 會更準' : '[NO_REPLY]'), extra: { v2: first } }),
+      ],
+      HUMANS,
+    );
+    const q = await sim.say(PIKA, '推薦一家 Soho 的點心');
+    await sim.run(120_000);
+    expect(sim.answersTo(q)).toContain('FOOD');
+    expect(sim.answersTo(q).filter((a) => a === 'FOOD')).toHaveLength(1);
+  });
+});
+
+
 // ---------------------------------------------------------------------------------------------
 // The brain contract: what every agent's brain is told, whatever its profile says.
 // Fake brains below act like a literal model: they do what the prompt they received says, and

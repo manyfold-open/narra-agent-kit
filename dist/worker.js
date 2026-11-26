@@ -1,4 +1,4 @@
-import { A2AError, buildPromptEnvelope, normalizeA2AOutput, runManyfoldA2ATurnWithMeta, } from './adapters/manyfold-a2a.js';
+import { A2AError, BRAIN_CONTRACT, buildPromptEnvelope, normalizeA2AOutput, runManyfoldA2ATurnWithMeta, } from './adapters/manyfold-a2a.js';
 import { D1BroadcastStore, DEFAULT_ROOM_POSTING_RULES, InMemoryBroadcastStore, roomPostingBlock, ProactiveBroadcastScheduler, } from './broadcast.js';
 import { runSchemaStatements } from './d1.js';
 import { BurstCoalescer } from './debounce.js';
@@ -12,7 +12,7 @@ import { fetchEventContext, fetchMatrixCredential, fetchNarraChatMessagesBacksto
 import { chatBehaviourNote, parseBrainOutput } from './v2/actions.js';
 import { DEFAULT_DAILY_RELEVANCE_LIMIT, NARRA_USAGE_SCHEMA, parseLimit, UsageBudget } from './v2/budget.js';
 import { claimPriority, decideWake } from './v2/gate.js';
-import { CLAIM_REACTION, CLAIM_RETRY_REASON, applyClaimReaction, applyClaimRedaction, buildLedgerSummary, emptyRoomState, peerAnswered, peerClaimHolder, pruneClaims, } from './v2/ledger.js';
+import { CLAIM_REACTION, CLAIM_RETRY_REASON, applyClaimReaction, applyClaimRedaction, buildLedgerSummary, emptyRoomState, peerAnswered, peerHandoff, peerClaimHolder, pruneClaims, } from './v2/ledger.js';
 import { pipelineForRoom } from './v2/pipeline.js';
 import { shouldFlushStream, streamableText } from './v2/stream.js';
 import { languageName, matchScript, replyLanguageFor } from './v2/language.js';
@@ -143,7 +143,8 @@ foreignLang) {
         `Your domain: ${spec.domainDescription}`,
         wantsSummary
             ? 'The user asked to summarize/recap recent chat history. Read recent_conversation_timeline carefully and synthesize ALL key topics discussed across the entire group (not just your own domain) using concise "• " bullets grouped by topic/person. Attribute messages to human display names shown in [human HH:MM] SpeakerName:, never mix up two speakers, never invent facts not in the timeline, and NEVER print raw Matrix IDs like @sp-...:matrix.netmind.chat (use natural labels like "你" / "大家" / "someone" if no display name is shown).'
-            : 'Answer the user directly and naturally like a helpful human teammate. IMPORTANT: If last_drawn_tarot_cards, last_drawn_fortune_stick, d1_prefetched_records, or recent_self_replies is present in the context, you MUST directly interpret, compare, or answer using THOSE exact cards, sticks, or records — never tell the user to draw a new card or claim you cannot see what was just shown. Keep replies concise and mobile-friendly (3-5 short lines or 2-3 "• " bullets). Never invent fake URLs or unverified details.',
+            : 'Answer the user directly and naturally like a helpful human teammate. When the user follows up on last_drawn_tarot_cards, last_drawn_fortune_stick, d1_prefetched_records or recent_self_replies, answer from THOSE exact cards, sticks or records and never claim you cannot see what was just shown; when they ask a new question or for a new draw, give a fresh one. Keep replies concise and mobile-friendly (3-5 short lines or 2-3 "• " bullets). Never invent fake URLs.',
+        ...BRAIN_CONTRACT,
         `Reply STRICTLY in ${langLabel}.`,
         'Never mention internal system errors, fallback models, or envelope metadata. Output ONLY the final reply text.',
     ].join('\n');
@@ -2097,6 +2098,7 @@ export class BaseNarraRoomCoordinator {
                     await budget.add('relevance', nowMs);
                 return {
                     score: relevance.score,
+                    ...(relevance.rawScore !== undefined ? { rawScore: relevance.rawScore } : {}),
                     notMine: relevance.notCosine !== undefined && relevance.cosine !== undefined && relevance.notCosine > relevance.cosine,
                     mine: relevance.notCosine !== undefined && relevance.cosine !== undefined && relevance.cosine > relevance.notCosine,
                 };
@@ -2126,9 +2128,9 @@ export class BaseNarraRoomCoordinator {
         await appendDoLog(this.ctx.storage, `v2-shadow ${turn.event.eventId}: ${this.describeGate(decision, relevance)} | v1 reply=${v1Decision.shouldReply} ${v1Decision.reason}`, nowMs, this.env);
     }
     /** Another agent answered one of these messages, judged from the latest stored history. */
-    async peerAnsweredNow(eventIds, selfId) {
+    async peerAnsweredNow(eventIds, selfId, pointsHere) {
         const history = (await this.ctx.storage.get('recentHistory')) ?? [];
-        return peerAnswered(history, eventIds, selfId);
+        return peerAnswered(history, eventIds, selfId, pointsHere);
     }
     /**
      * After a text answer the 👀 stays on the message, so people can see who took it. Only a turn
@@ -2276,7 +2278,15 @@ export class BaseNarraRoomCoordinator {
             turn.v2Decision = decision;
         }
         if (!decision.direct && !turn.v2ClaimEventId) {
-            const answeredBy = peerAnswered(context.recentHistory, eventIds, spec.matrixId);
+            const pointsHere = (text) => isSelfMentioned({ ...turn.event, text, mentions: [] }, spec);
+            const handedBy = decision.reason === 'handoff' ? undefined : peerHandoff(context.recentHistory, eventIds, spec.matrixId, pointsHere);
+            if (handedBy) {
+                // The agent that answered pointed here ("@X knows this better"): that is not an answer.
+                decision = { wake: true, reason: 'handoff', delayMs: 0, claim: true, direct: false, ...(decision.score !== undefined ? { score: decision.score } : {}) };
+                turn.v2Decision = decision;
+                await appendDoLog(this.ctx.storage, `v2 handoff ${turn.event.eventId}: ${handedBy} pointed here`, nowMs, this.env);
+            }
+            const answeredBy = peerAnswered(context.recentHistory, eventIds, spec.matrixId, pointsHere);
             if (answeredBy) {
                 await appendDoLog(this.ctx.storage, `v2 yield ${turn.event.eventId}: answered by ${answeredBy}`, nowMs, this.env);
                 await this.removePendingTurn(turn.event.eventId);
@@ -2294,9 +2304,10 @@ export class BaseNarraRoomCoordinator {
                 await this.updatePendingTurn({ ...turn, v2Decision: decision, v2WaitingOn: holder, dueAtMs: nowMs + V2_CLAIM_RECHECK_MS });
                 return;
             }
-            if (decision.reason === 'fallback' && eventIds.some((id) => (state.released?.[id] ?? 0) > 0)) {
-                // An agent that fit better looked and chose not to answer: do not keep trying down the list.
-                await appendDoLog(this.ctx.storage, `v2 fallback passed ${turn.event.eventId}: a better fit chose not to answer`, nowMs, this.env);
+            if (decision.reason === 'fallback' && eventIds.some((id) => (state.releasedFallback?.[id] ?? 0) > 0)) {
+                // Another stand-by already looked and stayed silent (chatter, most likely): do not keep trying
+                // down the list. A better fit that stayed silent is different: the stand-by is there for that.
+                await appendDoLog(this.ctx.storage, `v2 fallback passed ${turn.event.eventId}: another stand-by chose not to answer`, nowMs, this.env);
                 await this.removePendingTurn(turn.event.eventId);
                 return;
             }
@@ -2447,6 +2458,8 @@ export class BaseNarraRoomCoordinator {
                         chat_behaviour: chatBehaviourNote({
                             chatType: context.chatType,
                             direct: decision.direct,
+                            fallback: decision.reason === 'fallback',
+                            handoff: decision.reason === 'handoff',
                             proactive: Boolean(turn.v2Proactive),
                             replyLanguage: languageName(replyLang),
                         }),
@@ -2519,7 +2532,7 @@ export class BaseNarraRoomCoordinator {
             // While the brain was writing, another agent may have answered (e.g. a crisis reply). Unless
             // this agent was addressed directly, a second answer to the same message is noise.
             if (!decision.direct && !turn.v2StreamEventId) {
-                const peer = await this.peerAnsweredNow(eventIds, spec.matrixId);
+                const peer = await this.peerAnsweredNow(eventIds, spec.matrixId, (t) => isSelfMentioned({ ...turn.event, text: t, mentions: [] }, spec));
                 if (peer) {
                     await this.releaseV2Claim(turn);
                     await appendDoLog(this.ctx.storage, `v2 yield_after_brain ${turn.event.eventId}: answered by ${peer}`, this.nowMs(), this.env);

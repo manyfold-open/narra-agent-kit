@@ -58,6 +58,8 @@ export function applyClaimRedaction(state, redactedEventId, reason) {
     if (!target)
         return false;
     delete state.claimReactions[redactedEventId];
+    const releasedClaim = claimsOn(state, target).find((c) => c.reactionEventId === redactedEventId);
+    const releasedPriority = releasedClaim && typeof releasedClaim.priority === 'number' ? releasedClaim.priority : undefined;
     const left = claimsOn(state, target).filter((c) => c.reactionEventId !== redactedEventId);
     if (left.length > 0)
         state.claims[target] = left;
@@ -65,6 +67,9 @@ export function applyClaimRedaction(state, redactedEventId, reason) {
         delete state.claims[target];
     if (reason !== CLAIM_RETRY_REASON) {
         state.released = { ...(state.released ?? {}), [target]: (state.released?.[target] ?? 0) + 1 };
+        if (releasedPriority !== undefined && releasedPriority < 1) {
+            state.releasedFallback = { ...(state.releasedFallback ?? {}), [target]: (state.releasedFallback?.[target] ?? 0) + 1 };
+        }
     }
     return true;
 }
@@ -77,10 +82,12 @@ export function pruneClaims(state, nowMs, keepMs = 30 * 60_000) {
             delete state.claims[target];
     }
     // Released counts only matter while the message is fresh; keep the newest few.
-    if (state.released) {
-        const keys = Object.keys(state.released);
+    for (const map of [state.released, state.releasedFallback]) {
+        if (!map)
+            continue;
+        const keys = Object.keys(map);
         for (const k of keys.slice(0, Math.max(0, keys.length - 200)))
-            delete state.released[k];
+            delete map[k];
     }
     const live = new Set(Object.keys(state.claims).flatMap((t) => claimsOn(state, t).map((c) => c.reactionEventId)));
     for (const reactionId of Object.keys(state.claimReactions)) {
@@ -201,12 +208,29 @@ export function unansweredHumanMessages(history, nowMs, windowMs = OPEN_ASK_WIND
     }
     return history.filter((t) => !isAgentTurn(t) && nowMs - t.timestampMs <= windowMs && t.text.trim() && !answered.has(t.eventId));
 }
-/** Whether any agent other than `selfId` answered one of `eventIds`. */
-export function peerAnswered(history, eventIds, selfId) {
+/**
+ * Whether any agent other than `selfId` answered one of `eventIds`. A reply that only points to this
+ * agent ("@London Chinese Food knows this better") is a handoff, not an answer: pass `pointsHere`
+ * to leave those out, so the agent that was pointed to still answers.
+ */
+export function peerAnswered(history, eventIds, selfId, pointsHere) {
     for (const turn of history) {
         if (!isAgentTurn(turn) || turn.senderId === selfId || turn.isBroadcast)
             continue;
-        if (eventIds.some((id) => answers(turn, id)))
+        if (!eventIds.some((id) => answers(turn, id)))
+            continue;
+        if (pointsHere?.(turn.text))
+            continue;
+        return turn.senderId;
+    }
+    return undefined;
+}
+/** The peer reply to one of `eventIds` that points to this agent, if any (see `peerAnswered`). */
+export function peerHandoff(history, eventIds, selfId, pointsHere) {
+    for (const turn of history) {
+        if (!isAgentTurn(turn) || turn.senderId === selfId || turn.isBroadcast)
+            continue;
+        if (eventIds.some((id) => answers(turn, id)) && pointsHere(turn.text))
             return turn.senderId;
     }
     return undefined;
