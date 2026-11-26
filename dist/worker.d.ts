@@ -390,6 +390,11 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
     private logShadowV2;
     /** Another agent answered one of these messages, judged from the latest stored history. */
     private peerAnsweredNow;
+    /**
+     * After a text answer the 👀 stays on the message, so people can see who took it. Only a turn
+     * that ends without an answer (silent, failed, yielded) removes it, so the next agent can go on.
+     */
+    private keepV2Claim;
     private releaseV2Claim;
     private recordOwnReply;
     private runTurnV2;

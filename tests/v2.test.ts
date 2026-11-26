@@ -540,7 +540,7 @@ function setup(
 }
 
 describe('v2 pipeline end to end', () => {
-  it('claims a relevant group question with 👀, lets Manyfold answer, marks the answer and releases the claim', async () => {
+  it('claims a relevant group question with 👀, lets Manyfold answer, marks the answer and keeps the 👀', async () => {
     const t = setup('今天三則：OpenAI 發新模型、DeepMind 新論文、Anthropic 新功能。');
     await t.post([t.msg('$q', '有啥新聞嗎今天')]);
     await t.runAlarmsFor(10_000);
@@ -548,7 +548,8 @@ describe('v2 pipeline end to end', () => {
     expect(t.sent[0].body['m.relates_to']).toEqual({ rel_type: 'm.annotation', event_id: '$q', key: CLAIM_REACTION });
     expect(t.sent[1].body.body).toContain('OpenAI');
     expect(JSON.stringify(t.sent[1].body)).toContain('$q'); // ai.narra.answers marker
-    expect(t.redactions).toEqual(['$out_1']);
+    // The 👀 stays after an answer, so people can see who took the message.
+    expect(t.redactions).toEqual([]);
     expect(t.envelopes[0]).toContain('chat_behaviour');
     expect(t.envelopes[0]).toContain('reply_mode');
     expect(await t.log()).toMatch(/v2 gate \$q: wake=true relevant/);
