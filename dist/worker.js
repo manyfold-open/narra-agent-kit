@@ -2096,6 +2096,7 @@ export class BaseNarraRoomCoordinator {
                 return {
                     score: relevance.score,
                     notMine: relevance.notCosine !== undefined && relevance.cosine !== undefined && relevance.notCosine > relevance.cosine,
+                    mine: relevance.notCosine !== undefined && relevance.cosine !== undefined && relevance.cosine > relevance.notCosine,
                 };
             },
         });

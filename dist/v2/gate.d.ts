@@ -37,11 +37,13 @@ export interface WakeGateInput {
     budgetExhausted?: boolean;
     /**
      * Relevance of the message to this agent (0..1), computed only when needed. `notMine` means the
-     * message is closer to another agent's requests (`v2.notExamples`) than to this agent's profile.
+     * message is closer to another agent's requests (`v2.notExamples`) than to this agent's profile;
+     * `mine` means the opposite: other agents' requests were compared and this agent's profile won.
      */
     score: () => Promise<number | {
         score: number;
         notMine?: boolean;
+        mine?: boolean;
     }>;
     options?: Partial<WakeGateOptions>;
 }

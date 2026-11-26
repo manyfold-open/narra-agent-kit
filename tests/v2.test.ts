@@ -217,6 +217,20 @@ describe('v2 wake gate', () => {
     const withPeer = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => 0.6 });
     expect(withPeer).toMatchObject({ wake: false, reason: 'peer_conversation' });
   });
+
+  it('picks up a topic that moved to it while the sender talks with another agent (那晚上有啥可以玩的嗎 after food)', async () => {
+    const history = [turn('$a', ZACK, NOW - 60_000), turn('$b', SPOTTED, NOW - 50_000, { answersEventId: '$a' })];
+    const q = ev('$q', '那今天有什麼 AI 新聞');
+    // Closer to this agent's asks than to the other agents': the normal threshold applies.
+    const moved = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.55, mine: true }) });
+    expect(moved).toMatchObject({ wake: true, reason: 'relevant', claim: true });
+    // Still below the normal threshold: no wake.
+    const weak = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.4, mine: true }) });
+    expect(weak).toMatchObject({ wake: false, reason: 'low_relevance' });
+    // Not clearly this agent's: the peer-thread bar stays.
+    const unclear = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.55 }) });
+    expect(unclear).toMatchObject({ wake: false, reason: 'peer_conversation' });
+  });
 });
 
 describe('v2 room ledger', () => {
