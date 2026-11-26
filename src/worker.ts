@@ -409,6 +409,8 @@ interface PendingTurn {
   v2Proactive?: boolean;
   /** v2: the agent whose 👀 claim this turn is waiting on (answer -> drop, release -> go on). */
   v2WaitingOn?: string;
+  /** v2: a stand-by that claimed and waited for other stand-bys' claims to arrive (see V2_STANDBY_SETTLE_MS). */
+  v2StandbySettled?: boolean;
 }
 
 /** A real question nobody claimed: the first elected agent answers after this long... */
@@ -419,6 +421,19 @@ const GROUP_FALLBACK_STEP_MS = 8_000;
 const GROUP_FALLBACK_MAX_RANK = 3;
 /** v2: gap between agents' turns to answer an unaddressed crisis message, in room-agent order. */
 const V2_CRISIS_STEP_MS = 2_500;
+/**
+ * v2: a stand-by that resumes after the agent it waited on let go waits again, (1 - fit) x this, so
+ * the stand-bys go one at a time, best fit first, instead of all calling their brains at once.
+ */
+const V2_STANDBY_STAGGER_MS = 30_000;
+/**
+ * v2: a stand-by claims, then waits this long before calling its brain: stand-bys with similar fit
+ * reach the room within a second or two of each other, and only the strongest (then earliest) claim
+ * goes on. The others step back without it counting as a look.
+ */
+const V2_STANDBY_SETTLE_MS = 2_500;
+/** v2: stand-bys that may look at one message before the rest give up (chatter costs at most this many). */
+const V2_MAX_STANDBY_TRIES = 2;
 /** v2: how often a turn waiting on another agent's 👀 checks whether it answered or let go. */
 const V2_CLAIM_RECHECK_MS = 2_000;
 const GROUP_FALLBACK_NOTE =
@@ -3041,11 +3056,22 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         await this.updatePendingTurn({ ...turn, v2Decision: decision, v2WaitingOn: holder, dueAtMs: nowMs + V2_CLAIM_RECHECK_MS });
         return;
       }
-      if (decision.reason === 'fallback' && eventIds.some((id) => (state.releasedFallback?.[id] ?? 0) > 0)) {
-        // Another stand-by already looked and stayed silent (chatter, most likely): do not keep trying
-        // down the list. A better fit that stayed silent is different: the stand-by is there for that.
-        await appendDoLog(this.ctx.storage, `v2 fallback passed ${turn.event.eventId}: another stand-by chose not to answer`, nowMs, this.env);
+      const standByTries = Math.max(0, ...eventIds.map((id) => state.releasedFallback?.[id] ?? 0));
+      if (decision.reason === 'fallback' && standByTries >= V2_MAX_STANDBY_TRIES) {
+        // Stand-bys already looked and stayed silent (chatter, most likely): do not keep trying down the
+        // list. A better fit that stayed silent is different: the stand-bys are there for that.
+        await appendDoLog(this.ctx.storage, `v2 fallback passed ${turn.event.eventId}: ${standByTries} stand-bys chose not to answer`, nowMs, this.env);
         await this.removePendingTurn(turn.event.eventId);
+        return;
+      }
+      if (decision.reason === 'fallback' && turn.v2WaitingOn) {
+        // Every stand-by was waiting on the same claim and sees it go at the same moment. Spread out
+        // again by fit, so the best one claims first and the others wait on its 👀.
+        const fit = Math.min(0.99, Math.max(0, decision.score ?? 0));
+        const jitter = hashFraction(`standby:${turn.event.eventId}:${spec.matrixId ?? spec.id}`) * 400;
+        const waitMs = Math.round((1 - fit) * V2_STANDBY_STAGGER_MS + jitter);
+        await appendDoLog(this.ctx.storage, `v2 standby ${turn.event.eventId}: ${turn.v2WaitingOn} released it, next in ${waitMs}ms`, nowMs, this.env);
+        await this.updatePendingTurn({ ...turn, v2Decision: decision, v2WaitingOn: undefined, dueAtMs: nowMs + waitMs });
         return;
       }
       if (turn.v2WaitingOn) {
@@ -3070,6 +3096,34 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           turn.v2ClaimAtMs = this.nowMs();
           turn.v2ClaimCount = count + 1;
           await this.updatePendingTurn(turn);
+        }
+      }
+
+      if (decision.reason === 'fallback' && context.chatType === 'group' && turn.v2ClaimEventId) {
+        if (!turn.v2StandbySettled) {
+          // Let the other stand-bys' claims arrive before calling the brain.
+          await this.updatePendingTurn({ ...turn, v2Decision: decision, v2StandbySettled: true, dueAtMs: this.nowMs() + V2_STANDBY_SETTLE_MS });
+          return;
+        }
+        const latest = (await this.ctx.storage.get<V2RoomState>('v2State')) ?? emptyRoomState();
+        const peer = peerAnswered(context.recentHistory, eventIds, spec.matrixId);
+        const tries = Math.max(0, ...eventIds.map((id) => latest.releasedFallback?.[id] ?? 0));
+        const stronger = peer ? undefined : await this.outrankedNow(turn, decision, eventIds, spec.matrixId);
+        if (peer || stronger || tries >= V2_MAX_STANDBY_TRIES) {
+          await this.releaseV2Claim(turn, CLAIM_RETRY_REASON);
+          if (stronger && !peer && tries < V2_MAX_STANDBY_TRIES) {
+            await appendDoLog(this.ctx.storage, `v2 standby ${turn.event.eventId}: ${stronger} goes first`, this.nowMs(), this.env);
+            await this.updatePendingTurn({ ...turn, v2Decision: decision, v2StandbySettled: false, v2WaitingOn: stronger, dueAtMs: this.nowMs() + V2_CLAIM_RECHECK_MS });
+            return;
+          }
+          await appendDoLog(
+            this.ctx.storage,
+            `v2 fallback passed ${turn.event.eventId}: ${peer ? `answered by ${peer}` : `${tries} stand-bys chose not to answer`}`,
+            this.nowMs(),
+            this.env,
+          );
+          await this.removePendingTurn(turn.event.eventId);
+          return;
         }
       }
 

@@ -110,7 +110,15 @@ function marginFit(margin: number | undefined, fallback: number): number {
   return Math.min(1, Math.max(0, margin / CLEAR_MARGIN));
 }
 
+/**
+ * How strongly a decision holds the message, rounded to what the 👀 carries (`ai.narra.claim.priority`),
+ * so an agent compares its own claim with its peers' on the same footing.
+ */
 export function claimPriority(decision: Pick<WakeDecision, 'reason' | 'score' | 'direct' | 'margin'>): number {
+  return Math.round(rawClaimPriority(decision) * 1000) / 1000;
+}
+
+function rawClaimPriority(decision: Pick<WakeDecision, 'reason' | 'score' | 'direct' | 'margin'>): number {
   const score = Math.min(1, Math.max(0, decision.score ?? 0));
   if (decision.direct) return 5;
   switch (decision.reason) {

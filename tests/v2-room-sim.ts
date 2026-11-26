@@ -84,6 +84,9 @@ function sse(text: string): Response {
 
 /** Topic axes for the fake embedding: food, events, data, money, chatter, fortune. */
 const TOPICS: Array<[RegExp, number[]]> = [
+  // Live zack test 17:39: nobody's topic, several stand-bys at once.
+  [/會下雨/, [0, 0.7, 0.5, 0, 0.5]],
+  [/general helper/, [0, 0, 0, 0, 1]],
   // Live zack test 2026-11-26 (G10, G14): closest to the events agent, but data fits on its own.
   [/房租.*資料集/, [0, 0.8, 0.6, 0, 0]],
   [/天氣|好喔哈哈/, [0, 0.8, 0.5, 0, 0.3]],
