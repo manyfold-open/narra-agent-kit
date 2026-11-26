@@ -2825,6 +2825,14 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     return peerAnswered(history, eventIds, selfId);
   }
 
+  /**
+   * After a text answer the 👀 stays on the message, so people can see who took it. Only a turn
+   * that ends without an answer (silent, failed, yielded) removes it, so the next agent can go on.
+   */
+  private keepV2Claim(turn: PendingTurn): void {
+    turn.v2ClaimEventId = undefined;
+  }
+
   private async releaseV2Claim(turn: PendingTurn): Promise<void> {
     if (!turn.v2ClaimEventId) return;
     const claimId = turn.v2ClaimEventId;
@@ -3022,7 +3030,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       if (safety) {
         const posted = await this.postReplyToRoom(roomId, safety, turn.event.eventId, spec.matrixId, undefined, turn.event.eventId);
         await this.recordOwnReply(turn, spec, safety, posted.eventId);
-        await this.releaseV2Claim(turn);
+        this.keepV2Claim(turn);
         await appendDoLog(this.ctx.storage, `v2 safety reply ${turn.event.eventId}`, this.nowMs(), this.env);
         await this.removePendingTurn(turn.event.eventId);
         return;
@@ -3268,7 +3276,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         );
       }
       await this.recordOwnReply(turn, spec, text, posted.eventId, replyToEventId);
-      await this.releaseV2Claim(turn);
+      this.keepV2Claim(turn);
       await appendDoLog(
         this.ctx.storage,
         `v2 answered ${turn.event.eventId} (${decision.reason}${action.mode ? `, mode=${action.mode}` : ''}${stream.shown ? `, streamed edits=${stream.edits}` : ''}) in ${this.nowMs() - turn.event.timestampMs}ms`,

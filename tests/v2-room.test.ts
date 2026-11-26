@@ -162,6 +162,20 @@ describe('v2 room: every real ask gets exactly one answer', () => {
     expect(sim.answersTo(q)).toEqual(['EVENTS']);
   });
 
+  it('the 👀 stays on an answered message and goes away when the claimer stayed silent', async () => {
+    const sim = createRoomSim(
+      [food({ extra: { v2: later } }), events({ brain: () => '[NO_REPLY]', extra: { v2: first } })],
+      HUMANS,
+    );
+    const q = await sim.say(ZACK, '吃完飯有什麼市集可以逛');
+    await sim.run(120_000);
+    const claims = sim.timeline.filter((e) => e.type === 'm.reaction' && (e.content['m.relates_to'] as { event_id: string }).event_id === q);
+    const redacted = new Set(sim.timeline.filter((e) => e.type === 'm.room.redaction').map((e) => e.redacts));
+    const live = claims.filter((c) => !redacted.has(c.event_id)).map((c) => sim.agent('FOOD').id === c.sender ? 'FOOD' : 'EVENTS');
+    expect(sim.answersTo(q)).toEqual(['FOOD']);
+    expect(live).toEqual(['FOOD']);
+  });
+
   it('chatter gets no answer and nobody claims it', async () => {
     const sim = createRoomSim([food(), events(), data(), penny({ bill: false })], HUMANS);
     const q = await sim.say(ZACK, '哈哈');
