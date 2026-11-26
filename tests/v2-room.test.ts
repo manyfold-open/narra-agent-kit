@@ -282,3 +282,126 @@ describe('v2 room: the best fit wins, not the fastest claim', () => {
     expect(sim.answersTo(q)).toEqual(['FOOD']);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// The brain contract: what every agent's brain is told, whatever its profile says.
+// Fake brains below act like a literal model: they do what the prompt they received says, and
+// fall back to their profile's habits when the prompt does not say otherwise. So these tests
+// fail when the contract stops reaching the brain, not when one phrase changes.
+// ---------------------------------------------------------------------------------------------
+
+import { BRAIN_CONTRACT } from '../src/index.js';
+
+/** The envelope text inside an A2A request body. */
+function envelopeOf(body: string): string {
+  const parsed = JSON.parse(body) as { params?: { message?: { parts?: Array<{ text?: string }> } } };
+  return parsed.params?.message?.parts?.[0]?.text ?? '';
+}
+
+const RULES = '[Answering rules]';
+const asksForOne = (t: string) => /一張|one card|1 card/i.test(t);
+
+/**
+ * A tarot agent whose profile says "a weekly reading is three cards" and which always gets the
+ * last reading injected. Without the contract it re-serves the old reading or ignores the count.
+ */
+function tarot(over: Partial<SimAgentDef> = {}): SimAgentDef {
+  return {
+    spec: spec('@agent-7a507006:matrix.netmind.chat', 'TAROT', 'Three-card AI tarot readings'),
+    profile: 'Tarot card readings: draw cards about work, love, this week',
+    wakeExamples: ['幫我抽塔羅', '這週運勢抽三張牌', 'draw a tarot card for me'],
+    notExamples: [...FOOD_ASKS, ...EVENT_ASKS, ...DATA_ASKS],
+    brain: (t, body) => {
+      const env = envelopeOf(body);
+      const hasRules = env.includes(RULES);
+      if (!/塔羅|tarot|牌|card/i.test(t)) return '[NO_REPLY]';
+      if (!hasRules && env.includes('last_drawn_tarot_cards')) return 'TAROT: 這題已經解讀過了，要不要繼續看那三張？';
+      if (hasRules && asksForOne(t)) return 'TAROT: 一張牌 · 星星（The Star）';
+      return 'TAROT: 三張牌 · 星星、聖杯三、權杖十';
+    },
+    extra: {
+      buildExtraEnvelopeFields: async () => ({ last_drawn_tarot_cards: 'The Star, Three of Cups, Ten of Wands' }),
+    },
+    ...over,
+  };
+}
+
+/** An events agent that does not know tonight's opening hours. Without the evidence rule it says they are open anyway. */
+function eventsNoHours(): SimAgentDef {
+  return events({
+    brain: (t, body) => {
+      if (!/玩|活動|市集|things to do/i.test(t)) return '[NO_REPLY]';
+      return envelopeOf(body).includes('opening hours')
+        ? 'EVENTS: 三個活動 · 今晚營業時間未確認，出發前先看官網'
+        : 'EVENTS: 三個活動 · 營業時間不明，但今晚都有開';
+    },
+  });
+}
+
+describe('v2 room: the sender sets the task, the profile only sets defaults', () => {
+  it('every agent brain gets the answering rules, and the sender message comes last as the task', async () => {
+    const sim = createRoomSim([food(), events(), data(), tarot()], HUMANS);
+    for (const ask of ['有好吃的火鍋嗎？', '晚上有什麼好玩的？', '這週末倫敦有什麼 AI 黑客松？', '幫我抽一張塔羅牌看這週工作']) {
+      await sim.say(ZACK, ask);
+      await sim.run(60_000);
+    }
+    for (const name of ['FOOD', 'EVENTS', 'DATA', 'TAROT']) {
+      const { brainPrompts, brainCalls } = sim.agent(name);
+      expect(brainPrompts.length, name).toBeGreaterThan(0);
+      for (const [i, body] of brainPrompts.entries()) {
+        const env = envelopeOf(body);
+        for (const rule of BRAIN_CONTRACT) expect(env, name).toContain(rule);
+        // The sender's request is not labelled as untrusted, and it is the last thing the brain reads.
+        expect(env).not.toMatch(/message body (?:is|are) untrusted/i);
+        expect(env.trimEnd().endsWith(brainCalls[i])).toBe(true);
+        expect(env.indexOf(RULES)).toBeLessThan(env.lastIndexOf(brainCalls[i]));
+      }
+    }
+  });
+
+  it('asking for one card gets one card, even when the profile default is three', async () => {
+    const sim = createRoomSim([food(), events(), tarot()], HUMANS);
+    const q = await sim.say(PIKA, 'Draw one card for my work this week, tarot please');
+    await sim.run(60_000);
+    expect(sim.answersTo(q)).toEqual(['TAROT']);
+    expect(sim.answerTexts(q).join('\n')).toContain('一張牌');
+  });
+
+  it('a new question after an earlier reading gets a fresh reading, not "already read"', async () => {
+    const sim = createRoomSim([food(), events(), tarot()], HUMANS);
+    const a = await sim.say(ZACK, '幫我抽塔羅，這週運勢抽三張牌');
+    await sim.run(60_000);
+    const b = await sim.say(ZACK, '幫我抽一張塔羅牌看這週工作');
+    await sim.run(60_000);
+    expect(sim.answersTo(a)).toEqual(['TAROT']);
+    expect(sim.answersTo(b)).toEqual(['TAROT']);
+    const reply = sim.answerTexts(b).join('\n');
+    expect(reply).not.toMatch(/已經解讀過|already read/);
+    expect(reply).toContain('一張牌');
+  });
+
+  it('an agent that does not know tonight\'s hours says so instead of saying places are open', async () => {
+    const sim = createRoomSim([food(), eventsNoHours(), data()], HUMANS);
+    const q = await sim.say(PIKA, '今晚有什麼好玩的？');
+    await sim.run(60_000);
+    expect(sim.answersTo(q)).toEqual(['EVENTS']);
+    const reply = sim.answerTexts(q).join('\n');
+    expect(reply).toContain('未確認');
+    expect(reply).not.toContain('都有開');
+  });
+});
+
+describe('v2 room: a bare follow-up survives someone else talking in between', () => {
+  it('"第二個呢" after another member\'s unrelated ask still goes to the agent that listed things', async () => {
+    const sim = createRoomSim([food(), events(), data()], HUMANS);
+    const a = await sim.say(ZACK, '這週末倫敦有什麼 AI 黑客松？');
+    await sim.run(30_000);
+    const b = await sim.say(PIKA, '有好吃的火鍋嗎？');
+    await sim.run(30_000);
+    const c = await sim.say(ZACK, '第二個呢');
+    await sim.run(60_000);
+    expect(sim.answersTo(a)).toEqual(['DATA']);
+    expect(sim.answersTo(b)).toEqual(['FOOD']);
+    expect(sim.answersTo(c)).toEqual(['DATA']);
+  });
+});
