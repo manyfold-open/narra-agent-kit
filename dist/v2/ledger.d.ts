@@ -21,6 +21,8 @@ export interface V2RoomState {
     claims: Record<string, ClaimRecord>;
     /** claim reaction event id -> target event id (so a redaction releases the claim) */
     claimReactions: Record<string, string>;
+    /** target event id -> how many claims on it were released without an answer */
+    released?: Record<string, number>;
 }
 export declare function emptyRoomState(): V2RoomState;
 /** Records an agent's 👀 reaction as a claim on the message it reacts to. */

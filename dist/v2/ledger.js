@@ -43,6 +43,7 @@ export function applyClaimRedaction(state, redactedEventId) {
     delete state.claimReactions[redactedEventId];
     if (state.claims[target]?.reactionEventId === redactedEventId)
         delete state.claims[target];
+    state.released = { ...(state.released ?? {}), [target]: (state.released?.[target] ?? 0) + 1 };
     return true;
 }
 export function pruneClaims(state, nowMs, keepMs = 30 * 60_000) {
@@ -52,6 +53,12 @@ export function pruneClaims(state, nowMs, keepMs = 30 * 60_000) {
             if (claim.reactionEventId)
                 delete state.claimReactions[claim.reactionEventId];
         }
+    }
+    // Released counts only matter while the message is fresh; keep the newest few.
+    if (state.released) {
+        const keys = Object.keys(state.released);
+        for (const k of keys.slice(0, Math.max(0, keys.length - 200)))
+            delete state.released[k];
     }
     const live = new Set(Object.values(state.claims).map((c) => c.reactionEventId));
     for (const reactionId of Object.keys(state.claimReactions)) {

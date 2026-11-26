@@ -21,6 +21,7 @@ export type WakeReason =
   | 'proactive'
   | 'agent_hint'
   | 'relevant'
+  | 'fallback'
   | 'not_text'
   | 'from_agent'
   | 'aimed_elsewhere'
@@ -55,6 +56,15 @@ export interface WakeGateOptions {
   minDelayMs: number;
   /** Reactions on this agent's own messages that count as a reply to it (e.g. 👍 to confirm). */
   reactionsToSelf?: readonly string[];
+  /**
+   * Below the wake bar but at least this relevant: if no agent has answered or claimed the message
+   * after `fallbackDelayMs`, this agent takes it (the closest fit goes first). 0 turns it off.
+   */
+  fallbackThreshold: number;
+  /** Wait before a fallback agent takes an unanswered message, for a score right at the threshold... */
+  fallbackDelayMs: number;
+  /** ...minus up to this much for a better fit, so the closest agent goes first. */
+  fallbackSpreadMs: number;
 }
 
 export const DEFAULT_WAKE_GATE_OPTIONS: WakeGateOptions = {
@@ -62,6 +72,9 @@ export const DEFAULT_WAKE_GATE_OPTIONS: WakeGateOptions = {
   peerConversationThreshold: 0.65,
   maxDelayMs: 4_000,
   minDelayMs: 600,
+  fallbackThreshold: 0.3,
+  fallbackDelayMs: 20_000,
+  fallbackSpreadMs: 8_000,
 };
 
 export interface WakeGateInput {
@@ -164,7 +177,16 @@ export async function decideWake(input: WakeGateInput): Promise<WakeDecision> {
   // the partner drops it as `topic_moved_on`), the usual bar applies or nobody would answer.
   const inPeerThread = Boolean(partner) && !mine;
   const needed = inPeerThread ? opts.peerConversationThreshold : opts.threshold;
-  if (score < needed) return drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
+  if (score < needed) {
+    // Not sure enough to go first, but close: stand by in case nobody else takes it.
+    if (opts.fallbackThreshold > 0 && score >= opts.fallbackThreshold) {
+      const closeness = Math.min(1, Math.max(0, (score - opts.fallbackThreshold) / Math.max(0.01, needed - opts.fallbackThreshold)));
+      const jitter = hashFraction(`fallback:${event.eventId}:${selfId ?? spec.id}`) * 500;
+      const delayMs = Math.round(opts.fallbackDelayMs - closeness * opts.fallbackSpreadMs + jitter);
+      return { wake: true, reason: 'fallback', delayMs, claim: true, direct: false, score };
+    }
+    return drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
+  }
 
   // Higher relevance goes first; a per-agent hash breaks ties so two agents never collide exactly.
   const span = Math.max(0, opts.maxDelayMs - opts.minDelayMs);

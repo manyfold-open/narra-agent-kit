@@ -215,7 +215,11 @@ describe('v2 wake gate', () => {
     expect(high.delayMs).toBeLessThan(mid.delayMs);
     const history = [turn('$a', ZACK, NOW - 30_000), turn('$b', SPOTTED, NOW - 20_000, { answersEventId: '$a' })];
     const withPeer = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => 0.6 });
-    expect(withPeer).toMatchObject({ wake: false, reason: 'peer_conversation' });
+    // Under the bar in someone else's thread: only stands by in case nobody answers.
+    expect(withPeer).toMatchObject({ wake: true, reason: 'fallback', claim: true });
+    expect(withPeer.delayMs).toBeGreaterThan(10_000);
+    const noOpts = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => 0.6, options: { fallbackThreshold: 0 } });
+    expect(noOpts).toMatchObject({ wake: false, reason: 'peer_conversation' });
   });
 
   it('picks up a topic that moved to it while the sender talks with another agent (那晚上有啥可以玩的嗎 after food)', async () => {
@@ -224,12 +228,14 @@ describe('v2 wake gate', () => {
     // Closer to this agent's asks than to the other agents': the normal threshold applies.
     const moved = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.55, mine: true }) });
     expect(moved).toMatchObject({ wake: true, reason: 'relevant', claim: true });
-    // Still below the normal threshold: no wake.
+    // Still below the normal threshold: only a fallback.
     const weak = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.4, mine: true }) });
-    expect(weak).toMatchObject({ wake: false, reason: 'low_relevance' });
-    // Not clearly this agent's: the peer-thread bar stays.
+    expect(weak).toMatchObject({ wake: true, reason: 'fallback' });
+    // Not clearly this agent's: the peer-thread bar stays, so it only stands by.
     const unclear = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.55 }) });
-    expect(unclear).toMatchObject({ wake: false, reason: 'peer_conversation' });
+    expect(unclear).toMatchObject({ wake: true, reason: 'fallback' });
+    // A closer fit stands by for less time.
+    expect(unclear.delayMs).toBeLessThan(weak.delayMs);
   });
 });
 
@@ -573,7 +579,45 @@ describe('v2 pipeline end to end', () => {
     await t.runAlarmsFor(10_000);
     expect(t.envelopes).toHaveLength(0);
     expect(t.sent).toHaveLength(0);
-    expect(await t.log()).toMatch(/v2 yield \$q: handled by @agent-f9388b28/);
+    // A claim is not an answer: it waits for the outcome instead of dropping the message.
+    expect(await t.log()).toMatch(/v2 wait \$q: claimed by @agent-f9388b28/);
+    // The other agent answers: done.
+    await t.post([
+      {
+        event_id: '$peer_answer',
+        sender: SPOTTED,
+        type: 'm.room.message',
+        origin_server_ts: Date.UTC(2026, 10, 25, 12, 0, 12),
+        content: { msgtype: 'm.text', body: '這週末有這些活動', 'ai.narra.answers': { event_id: '$q' } },
+      },
+    ]);
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes).toHaveLength(0);
+    expect(await t.log()).toMatch(/v2 yield \$q: answered by @agent-f9388b28/);
+  });
+
+  it('answers after all when the agent that claimed first lets go without answering', async () => {
+    const t = setup('今天三則 AI 新聞。');
+    await t.post([t.msg('$q', '有啥新聞嗎今天')]);
+    await t.runAlarmsFor(2_000);
+    await t.post([
+      {
+        event_id: '$peer_claim',
+        sender: SPOTTED,
+        type: 'm.reaction',
+        origin_server_ts: Date.UTC(2026, 10, 25, 12, 0, 2),
+        content: { 'm.relates_to': { rel_type: 'm.annotation', event_id: '$q', key: CLAIM_REACTION } },
+      },
+    ]);
+    await t.runAlarmsFor(5_000);
+    expect(t.envelopes).toHaveLength(0);
+    await t.post([
+      { event_id: '$peer_unclaim', sender: SPOTTED, type: 'm.room.redaction', redacts: '$peer_claim', origin_server_ts: Date.UTC(2026, 10, 25, 12, 0, 8), content: {} },
+    ]);
+    await t.runAlarmsFor(10_000);
+    expect(t.envelopes).toHaveLength(1);
+    expect(t.sent.some((s) => s.type === 'm.room.message' && String(s.body.body).includes('AI'))).toBe(true);
+    expect(await t.log()).toMatch(/v2 resume \$q: @agent-f9388b28:matrix.netmind.chat released it/);
   });
 
   it('a silent brain leaves no trace: no message, no fake error, claim removed', async () => {

@@ -35,6 +35,8 @@ export interface V2RoomState {
   claims: Record<string, ClaimRecord>;
   /** claim reaction event id -> target event id (so a redaction releases the claim) */
   claimReactions: Record<string, string>;
+  /** target event id -> how many claims on it were released without an answer */
+  released?: Record<string, number>;
 }
 
 export function emptyRoomState(): V2RoomState {
@@ -65,6 +67,7 @@ export function applyClaimRedaction(state: V2RoomState, redactedEventId: string)
   if (!target) return false;
   delete state.claimReactions[redactedEventId];
   if (state.claims[target]?.reactionEventId === redactedEventId) delete state.claims[target];
+  state.released = { ...(state.released ?? {}), [target]: (state.released?.[target] ?? 0) + 1 };
   return true;
 }
 
@@ -74,6 +77,11 @@ export function pruneClaims(state: V2RoomState, nowMs: number, keepMs = 30 * 60_
       delete state.claims[target];
       if (claim.reactionEventId) delete state.claimReactions[claim.reactionEventId];
     }
+  }
+  // Released counts only matter while the message is fresh; keep the newest few.
+  if (state.released) {
+    const keys = Object.keys(state.released);
+    for (const k of keys.slice(0, Math.max(0, keys.length - 200))) delete state.released[k];
   }
   const live = new Set(Object.values(state.claims).map((c) => c.reactionEventId));
   for (const reactionId of Object.keys(state.claimReactions)) {
