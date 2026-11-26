@@ -177,11 +177,13 @@ export type NarraMatrixOp = {
     eventId: string;
     key: string;
     txnId?: string;
+    extra?: Record<string, unknown>;
 } | {
     op: 'redact';
     roomId: string;
     eventId: string;
     txnId?: string;
+    reason?: string;
 } | {
     op: 'receipt';
     roomId: string;
@@ -396,6 +398,8 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
      */
     private keepV2Claim;
     private releaseV2Claim;
+    /** A peer holding a stronger live claim on this message than this agent's own claim, if any. */
+    private outrankedNow;
     private recordOwnReply;
     private runTurnV2;
     private buildRoomContextForTurn;

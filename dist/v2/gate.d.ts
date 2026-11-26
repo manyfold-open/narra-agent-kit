@@ -2,7 +2,7 @@ import type { AgentSpec, InboundEvent, RoomContext } from '../types.js';
 import { type ReplyMode } from './ledger.js';
 /** Stop speaking once this many agent messages follow the last human one (platform rejects the 7th). */
 export declare const V2_AGENT_TAIL_CAP = 5;
-export type WakeReason = 'dm' | 'mentioned' | 'reply_to_you' | 'your_conversation' | 'handoff' | 'reaction_to_you' | 'proactive' | 'agent_hint' | 'relevant' | 'fallback' | 'not_text' | 'from_agent' | 'aimed_elsewhere' | 'mode_mention' | 'mode_quiet' | 'agent_tail_cap' | 'peer_conversation' | 'topic_moved_on' | 'low_relevance' | 'budget';
+export type WakeReason = 'dm' | 'mentioned' | 'reply_to_you' | 'your_conversation' | 'answers_your_question' | 'handoff' | 'reaction_to_you' | 'proactive' | 'agent_hint' | 'relevant' | 'fallback' | 'not_text' | 'from_agent' | 'aimed_elsewhere' | 'mode_mention' | 'mode_quiet' | 'agent_tail_cap' | 'peer_conversation' | 'topic_moved_on' | 'low_relevance' | 'budget';
 export interface WakeDecision {
     wake: boolean;
     reason: WakeReason;
@@ -56,5 +56,11 @@ export interface WakeGateInput {
     }>;
     options?: Partial<WakeGateOptions>;
 }
+/**
+ * How strongly a decision holds the message, sent with the 👀 claim. The highest live claim answers;
+ * arrival order only breaks ties. Continuing a conversation beats topical fit, and a confident fit
+ * beats a stand-by fallback.
+ */
+export declare function claimPriority(decision: Pick<WakeDecision, 'reason' | 'score' | 'direct'>): number;
 export declare function decideWake(input: WakeGateInput): Promise<WakeDecision>;
 //# sourceMappingURL=gate.d.ts.map

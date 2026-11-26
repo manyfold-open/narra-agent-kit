@@ -11,8 +11,8 @@ import { AGENT_CHAIN_CAP, AGENT_CHAIN_RETRY_MS, AgentChainTracker, DEFAULT_SESSI
 import { fetchEventContext, fetchMatrixCredential, fetchNarraChatMessagesBackstop, fetchRoomMessagesBackstop, matrixSyncRequest, redactSecrets, SyncError, syncOnce, fetchWithDeadline, } from './sync.js';
 import { chatBehaviourNote, parseBrainOutput } from './v2/actions.js';
 import { DEFAULT_DAILY_RELEVANCE_LIMIT, NARRA_USAGE_SCHEMA, parseLimit, UsageBudget } from './v2/budget.js';
-import { decideWake } from './v2/gate.js';
-import { CLAIM_REACTION, applyClaimReaction, applyClaimRedaction, buildLedgerSummary, emptyRoomState, peerAnswered, peerClaimHolder, pruneClaims, } from './v2/ledger.js';
+import { claimPriority, decideWake } from './v2/gate.js';
+import { CLAIM_REACTION, CLAIM_RETRY_REASON, applyClaimReaction, applyClaimRedaction, buildLedgerSummary, emptyRoomState, peerAnswered, peerClaimHolder, pruneClaims, } from './v2/ledger.js';
 import { pipelineForRoom } from './v2/pipeline.js';
 import { shouldFlushStream, streamableText } from './v2/stream.js';
 import { languageName, matchScript, replyLanguageFor } from './v2/language.js';
@@ -623,12 +623,12 @@ export class BaseNarraMatrixSync {
         if (op.op === 'react') {
             const txnId = op.txnId || crypto.randomUUID();
             url = `${roomBase}/send/m.reaction/${enc(txnId)}`;
-            body = { 'm.relates_to': { rel_type: 'm.annotation', event_id: op.eventId, key: op.key } };
+            body = { ...(op.extra ?? {}), 'm.relates_to': { rel_type: 'm.annotation', event_id: op.eventId, key: op.key } };
         }
         else if (op.op === 'redact') {
             const txnId = op.txnId || crypto.randomUUID();
             url = `${roomBase}/redact/${enc(op.eventId)}/${enc(txnId)}`;
-            body = {};
+            body = op.reason ? { reason: op.reason } : {};
         }
         else if (op.op === 'send') {
             const txnId = op.txnId || crypto.randomUUID();
@@ -1706,7 +1706,7 @@ export class BaseNarraRoomCoordinator {
                     }
                     if (ev.kind === 'redaction' && ev.redactsEventId) {
                         const targetId = ev.redactsEventId;
-                        if (applyClaimRedaction(v2State, targetId))
+                        if (applyClaimRedaction(v2State, targetId, ev.redactionReason))
                             v2Dirty = true;
                         if (!redactedSet.has(targetId)) {
                             redactedSet.add(targetId);
@@ -2137,17 +2137,26 @@ export class BaseNarraRoomCoordinator {
     keepV2Claim(turn) {
         turn.v2ClaimEventId = undefined;
     }
-    async releaseV2Claim(turn) {
+    async releaseV2Claim(turn, reason) {
         if (!turn.v2ClaimEventId)
             return;
         const claimId = turn.v2ClaimEventId;
         turn.v2ClaimEventId = undefined;
+        turn.v2ClaimAtMs = undefined;
         await this.matrixOp({
             op: 'redact',
             roomId: turn.event.roomId,
             eventId: claimId,
             txnId: await deterministicTxnId(`unclaim:${claimId}`),
+            ...(reason ? { reason } : {}),
         }).catch(() => undefined);
+    }
+    /** A peer holding a stronger live claim on this message than this agent's own claim, if any. */
+    async outrankedNow(turn, decision, eventIds, selfId) {
+        if (decision.direct || !decision.claim || !turn.v2ClaimEventId)
+            return undefined;
+        const state = (await this.ctx.storage.get('v2State')) ?? emptyRoomState();
+        return peerClaimHolder(state, eventIds, selfId, this.nowMs(), claimPriority(decision), turn.v2ClaimAtMs ?? this.nowMs());
     }
     async recordOwnReply(turn, spec, text, eventId, replyToEventId, isBroadcast = false) {
         const at = this.nowMs();
@@ -2273,7 +2282,9 @@ export class BaseNarraRoomCoordinator {
                 await this.removePendingTurn(turn.event.eventId);
                 return;
             }
-            const holder = peerClaimHolder(state, eventIds, spec.matrixId, nowMs);
+            // Only a claim at least as strong holds this agent back: a weak fit that reacted first (events
+            // reach Workers seconds apart) must not make the best fit wait for it.
+            const holder = peerClaimHolder(state, eventIds, spec.matrixId, nowMs, claimPriority(decision));
             if (holder) {
                 // A 👀 is an intent, not an answer: the holder may still stay silent, fail or time out.
                 // Wait for the outcome; give up only once a peer actually answered (checked above).
@@ -2296,15 +2307,19 @@ export class BaseNarraRoomCoordinator {
         }
         try {
             if (decision.claim && context.chatType === 'group' && !turn.v2ClaimEventId) {
+                const count = turn.v2ClaimCount ?? 0;
                 const claim = await this.matrixOp({
                     op: 'react',
                     roomId,
                     eventId: turn.event.eventId,
                     key: CLAIM_REACTION,
-                    txnId: await deterministicTxnId(`claim:${turn.event.eventId}`),
+                    txnId: await deterministicTxnId(count ? `claim:${turn.event.eventId}:${count}` : `claim:${turn.event.eventId}`),
+                    extra: { 'ai.narra.claim': { priority: Math.round(claimPriority(decision) * 1000) / 1000, reason: decision.reason } },
                 });
                 if (claim.ok && claim.eventId) {
                     turn.v2ClaimEventId = claim.eventId;
+                    turn.v2ClaimAtMs = this.nowMs();
+                    turn.v2ClaimCount = count + 1;
                     await this.updatePendingTurn(turn);
                 }
             }
@@ -2357,6 +2372,10 @@ export class BaseNarraRoomCoordinator {
                         return;
                     if (!turn.v2StreamEventId) {
                         if (!decision.direct && (await this.peerAnsweredNow(eventIds, spec.matrixId))) {
+                            stream.suppressed = true;
+                            return;
+                        }
+                        if (await this.outrankedNow(turn, decision, eventIds, spec.matrixId)) {
                             stream.suppressed = true;
                             return;
                         }
@@ -2507,6 +2526,14 @@ export class BaseNarraRoomCoordinator {
                     await this.removePendingTurn(turn.event.eventId);
                     return;
                 }
+                // A better-fitting agent claimed while this brain was working: it answers, this one steps back.
+                const stronger = await this.outrankedNow(turn, decision, eventIds, spec.matrixId);
+                if (stronger) {
+                    await this.releaseV2Claim(turn);
+                    await appendDoLog(this.ctx.storage, `v2 outranked ${turn.event.eventId}: ${stronger} fits better`, this.nowMs(), this.env);
+                    await this.removePendingTurn(turn.event.eventId);
+                    return;
+                }
             }
             if (turn.v2Proactive) {
                 const sent = await this.matrixOp({
@@ -2555,6 +2582,10 @@ export class BaseNarraRoomCoordinator {
                         ? error.retryable
                         : true;
             if (retryable && attempts < MAX_POST_ATTEMPTS) {
+                // Step back while retrying: a slow or failing brain must not hold the room. Another agent may
+                // take the message meanwhile; the retry then waits, or yields once that agent answered.
+                if (turn.v2ClaimEventId && !turn.v2StreamEventId)
+                    await this.releaseV2Claim(turn, CLAIM_RETRY_REASON);
                 await this.updatePendingTurn({ ...turn, attempts, dueAtMs: failNow + 4_000 * 2 ** (attempts - 1), lastError: errMsg });
                 await appendDoLog(this.ctx.storage, `v2 retry ${turn.event.eventId} attempt=${attempts}: ${errMsg}`, failNow, this.env);
                 return;

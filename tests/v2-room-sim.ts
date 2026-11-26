@@ -82,7 +82,7 @@ function sse(text: string): Response {
   );
 }
 
-/** Topic axes for the fake embedding: food, events, data, money, chatter. */
+/** Topic axes for the fake embedding: food, events, data, money, chatter, fortune. */
 const TOPICS: Array<[RegExp, number[]]> = [
   [/£|付了|欠|帳|記帳|split|owe|bill|expense|\bOK\b|^好$|#\d/i, [0, 0, 0, 1, 0]],
   [/黑客松|hackathon|資料集|dataset|融資|funding|研討會/i, [0, 0, 1, 0, 0]],
@@ -91,13 +91,17 @@ const TOPICS: Array<[RegExp, number[]]> = [
   [/有什麼推薦/, [0.1, 0.45, 0, 0, 0.9]],
   // Both food and events.
   [/吃完飯有什麼市集/, [1, 1, 0, 0, 0]],
+  // Mostly food, a little events.
+  [/夜市小吃/, [1, 0.6, 0, 0, 0]],
+  // Fortune telling.
+  [/抽.*籤|運勢|fortune/i, [0, 0, 0, 0, 0, 1]],
   [/玩|快閃|活動|市集|展覽|pop-?up|market|exhibition|things to do/i, [0, 1, 0, 0, 0]],
   [/吃|餐|火鍋|餓|拉麵|food|dinner|restaurant/i, [1, 0, 0, 0, 0]],
 ];
 
 export function fakeEmbedding(text: string): number[] {
   for (const [re, v] of TOPICS) if (re.test(text)) return v;
-  return [0, 0, 0, 0, 1];
+  return [0, 0, 0, 0, 1, 0];
 }
 
 export interface SimEvent {
@@ -121,8 +125,8 @@ export interface SimAgentDef {
   profile: string;
   wakeExamples: string[];
   notExamples: string[];
-  /** current human message text -> brain reply */
-  brain: (text: string) => BrainReply;
+  /** current human message text (and the full prompt the agent sent) -> brain reply */
+  brain: (text: string, prompt: string) => BrainReply;
   extra?: Partial<NarraGatewayConfig<NarraGatewayEnv>>;
 }
 
@@ -160,7 +164,7 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
       if (url.includes('/redact/')) {
         const target = decodeURIComponent(url.split('/redact/')[1].split('/')[0]);
         const eventId = `$${short}_r${++seq}`;
-        timeline.push({ event_id: eventId, sender: id, type: 'm.room.redaction', origin_server_ts: nowMs, content: {}, redacts: target });
+        timeline.push({ event_id: eventId, sender: id, type: 'm.room.redaction', origin_server_ts: nowMs, content: JSON.parse(String(init?.body ?? '{}')), redacts: target });
         return Response.json({ event_id: eventId });
       }
       const send = /\/send\/([^/]+)\//.exec(url);
@@ -172,7 +176,7 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
       if (url === `https://a2a.test/${short}`) {
         const current = latestHumanTextBefore(nowMs);
         brainCalls.push(current);
-        const reply = def.brain(current);
+        const reply = def.brain(current, String(init?.body ?? ''));
         const self = agents.find((a) => a.id === id)!;
         // The brain takes room time; other agents keep working meanwhile.
         self.waitingBrain = true;
