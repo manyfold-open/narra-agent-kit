@@ -182,6 +182,11 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
       }
       const send = /\/send\/([^/]+)\//.exec(url);
       if (send) {
+        const content = JSON.parse(String(init?.body ?? '{}'));
+        // Synapse requires canonical JSON: a non-integer number anywhere in the content is refused.
+        if (hasNonIntegerNumber(content)) {
+          return Response.json({ errcode: 'M_BAD_JSON', error: 'Bad JSON value: float' }, { status: 400 });
+        }
         const eventId = `$${short}_${++seq}`;
         timeline.push({ event_id: eventId, sender: id, type: decodeURIComponent(send[1]), origin_server_ts: nowMs, content: JSON.parse(String(init?.body ?? '{}')) });
         return Response.json({ event_id: eventId });
@@ -360,4 +365,12 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
   }
 
   return { say, run, answersTo, answerTexts, logOf, agent, timeline, advance, now: () => nowMs };
+}
+
+/** True when `value` holds a number Matrix canonical JSON refuses (a float, or outside +-2^53). */
+export function hasNonIntegerNumber(value: unknown): boolean {
+  if (typeof value === 'number') return !Number.isSafeInteger(value);
+  if (Array.isArray(value)) return value.some(hasNonIntegerNumber);
+  if (value && typeof value === 'object') return Object.values(value).some(hasNonIntegerNumber);
+  return false;
 }
