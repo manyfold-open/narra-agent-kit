@@ -316,7 +316,8 @@ function tarot(over: Partial<SimAgentDef> = {}): SimAgentDef {
       const hasRules = env.includes(RULES);
       if (!/塔羅|tarot|牌|card/i.test(t)) return '[NO_REPLY]';
       if (!hasRules && env.includes('last_drawn_tarot_cards')) return 'TAROT: 這題已經解讀過了，要不要繼續看那三張？';
-      if (hasRules && asksForOne(t)) return 'TAROT: 一張牌 · 星星（The Star）';
+      // Its tool only draws three, so with the rules it says so instead of silently swapping.
+      if (hasRules && asksForOne(t)) return 'TAROT: 我用三張牌來讀，這次一樣抽三張 · 星星、聖杯三、權杖十';
       return 'TAROT: 三張牌 · 星星、聖杯三、權杖十';
     },
     extra: {
@@ -359,12 +360,12 @@ describe('v2 room: the sender sets the task, the profile only sets defaults', ()
     }
   });
 
-  it('asking for one card gets one card, even when the profile default is three', async () => {
+  it('asking for one card when the agent only reads three gets told so, not a silent swap', async () => {
     const sim = createRoomSim([food(), events(), tarot()], HUMANS);
     const q = await sim.say(PIKA, 'Draw one card for my work this week, tarot please');
     await sim.run(60_000);
     expect(sim.answersTo(q)).toEqual(['TAROT']);
-    expect(sim.answerTexts(q).join('\n')).toContain('一張牌');
+    expect(sim.answerTexts(q).join('\n')).toContain('我用三張牌來讀');
   });
 
   it('a new question after an earlier reading gets a fresh reading, not "already read"', async () => {
@@ -377,7 +378,7 @@ describe('v2 room: the sender sets the task, the profile only sets defaults', ()
     expect(sim.answersTo(b)).toEqual(['TAROT']);
     const reply = sim.answerTexts(b).join('\n');
     expect(reply).not.toMatch(/已經解讀過|already read/);
-    expect(reply).toContain('一張牌');
+    expect(reply).toContain('抽三張');
   });
 
   it('an agent that does not know tonight\'s hours says so instead of saying places are open', async () => {
