@@ -86,10 +86,14 @@ export async function decideWake(input) {
         }
         return drop('topic_moved_on', score);
     }
-    const { score } = await getScore();
-    const needed = partner ? opts.peerConversationThreshold : opts.threshold;
+    const { score, mine } = await getScore();
+    // The sender talking with another agent raises the bar, so follow-ups stay in that thread. But when
+    // this message is closer to this agent's asks than to the other agents' (the topic moved here, and
+    // the partner drops it as `topic_moved_on`), the usual bar applies or nobody would answer.
+    const inPeerThread = Boolean(partner) && !mine;
+    const needed = inPeerThread ? opts.peerConversationThreshold : opts.threshold;
     if (score < needed)
-        return drop(partner ? 'peer_conversation' : 'low_relevance', score);
+        return drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
     // Higher relevance goes first; a per-agent hash breaks ties so two agents never collide exactly.
     const span = Math.max(0, opts.maxDelayMs - opts.minDelayMs);
     const fit = Math.min(1, Math.max(0, (score - needed) / Math.max(0.01, 1 - needed)));

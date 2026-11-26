@@ -74,9 +74,10 @@ export interface WakeGateInput {
   budgetExhausted?: boolean;
   /**
    * Relevance of the message to this agent (0..1), computed only when needed. `notMine` means the
-   * message is closer to another agent's requests (`v2.notExamples`) than to this agent's profile.
+   * message is closer to another agent's requests (`v2.notExamples`) than to this agent's profile;
+   * `mine` means the opposite: other agents' requests were compared and this agent's profile won.
    */
-  score: () => Promise<number | { score: number; notMine?: boolean }>;
+  score: () => Promise<number | { score: number; notMine?: boolean; mine?: boolean }>;
   options?: Partial<WakeGateOptions>;
 }
 
@@ -139,8 +140,8 @@ export async function decideWake(input: WakeGateInput): Promise<WakeDecision> {
   if (input.budgetExhausted) return drop('budget');
 
   const partner = threadPartner(context.recentHistory, event.senderId, nowMs, THREAD_WINDOW_MS);
-  let scored: { score: number; notMine?: boolean } | undefined;
-  const getScore = async (): Promise<{ score: number; notMine?: boolean }> => {
+  let scored: { score: number; notMine?: boolean; mine?: boolean } | undefined;
+  const getScore = async (): Promise<{ score: number; notMine?: boolean; mine?: boolean }> => {
     if (!scored) {
       const raw = await input.score();
       scored = typeof raw === 'number' ? { score: raw } : raw;
@@ -157,9 +158,13 @@ export async function decideWake(input: WakeGateInput): Promise<WakeDecision> {
     return drop('topic_moved_on', score);
   }
 
-  const { score } = await getScore();
-  const needed = partner ? opts.peerConversationThreshold : opts.threshold;
-  if (score < needed) return drop(partner ? 'peer_conversation' : 'low_relevance', score);
+  const { score, mine } = await getScore();
+  // The sender talking with another agent raises the bar, so follow-ups stay in that thread. But when
+  // this message is closer to this agent's asks than to the other agents' (the topic moved here, and
+  // the partner drops it as `topic_moved_on`), the usual bar applies or nobody would answer.
+  const inPeerThread = Boolean(partner) && !mine;
+  const needed = inPeerThread ? opts.peerConversationThreshold : opts.threshold;
+  if (score < needed) return drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
 
   // Higher relevance goes first; a per-agent hash breaks ties so two agents never collide exactly.
   const span = Math.max(0, opts.maxDelayMs - opts.minDelayMs);
