@@ -151,7 +151,12 @@ export function peerClaimHolder(
       const beats =
         ownPriority === Number.POSITIVE_INFINITY
           ? true
-          : p > ownPriority || (p === ownPriority && (ownClaimAtMs === undefined || claim.atMs < ownClaimAtMs));
+          : p > ownPriority ||
+            (p === ownPriority &&
+              (ownClaimAtMs === undefined ||
+                claim.atMs < ownClaimAtMs ||
+                // Same priority, same moment: a fixed order, so exactly one of the two goes on.
+                (claim.atMs === ownClaimAtMs && selfId !== undefined && claim.agentId < selfId)));
       if (beats && (!best || p > priorityOf(best))) best = claim;
     }
   }

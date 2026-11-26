@@ -60,6 +60,10 @@ export interface WakeGateInput {
     }>;
     options?: Partial<WakeGateOptions>;
 }
+/**
+ * How strongly a decision holds the message, rounded to what the 👀 carries (`ai.narra.claim.priority`),
+ * so an agent compares its own claim with its peers' on the same footing.
+ */
 export declare function claimPriority(decision: Pick<WakeDecision, 'reason' | 'score' | 'direct' | 'margin'>): number;
 export declare function decideWake(input: WakeGateInput): Promise<WakeDecision>;
 //# sourceMappingURL=gate.d.ts.map

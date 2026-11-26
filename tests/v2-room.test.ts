@@ -484,3 +484,53 @@ describe('v2 room: emoji acknowledgements come from the agent you talked with', 
     expect(await sim.logOf('PENNY')).not.toMatch(/v2 reacted/);
   });
 });
+
+describe('v2 room: stand-bys take turns (zack test 17:39, 2026-11-26)', () => {
+  // When the agent that fit best stayed silent, every stand-by resumed at once and five brains ran
+  // for one question. They now go one at a time, best fit first, and stop after two tries.
+  function helper(name: string, id: string, brain: SimAgentDef['brain']): SimAgentDef {
+    return {
+      spec: spec(id, name, 'general helper'),
+      profile: 'general helper',
+      wakeExamples: [],
+      notExamples: EVENT_ASKS,
+      brain,
+    };
+  }
+  const answersIfStandBy = (t: string, prompt: string) => (/下雨/.test(t) && prompt.includes('stand-by') ? 'HELP: 明天會下雨，帶傘' : '[NO_REPLY]');
+
+  it('one answer, and the stand-bys do not all call their brains at once', async () => {
+    const sim = createRoomSim(
+      [
+        events({ brain: () => '[NO_REPLY]' }),
+        data({ brain: () => '[NO_REPLY]' }),
+        helper('HELPA', '@agent-4e1a0006:matrix.netmind.chat', answersIfStandBy),
+        helper('HELPB', '@agent-4e1b0007:matrix.netmind.chat', answersIfStandBy),
+      ],
+      HUMANS,
+    );
+    const q = await sim.say(PIKA, '倫敦明天會下雨嗎？');
+    await sim.run(180_000);
+    expect(sim.answersTo(q)).toHaveLength(1);
+    const standByCalls = ['DATA', 'HELPA', 'HELPB'].reduce((n, a) => n + sim.agent(a).brainCalls.length, 0);
+    expect(standByCalls).toBeLessThanOrEqual(2);
+  });
+
+  it('chatter is given up after two stand-bys looked', async () => {
+    const sim = createRoomSim(
+      [
+        events({ brain: () => '[NO_REPLY]' }),
+        data({ brain: () => '[NO_REPLY]' }),
+        helper('HELPA', '@agent-4e1a0006:matrix.netmind.chat', () => '[NO_REPLY]'),
+        helper('HELPB', '@agent-4e1b0007:matrix.netmind.chat', () => '[NO_REPLY]'),
+      ],
+      HUMANS,
+    );
+    const q = await sim.say(PIKA, '會下雨吧哈哈');
+    await sim.run(180_000);
+    expect(sim.answersTo(q)).toEqual([]);
+    const standByCalls = ['DATA', 'HELPA', 'HELPB'].reduce((n, a) => n + sim.agent(a).brainCalls.length, 0);
+    expect(standByCalls).toBeLessThanOrEqual(2);
+  });
+});
+
