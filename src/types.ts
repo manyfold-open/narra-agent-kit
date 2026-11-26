@@ -72,6 +72,10 @@ export interface InboundEvent {
   replacesEventId?: string;
   redactsEventId?: string;
   reactionKey?: string;
+  /** A kit agent's 👀 claim carries how strongly it fits the message (`ai.narra.claim.priority`). */
+  claimPriority?: number;
+  /** Reason given on a redaction (kit agents mark claims they only release to retry). */
+  redactionReason?: string;
   isVoice?: boolean;
   voiceMeta?: VoiceMeta;
   mediaUrl?: string;

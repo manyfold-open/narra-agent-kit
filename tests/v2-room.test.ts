@@ -184,3 +184,101 @@ describe('v2 room: every real ask gets exactly one answer', () => {
     expect(sim.timeline.filter((e) => e.type === 'm.reaction')).toEqual([]);
   });
 });
+
+const DEMI = '@sp-demi:matrix.netmind.chat';
+const HUMANS3 = [...HUMANS, { id: DEMI, name: 'demi' }];
+
+/** Asks which topic before drawing; its brain answers a bare "工作" only when told it is the answer to its question. */
+function fortune(over: Partial<SimAgentDef> = {}): SimAgentDef {
+  return {
+    spec: spec('@agent-f0r70005:matrix.netmind.chat', 'FORTUNE', 'Fortune stick draws'),
+    profile: 'Fortune stick draws, luck and 抽籤',
+    wakeExamples: ['幫我抽個籤', '今天運勢如何'],
+    notExamples: [...FOOD_ASKS, ...EVENT_ASKS, ...DATA_ASKS],
+    brain: (t, prompt) => {
+      if (/抽.*籤/.test(t)) return '可以的。你想問的是什麼事？工作、感情還是某個決定？';
+      if (/工作|感情/.test(t) && prompt.includes('your_open_question')) return 'FORTUNE: 第 13 籤 · 工作';
+      return '[NO_REPLY]';
+    },
+    ...over,
+  };
+}
+
+async function askFortune(sim: ReturnType<typeof createRoomSim>): Promise<string> {
+  const id = sim.agent('FORTUNE').id;
+  const q = await sim.say(DEMI, '@FORTUNE 幫我抽個籤', { 'm.mentions': { user_ids: [id] } });
+  await sim.run(30_000);
+  expect(sim.answersTo(q)).toEqual(['FORTUNE']);
+  return q;
+}
+
+describe('v2 room: a conversation belongs to the room, not to one sender', () => {
+  it('a different person answering an agent question minutes later reaches that agent', async () => {
+    const sim = createRoomSim([fortune(), food(), events(), penny({ bill: false })], HUMANS3);
+    await askFortune(sim);
+    sim.advance(13 * 60_000);
+    const a = await sim.say(PIKA, '工作');
+    await sim.run(60_000);
+    expect(sim.answersTo(a)).toEqual(['FORTUNE']);
+  });
+
+  it('the person who was asked can still answer after the 3-minute thread window', async () => {
+    const sim = createRoomSim([fortune(), food(), events()], HUMANS3);
+    await askFortune(sim);
+    sim.advance(10 * 60_000);
+    const a = await sim.say(DEMI, '感情');
+    await sim.run(60_000);
+    expect(sim.answersTo(a)).toEqual(['FORTUNE']);
+  });
+
+  it('once the question is answered, later chatter is not treated as an answer', async () => {
+    const sim = createRoomSim([fortune(), food(), events()], HUMANS3);
+    await askFortune(sim);
+    const a = await sim.say(PIKA, '工作');
+    await sim.run(30_000);
+    expect(sim.answersTo(a)).toEqual(['FORTUNE']);
+    sim.advance(5 * 60_000);
+    const b = await sim.say(ZACK, '哈哈');
+    await sim.run(60_000);
+    expect(sim.answersTo(b)).toEqual([]);
+  });
+
+  it('a real ask for another agent after an agent question still goes to that other agent', async () => {
+    const sim = createRoomSim([fortune(), food(), events()], HUMANS3);
+    await askFortune(sim);
+    sim.advance(60_000);
+    const a = await sim.say(PIKA, '有好吃的火鍋嗎？');
+    await sim.run(60_000);
+    expect(sim.answersTo(a)).toEqual(['FOOD']);
+  });
+});
+
+describe('v2 room: the best fit wins, not the fastest claim', () => {
+  it('a much better fit is not held back by a weaker agent that claimed first', async () => {
+    const sim = createRoomSim(
+      [
+        food({ extra: { v2: later } }),
+        // Weak fit (no notExamples), claims instantly, and its brain hangs.
+        events({ notExamples: [], brain: () => ({ fail: true }), extra: { v2: first } }),
+      ],
+      HUMANS,
+    );
+    const q = await sim.say(ZACK, '夜市小吃推薦');
+    await sim.run(15_000);
+    expect(sim.answersTo(q)).toEqual(['FOOD']);
+    await sim.run(150_000);
+    expect(sim.answersTo(q)).toEqual(['FOOD']);
+  });
+
+  it('a claimant whose brain fails lets the next agent go at once, not after its retries', async () => {
+    const sim = createRoomSim(
+      [food({ extra: { v2: later } }), events({ brain: () => ({ fail: true }), extra: { v2: first } })],
+      HUMANS,
+    );
+    const q = await sim.say(ZACK, '吃完飯有什麼市集可以逛');
+    await sim.run(45_000);
+    expect(sim.answersTo(q)).toEqual(['FOOD']);
+    await sim.run(150_000);
+    expect(sim.answersTo(q)).toEqual(['FOOD']);
+  });
+});

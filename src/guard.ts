@@ -160,6 +160,7 @@ export function parseMatrixEvent(
       timeIso,
       mentions: [],
       redactsEventId,
+      ...(str(content.reason) ? { redactionReason: str(content.reason).slice(0, 64) } : {}),
       raw: event,
     };
   }
@@ -191,6 +192,7 @@ export function parseMatrixEvent(
     const replyToEventId = str(relates.event_id);
     const reactionKey = str(relates.key).slice(0, 32);
     if (!replyToEventId || !reactionKey) return null;
+    const claimPriority = Number(((content['ai.narra.claim'] ?? {}) as Record<string, unknown>).priority);
     return {
       roomId,
       ...(roomName ? { roomName: roomName.slice(0, 200) } : {}),
@@ -206,6 +208,7 @@ export function parseMatrixEvent(
       mentions: [],
       replyToEventId,
       reactionKey,
+      ...(Number.isFinite(claimPriority) ? { claimPriority } : {}),
       raw: event,
     };
   }

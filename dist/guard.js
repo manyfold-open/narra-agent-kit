@@ -131,6 +131,7 @@ export function parseMatrixEvent(raw, defaults) {
             timeIso,
             mentions: [],
             redactsEventId,
+            ...(str(content.reason) ? { redactionReason: str(content.reason).slice(0, 64) } : {}),
             raw: event,
         };
     }
@@ -162,6 +163,7 @@ export function parseMatrixEvent(raw, defaults) {
         const reactionKey = str(relates.key).slice(0, 32);
         if (!replyToEventId || !reactionKey)
             return null;
+        const claimPriority = Number((content['ai.narra.claim'] ?? {}).priority);
         return {
             roomId,
             ...(roomName ? { roomName: roomName.slice(0, 200) } : {}),
@@ -177,6 +179,7 @@ export function parseMatrixEvent(raw, defaults) {
             mentions: [],
             replyToEventId,
             reactionKey,
+            ...(Number.isFinite(claimPriority) ? { claimPriority } : {}),
             raw: event,
         };
     }

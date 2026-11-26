@@ -6,7 +6,7 @@
 import { isNarraAgent } from '../guard.js';
 import { hashFraction, isAimedElsewhere, isSelfMentioned } from '../router.js';
 import type { AgentSpec, InboundEvent, RoomContext } from '../types.js';
-import { THREAD_WINDOW_MS, threadPartner, type ReplyMode } from './ledger.js';
+import { conversationOwner, type ReplyMode } from './ledger.js';
 
 /** Stop speaking once this many agent messages follow the last human one (platform rejects the 7th). */
 export const V2_AGENT_TAIL_CAP = 5;
@@ -16,6 +16,7 @@ export type WakeReason =
   | 'mentioned'
   | 'reply_to_you'
   | 'your_conversation'
+  | 'answers_your_question'
   | 'handoff'
   | 'reaction_to_you'
   | 'proactive'
@@ -94,6 +95,29 @@ export interface WakeGateInput {
   options?: Partial<WakeGateOptions>;
 }
 
+/**
+ * How strongly a decision holds the message, sent with the 👀 claim. The highest live claim answers;
+ * arrival order only breaks ties. Continuing a conversation beats topical fit, and a confident fit
+ * beats a stand-by fallback.
+ */
+export function claimPriority(decision: Pick<WakeDecision, 'reason' | 'score' | 'direct'>): number {
+  const score = Math.min(1, Math.max(0, decision.score ?? 0));
+  if (decision.direct) return 5;
+  switch (decision.reason) {
+    case 'handoff':
+      return 4;
+    case 'answers_your_question':
+    case 'your_conversation':
+      return 3 + score * 0.5;
+    case 'relevant':
+      return 1 + score;
+    case 'fallback':
+      return score;
+    default:
+      return 1;
+  }
+}
+
 function drop(reason: WakeReason, score?: number): WakeDecision {
   return { wake: false, reason, delayMs: 0, claim: false, direct: false, ...(score !== undefined ? { score } : {}) };
 }
@@ -152,7 +176,11 @@ export async function decideWake(input: WakeGateInput): Promise<WakeDecision> {
   if (mode === 'mention') return drop('mode_mention');
   if (input.budgetExhausted) return drop('budget');
 
-  const partner = threadPartner(context.recentHistory, event.senderId, nowMs, THREAD_WINDOW_MS);
+  // Who this message most likely continues with, judged from the room (the same for every agent):
+  // the agent whose question is still waiting for an answer, from anyone, else the agent that was
+  // just talking with this sender.
+  const owner = conversationOwner(context.recentHistory, event, nowMs);
+  const partner = owner?.agentId;
   let scored: { score: number; notMine?: boolean; mine?: boolean } | undefined;
   const getScore = async (): Promise<{ score: number; notMine?: boolean; mine?: boolean }> => {
     if (!scored) {
@@ -166,7 +194,8 @@ export async function decideWake(input: WakeGateInput): Promise<WakeDecision> {
     // unrelated, but not when the person clearly moved on to another agent's topic.
     const { score, notMine } = await getScore();
     if (!notMine) {
-      return { wake: true, reason: 'your_conversation', delayMs: 0, claim: true, direct: false, score };
+      const reason = owner?.via === 'open_question' ? 'answers_your_question' : 'your_conversation';
+      return { wake: true, reason, delayMs: 0, claim: true, direct: false, score };
     }
     return drop('topic_moved_on', score);
   }
