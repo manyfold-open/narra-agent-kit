@@ -13,6 +13,9 @@ export const DEFAULT_WAKE_GATE_OPTIONS = {
     peerConversationThreshold: 0.65,
     maxDelayMs: 4_000,
     minDelayMs: 600,
+    fallbackThreshold: 0.3,
+    fallbackDelayMs: 20_000,
+    fallbackSpreadMs: 8_000,
 };
 function drop(reason, score) {
     return { wake: false, reason, delayMs: 0, claim: false, direct: false, ...(score !== undefined ? { score } : {}) };
@@ -92,8 +95,16 @@ export async function decideWake(input) {
     // the partner drops it as `topic_moved_on`), the usual bar applies or nobody would answer.
     const inPeerThread = Boolean(partner) && !mine;
     const needed = inPeerThread ? opts.peerConversationThreshold : opts.threshold;
-    if (score < needed)
+    if (score < needed) {
+        // Not sure enough to go first, but close: stand by in case nobody else takes it.
+        if (opts.fallbackThreshold > 0 && score >= opts.fallbackThreshold) {
+            const closeness = Math.min(1, Math.max(0, (score - opts.fallbackThreshold) / Math.max(0.01, needed - opts.fallbackThreshold)));
+            const jitter = hashFraction(`fallback:${event.eventId}:${selfId ?? spec.id}`) * 500;
+            const delayMs = Math.round(opts.fallbackDelayMs - closeness * opts.fallbackSpreadMs + jitter);
+            return { wake: true, reason: 'fallback', delayMs, claim: true, direct: false, score };
+        }
         return drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
+    }
     // Higher relevance goes first; a per-agent hash breaks ties so two agents never collide exactly.
     const span = Math.max(0, opts.maxDelayMs - opts.minDelayMs);
     const fit = Math.min(1, Math.max(0, (score - needed) / Math.max(0.01, 1 - needed)));

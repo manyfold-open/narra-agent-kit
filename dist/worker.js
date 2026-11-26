@@ -47,6 +47,8 @@ const GROUP_FALLBACK_STEP_MS = 8_000;
 const GROUP_FALLBACK_MAX_RANK = 3;
 /** v2: gap between agents' turns to answer an unaddressed crisis message, in room-agent order. */
 const V2_CRISIS_STEP_MS = 2_500;
+/** v2: how often a turn waiting on another agent's 👀 checks whether it answered or let go. */
+const V2_CLAIM_RECHECK_MS = 2_000;
 const GROUP_FALLBACK_NOTE = 'No other AI agent in this group answered this question. Answer it yourself, briefly and helpfully, ' +
     'even if it is outside your speciality. If another agent in this group clearly fits better, say so and name them. ' +
     'Reply in the language of the question.';
@@ -2235,7 +2237,9 @@ export class BaseNarraRoomCoordinator {
                 return;
             }
             if (hint === 'wake') {
-                decision = { wake: true, reason: 'agent_hint', delayMs: 0, claim: context.chatType === 'group', direct: false };
+                // A hint is the agent's own guess ("might be an answer to my question"), not a claim on the
+                // message: it looks without a 👀, so agents that fit better are never blocked by it.
+                decision = { wake: true, reason: 'agent_hint', delayMs: 0, claim: false, direct: false };
                 turn.v2Decision = decision;
                 await appendDoLog(this.ctx.storage, `v2 gate ${turn.event.eventId}: wake=true agent_hint`, nowMs, this.env);
             }
@@ -2256,12 +2260,31 @@ export class BaseNarraRoomCoordinator {
             turn.v2Decision = decision;
         }
         if (!decision.direct && !turn.v2ClaimEventId) {
-            const holder = peerClaimHolder(state, eventIds, spec.matrixId, nowMs) ??
-                peerAnswered(context.recentHistory, eventIds, spec.matrixId);
-            if (holder) {
-                await appendDoLog(this.ctx.storage, `v2 yield ${turn.event.eventId}: handled by ${holder}`, nowMs, this.env);
+            const answeredBy = peerAnswered(context.recentHistory, eventIds, spec.matrixId);
+            if (answeredBy) {
+                await appendDoLog(this.ctx.storage, `v2 yield ${turn.event.eventId}: answered by ${answeredBy}`, nowMs, this.env);
                 await this.removePendingTurn(turn.event.eventId);
                 return;
+            }
+            const holder = peerClaimHolder(state, eventIds, spec.matrixId, nowMs);
+            if (holder) {
+                // A 👀 is an intent, not an answer: the holder may still stay silent, fail or time out.
+                // Wait for the outcome; give up only once a peer actually answered (checked above).
+                if (turn.v2WaitingOn !== holder) {
+                    await appendDoLog(this.ctx.storage, `v2 wait ${turn.event.eventId}: claimed by ${holder}`, nowMs, this.env);
+                }
+                await this.updatePendingTurn({ ...turn, v2Decision: decision, v2WaitingOn: holder, dueAtMs: nowMs + V2_CLAIM_RECHECK_MS });
+                return;
+            }
+            if (decision.reason === 'fallback' && eventIds.some((id) => (state.released?.[id] ?? 0) > 0)) {
+                // An agent that fit better looked and chose not to answer: do not keep trying down the list.
+                await appendDoLog(this.ctx.storage, `v2 fallback passed ${turn.event.eventId}: a better fit chose not to answer`, nowMs, this.env);
+                await this.removePendingTurn(turn.event.eventId);
+                return;
+            }
+            if (turn.v2WaitingOn) {
+                await appendDoLog(this.ctx.storage, `v2 resume ${turn.event.eventId}: ${turn.v2WaitingOn} released it`, nowMs, this.env);
+                turn.v2WaitingOn = undefined;
             }
         }
         try {
