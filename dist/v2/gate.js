@@ -22,6 +22,13 @@ export const DEFAULT_WAKE_GATE_OPTIONS = {
  * arrival order only breaks ties. Continuing a conversation beats topical fit, and a confident fit
  * beats a stand-by fallback.
  */
+/** Margin (own cosine minus best not-example cosine) at which an agent counts as a clear winner. */
+const CLEAR_MARGIN = 0.3;
+function marginFit(margin, fallback) {
+    if (margin === undefined || !Number.isFinite(margin))
+        return fallback;
+    return Math.min(1, Math.max(0, margin / CLEAR_MARGIN));
+}
 export function claimPriority(decision) {
     const score = Math.min(1, Math.max(0, decision.score ?? 0));
     if (decision.direct)
@@ -33,7 +40,9 @@ export function claimPriority(decision) {
         case 'your_conversation':
             return 3 + score * 0.5;
         case 'relevant':
-            return 1 + score;
+            // Relevance saturates at 1 for every agent that fits at all, so two confident agents would tie
+            // and the faster Worker would win. The margin over the other agents' asks separates them.
+            return 1 + score * 0.5 + marginFit(decision.margin, score) * 0.5;
         case 'fallback':
             return score;
         default:
@@ -43,8 +52,8 @@ export function claimPriority(decision) {
 function drop(reason, score) {
     return { wake: false, reason, delayMs: 0, claim: false, direct: false, ...(score !== undefined ? { score } : {}) };
 }
-function direct(reason) {
-    return { wake: true, reason, delayMs: 0, claim: false, direct: true };
+function direct(reason, claim = false) {
+    return { wake: true, reason, delayMs: 0, claim, direct: true };
 }
 /** An agent message that names this agent and hands it the question. */
 function isHandoffToSelf(event, spec) {
@@ -82,10 +91,11 @@ export async function decideWake(input) {
     }
     if (context.chatType === 'dm')
         return direct('dm');
+    // Addressed in a group: show the 👀 at once, so people see it was picked up while the brain works.
     if (isSelfMentioned(event, spec))
-        return direct('mentioned');
+        return direct('mentioned', true);
     if (context.replyToTarget?.isSelf)
-        return direct('reply_to_you');
+        return direct('reply_to_you', true);
     if (isAimedElsewhere(event, context, spec))
         return drop('aimed_elsewhere');
     if (mode === 'quiet')
@@ -130,7 +140,7 @@ export async function decideWake(input) {
         // in case nobody takes it (it knows the conversation).
         return standBy(rawScore ?? score, opts.threshold) ?? drop('topic_moved_on', score);
     }
-    const { score, mine, notMine, rawScore } = await getScore();
+    const { score, mine, notMine, rawScore, margin } = await getScore();
     // The sender talking with another agent raises the bar, so follow-ups stay in that thread. But when
     // this message is closer to this agent's asks than to the other agents' (the topic moved here, and
     // the partner drops it as `topic_moved_on`), the usual bar applies or nobody would answer.
@@ -143,11 +153,13 @@ export async function decideWake(input) {
         const standByScore = notMine ? Math.max(score, rawScore ?? 0) : score;
         return standBy(standByScore, needed) ?? drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
     }
-    // Higher relevance goes first; a per-agent hash breaks ties so two agents never collide exactly.
+    // Higher relevance goes first. Relevance saturates at 1, so the margin over the other agents' asks
+    // orders equally confident agents; a per-agent hash breaks exact ties.
     const span = Math.max(0, opts.maxDelayMs - opts.minDelayMs);
-    const fit = Math.min(1, Math.max(0, (score - needed) / Math.max(0.01, 1 - needed)));
-    const jitter = hashFraction(`${event.eventId}:${selfId ?? spec.id}`) * 300;
-    const delayMs = Math.round(opts.minDelayMs + (1 - fit) * span + jitter);
-    return { wake: true, reason: 'relevant', delayMs, claim: true, direct: false, score };
+    const above = Math.min(1, Math.max(0, (score - needed) / Math.max(0.01, 1 - needed)));
+    const clear = marginFit(margin, above);
+    const jitter = hashFraction(`${event.eventId}:${selfId ?? spec.id}`) * 150;
+    const delayMs = Math.round(opts.minDelayMs + (1 - above) * span + (1 - clear) * 400 + jitter);
+    return { wake: true, reason: 'relevant', delayMs, claim: true, direct: false, score, ...(margin !== undefined ? { margin } : {}) };
 }
 //# sourceMappingURL=gate.js.map

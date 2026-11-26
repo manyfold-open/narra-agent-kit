@@ -387,6 +387,8 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
     private v2Mode;
     private v2Budget;
     private v2Gate;
+    /** In a group, only an addressed agent or the conversation's owner reacts with an emoji. */
+    private mayReactInGroup;
     private describeGate;
     /** Shadow mode: log what v2 would do with this turn, next to v1's decision. No brain call. */
     private logShadowV2;

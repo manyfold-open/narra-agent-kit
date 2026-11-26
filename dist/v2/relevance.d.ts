@@ -30,6 +30,8 @@ export interface RelevanceResult {
      * closer (`score` is then 0). Used only to stand by as a fallback, never to go first.
      */
     rawScore?: number;
+    /** `cosine - notCosine`: how clearly this agent beats the other agents' asks (negative = loses). */
+    margin?: number;
     /** Raw best cosine, logged so thresholds can be calibrated from real traffic. */
     cosine?: number;
     /** Best cosine against `notExamples`, when given. */

@@ -463,3 +463,24 @@ describe('v2 room: a bare follow-up survives someone else talking in between', (
     expect(sim.answersTo(c)).toEqual(['DATA']);
   });
 });
+
+// Found in the zack test live run (2026-11-26, pika): Penny reacted 👍 to thanks meant for another agent.
+describe('v2 room: emoji acknowledgements come from the agent you talked with', () => {
+  it('thanks after an answer: the answering agent reacts, a looking-in agent does not', async () => {
+    const thanks = (name: string) => (t: string) => (/謝謝/.test(t) ? '[REACT 👍]' : /玩|快閃|活動/.test(t) && name === 'EVENTS' ? 'EVENTS: 三個活動' : '[NO_REPLY]');
+    const sim = createRoomSim([food(), events({ brain: thanks('EVENTS') }), penny({ bill: true }, { brain: thanks('PENNY') })], HUMANS);
+    const a = await sim.say(PIKA, '這週末有什麼快閃活動');
+    await sim.run(30_000);
+    expect(sim.answersTo(a)).toEqual(['EVENTS']);
+    const q = await sim.say(PIKA, '謝謝');
+    await sim.run(60_000);
+    const redacted = new Set(sim.timeline.filter((e) => e.type === 'm.room.redaction').map((e) => e.redacts));
+    const reactions = sim.timeline
+      .filter((e) => e.type === 'm.reaction' && !redacted.has(e.event_id))
+      .filter((e) => (e.content['m.relates_to'] as { event_id: string }).event_id === q)
+      .map((e) => `${sim.agent('EVENTS').id === e.sender ? 'EVENTS' : sim.agent('PENNY').id === e.sender ? 'PENNY' : 'OTHER'} ${(e.content['m.relates_to'] as { key: string }).key}`);
+    expect(sim.answersTo(q)).toEqual([]);
+    expect(reactions).toEqual(['EVENTS 👍']);
+    expect(await sim.logOf('PENNY')).not.toMatch(/v2 reacted/);
+  });
+});

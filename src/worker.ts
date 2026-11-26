@@ -98,7 +98,7 @@ import {
   type V2RoomState,
 } from './v2/ledger.js';
 import { pipelineForRoom } from './v2/pipeline.js';
-import { shouldFlushStream, streamableText } from './v2/stream.js';
+import { continuousStreamText, newStreamContinuity, shouldFlushStream, streamableText } from './v2/stream.js';
 import { languageName, matchScript, replyLanguageFor } from './v2/language.js';
 import { scoreRelevance, type RelevanceResult } from './v2/relevance.js';
 
@@ -2792,12 +2792,19 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         return {
           score: relevance.score,
           ...(relevance.rawScore !== undefined ? { rawScore: relevance.rawScore } : {}),
+          ...(relevance.margin !== undefined ? { margin: relevance.margin } : {}),
           notMine: relevance.notCosine !== undefined && relevance.cosine !== undefined && relevance.notCosine > relevance.cosine,
           mine: relevance.notCosine !== undefined && relevance.cosine !== undefined && relevance.cosine > relevance.notCosine,
         };
       },
     });
     return { decision, ...(relevance ? { relevance } : {}) };
+  }
+
+  /** In a group, only an addressed agent or the conversation's owner reacts with an emoji. */
+  private mayReactInGroup(context: RoomContext, decision: WakeDecision): boolean {
+    if (context.chatType !== 'group' || decision.direct) return true;
+    return decision.reason === 'your_conversation' || decision.reason === 'answers_your_question' || decision.reason === 'reaction_to_you';
   }
 
   private describeGate(decision: WakeDecision, relevance?: RelevanceResult): string {
@@ -3099,7 +3106,9 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         replyToEventId: undefined as string | undefined,
         chain: Promise.resolve() as Promise<unknown>,
       };
+      const continuity = newStreamContinuity();
       const onText = (partial: string): void => {
+        if (!continuousStreamText(continuity, partial, Boolean(stream.shown))) return;
         const candidate = streamableText(partial);
         if (!candidate) return;
         const display = matchScript(normalizeA2AOutput(candidate, streamLang).text, streamLang);
@@ -3242,6 +3251,14 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       if (action.kind === 'silent') {
         await this.releaseV2Claim(turn);
         await appendDoLog(this.ctx.storage, `v2 silent ${turn.event.eventId} (${decision.reason})`, nowMs, this.env);
+        await this.removePendingTurn(turn.event.eventId);
+        return;
+      }
+      if (action.kind === 'react' && !this.mayReactInGroup(context, decision)) {
+        // An emoji on chatter or thanks belongs to the agent the person was talking with (or one they
+        // addressed). From any other agent it reads as a stranger butting in.
+        await this.releaseV2Claim(turn);
+        await appendDoLog(this.ctx.storage, `v2 silent ${turn.event.eventId} (${decision.reason}, reaction not ours)`, nowMs, this.env);
         await this.removePendingTurn(turn.event.eventId);
         return;
       }

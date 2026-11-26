@@ -363,7 +363,9 @@ export function stripLeakedNotes(answer) {
     };
 }
 const MD_LINK_RE = /\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g;
-const SANDBOX_IMAGE_MD_RE = /!\[[^\]\n]*\]\(\s*(?:\.{0,2}\/)?media\/[^)\s]+\s*\)/gi;
+// Any Markdown image whose target is not an absolute http(s) URL (sandbox paths like media/x.jpg or
+// sticks/21-zh.jpg): chat clients cannot load it, so it would show as raw markup.
+const SANDBOX_IMAGE_MD_RE = /!\[[^\]\n]*\]\(\s*(?!https?:\/\/)[^)\s]+\s*\)/gi;
 const EMPTY_CODE_FENCE_RE = /```[a-zA-Z0-9_-]*\s*```/g;
 const ORPHAN_PICTURES_LINE_RE = /(?:\b(?:(?:Their|The)\s+)?(?:cover\s+)?(?:pictures?|photos?|images?)\s+(?:follow(?:\s+below)?|are\s+(?:attached|listed|below|included)|appear\s+below)(?:\s+in\s+(?:the\s+same|that|this|listed)\s+order)?[.:!]?|(?:封面)?(?:圖片|图片|照片)(?:已|都)?(?:依序|按順序|按顺序|照順序|照顺序)?附在(?:後面|后面|下方)[。.!！]?)\s*/gi;
 const NON_PAREN_WRAPPED_URL_RE = /([[\（【<《"'])(https?:\/\/[^\s<>[\]（）【】《》"']+?)([\]）】>》"'])/g;

@@ -110,6 +110,7 @@ export async function scoreRelevance(text, spec, examples, options, fallback) {
         return {
             score: notMine ? 0 : scaleCosine(best, options.cosineLow, options.cosineHigh),
             rawScore: scaleCosine(best, options.cosineLow, options.cosineHigh),
+            ...(negatives.length > 0 ? { margin: Math.round((best - notBest) * 1000) / 1000 } : {}),
             cosine: Math.round(best * 1000) / 1000,
             ...(negatives.length > 0 ? { notCosine: Math.round(notBest * 1000) / 1000 } : {}),
             source: 'embedding',

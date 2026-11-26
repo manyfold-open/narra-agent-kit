@@ -13,6 +13,8 @@ export interface WakeDecision {
     /** Addressed to this agent: always gets an answer, even after failures. */
     direct: boolean;
     score?: number;
+    /** How clearly this agent beats the other agents' asks (cosine minus best not-example cosine). */
+    margin?: number;
 }
 export interface WakeGateOptions {
     /** Relevance needed to wake on an unaddressed group message (0..1). */
@@ -54,14 +56,10 @@ export interface WakeGateInput {
         notMine?: boolean;
         mine?: boolean;
         rawScore?: number;
+        margin?: number;
     }>;
     options?: Partial<WakeGateOptions>;
 }
-/**
- * How strongly a decision holds the message, sent with the 👀 claim. The highest live claim answers;
- * arrival order only breaks ties. Continuing a conversation beats topical fit, and a confident fit
- * beats a stand-by fallback.
- */
-export declare function claimPriority(decision: Pick<WakeDecision, 'reason' | 'score' | 'direct'>): number;
+export declare function claimPriority(decision: Pick<WakeDecision, 'reason' | 'score' | 'direct' | 'margin'>): number;
 export declare function decideWake(input: WakeGateInput): Promise<WakeDecision>;
 //# sourceMappingURL=gate.d.ts.map

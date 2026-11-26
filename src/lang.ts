@@ -463,7 +463,20 @@ const ZH_HANT_PHRASES: ReadonlyArray<readonly [string, string]> = [
   ['骇客松', '駭客松'],
 ];
 
-const PHRASES_BY_LEN = [...ZH_HANT_PHRASES].sort((a, b) => b[0].length - a[0].length);
+/**
+ * Traditional text that already uses 準 where 准 is correct (permission: 批准, 核准, 准許, 獲准).
+ * Brains often write Traditional directly, so toZhHant also fixes these. Not reversible (toZhHans
+ * keeps 准), so they live outside ZH_HANT_PHRASES.
+ */
+const ZH_HANT_FIXES: ReadonlyArray<readonly [string, string]> = [
+  ['批準', '批准'],
+  ['核準', '核准'],
+  ['準許', '准許'],
+  ['獲準', '獲准'],
+  ['恩準', '恩准'],
+];
+
+const PHRASES_BY_LEN = [...ZH_HANT_PHRASES, ...ZH_HANT_FIXES].sort((a, b) => b[0].length - a[0].length);
 
 const ZH_HANT_CHARS: Readonly<Record<string, string>> = {
   万: '萬', 与: '與', 专: '專', 业: '業', 东: '東', 丝: '絲', 丢: '丟',
