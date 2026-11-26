@@ -2,6 +2,11 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   CLAIM_REACTION,
   UsageBudget,
+  claimPriority,
+  continuousStreamText,
+  newStreamContinuity,
+  sanitizeMobileLinks,
+  toZhHant,
   NARRA_USAGE_SCHEMA,
   applyClaimReaction,
   applyClaimRedaction,
@@ -139,8 +144,9 @@ describe('v2 streaming', () => {
 
   it('posts after a first sentence, then edits sparingly', () => {
     expect(shouldFlushStream({ shown: '', next: '今天', msSinceLastFlush: 0 })).toBe(false);
-    expect(shouldFlushStream({ shown: '', next: '今天有三則 AI 新聞值得看：OpenAI 發新模型', msSinceLastFlush: 0 })).toBe(true);
-    const shown = '今天有三則 AI 新聞值得看：OpenAI 發新模型';
+    expect(shouldFlushStream({ shown: '', next: 'Group and members exist. Add the entry.', msSinceLastFlush: 0 })).toBe(false);
+    expect(shouldFlushStream({ shown: '', next: '今天有三則 AI 新聞值得看：OpenAI 發新模型，Google DeepMind 推出可靠性基準測試，百度開源 ERNIE 5.5', msSinceLastFlush: 0 })).toBe(true);
+    const shown = '今天有三則 AI 新聞值得看：OpenAI 發新模型，Google DeepMind 推出可靠性基準測試，百度開源 ERNIE 5.5';
     expect(shouldFlushStream({ shown, next: shown + '，Google 也有', msSinceLastFlush: 5_000 })).toBe(false);
     expect(shouldFlushStream({ shown, next: shown + '，Google DeepMind 推出新的可靠性基準測試，百度開源 ERNIE', msSinceLastFlush: 500 })).toBe(false);
     expect(shouldFlushStream({ shown, next: shown + '，Google DeepMind 推出新的可靠性基準測試，百度開源 ERNIE', msSinceLastFlush: 2_000 })).toBe(true);
@@ -156,7 +162,8 @@ describe('v2 wake gate', () => {
     const dm = await decideWake({ event: ev('$1', 'hi', NOW, { chatType: 'dm' }), context: ctx({ chatType: 'dm' }), spec: NEWS_SPEC, mode: 'quiet', nowMs: NOW, score: never });
     expect(dm).toMatchObject({ wake: true, reason: 'dm', direct: true, delayMs: 0, claim: false });
     const mention = await decideWake({ event: ev('$2', '@AI in 5 今天有什麼', NOW, { mentions: [NEWS] }), context: ctx(), spec: NEWS_SPEC, mode: 'mention', nowMs: NOW, score: never });
-    expect(mention).toMatchObject({ wake: true, reason: 'mentioned', direct: true });
+    // An @mention in a group shows the 👀 at once (people see it was picked up while the brain works).
+    expect(mention).toMatchObject({ wake: true, reason: 'mentioned', direct: true, claim: true });
     const reply = await decideWake({
       event: ev('$3', '第二則呢', NOW, { replyToEventId: '$mine' }),
       context: ctx({ replyToTarget: { eventId: '$mine', senderId: NEWS, isSelf: true, isAgent: true, text: '…' } }),
@@ -633,9 +640,11 @@ describe('v2 pipeline end to end', () => {
     const t = setup('[REACT ❤️]');
     await t.post([t.msg('$t', '@AI in 5 謝謝！', ZACK, { 'm.mentions': { user_ids: [NEWS] } })]);
     await t.runAlarmsFor(10_000);
-    expect(t.sent).toHaveLength(1);
-    expect(t.sent[0].type).toBe('m.reaction');
-    expect((t.sent[0].body['m.relates_to'] as { key: string }).key).toBe('❤️');
+    // Addressed: the 👀 goes up at once, then the ❤️ replaces it. No text.
+    expect(t.sent.every((s) => s.type === 'm.reaction')).toBe(true);
+    const keys = t.sent.map((s) => (s.body['m.relates_to'] as { key: string }).key);
+    expect(keys).toEqual(['👀', '❤️']);
+    expect(t.redactions).toEqual(['$out_1']);
   });
 
   it('the group can ask the agent to speak only when mentioned', async () => {
@@ -662,7 +671,7 @@ describe('v2 pipeline end to end', () => {
   });
 
   it('streams a long reply: shows the first part, then edits the same message to the full text', async () => {
-    const parts = ['今天第 39 期三則重點：', 'Google DeepMind 推出 AI 可靠性基準測試；', 'Anthropic 推出 Claude Ship；百度開源 ERNIE 5.5。'];
+    const parts = ['今天第 39 期三則重點：', 'Google DeepMind 推出新的 AI 可靠性基準測試，涵蓋推理、工具使用與長文本三個面向；', 'Anthropic 推出 Claude Ship；百度開源 ERNIE 5.5。'];
     const events = [
       ...parts.map((text, i) => ({ kind: 'artifact-update', append: i > 0, artifact: { artifactId: 'a1', parts: [{ kind: 'text', text }] } })),
       { kind: 'status-update', status: { state: 'completed' } },
@@ -828,5 +837,64 @@ describe('v2 pipeline end to end', () => {
     await t.kick();
     await t.runAlarmsFor(10_000);
     expect(t.envelopes).toHaveLength(1);
+  });
+});
+
+// Found in the zack test live run (2026-11-26).
+describe('v2 fixes from the 11-26 live run', () => {
+  const FOOD = '@agent-b2b526f3:matrix.netmind.chat';
+  const EVENTS = '@agent-f9388b28:matrix.netmind.chat';
+  const agentSpec = (matrixId: string, name: string): AgentSpec => ({ ...NEWS_SPEC, id: name, matrixId, name });
+
+  it('two confident agents: the clearer winner over the other agents\' asks claims first and ranks higher', async () => {
+    // "推薦一家 Soho 的點心": both scored 1.00 (cos .653 vs not .498, and cos .69 vs not .549).
+    const e = ev('$dimsum', '推薦一家 Soho 的點心', NOW);
+    const food = await decideWake({ event: e, context: ctx(), spec: agentSpec(FOOD, 'food'), mode: 'ambient', nowMs: NOW, score: async () => ({ score: 1, margin: 0.155, mine: true }) });
+    const events = await decideWake({ event: e, context: ctx(), spec: agentSpec(EVENTS, 'events'), mode: 'ambient', nowMs: NOW, score: async () => ({ score: 1, margin: 0.141, mine: true }) });
+    expect(claimPriority(food)).toBeGreaterThan(claimPriority(events));
+    const wide = await decideWake({ event: e, context: ctx(), spec: agentSpec(FOOD, 'food'), mode: 'ambient', nowMs: NOW, score: async () => ({ score: 1, margin: 0.3, mine: true }) });
+    const narrow = await decideWake({ event: e, context: ctx(), spec: agentSpec(EVENTS, 'events'), mode: 'ambient', nowMs: NOW, score: async () => ({ score: 1, margin: 0.02, mine: true }) });
+    expect(wide.delayMs).toBeLessThan(narrow.delayMs);
+    // A stand-by claim never outranks an agent that fits, whatever its margin.
+    expect(claimPriority({ reason: 'fallback', score: 0.99, direct: false })).toBeLessThan(claimPriority({ reason: 'relevant', score: 0.5, direct: false, margin: -0.1 }));
+  });
+
+  it('does not stream a working note the brain replaces with the real answer', () => {
+    const c = newStreamContinuity();
+    expect(continuousStreamText(c, 'Group and members exist. Add the entry.', false)).toBe(false);
+    expect(continuousStreamText(c, '#4 晚餐 £24，pika 付', false)).toBe(false);
+    expect(continuousStreamText(c, '#4 晚餐 £24，pika 付\n均分 2 人，每人 £12', false)).toBe(true);
+    // Once something is showing, a rewrite stops further edits (the final reply replaces it).
+    expect(continuousStreamText(c, '完全不同的文字', true)).toBe(false);
+    expect(continuousStreamText(c, '完全不同的文字，而且更長了', true)).toBe(false);
+  });
+
+  it('end to end: a narration message before a tool call never reaches the room', async () => {
+    const answer = ['#4 晚餐 £24，pika 付。均分 2 人，每人 £12。', '@Zack 回 @Penny OK #4 入帳，或直接說要改什麼。這筆會先記成待確認，確認後才算進結餘。'];
+    const events = [
+      { kind: 'message', role: 'agent', parts: [{ kind: 'text', text: 'Group and members exist. Add the entry. Checking the ledger now before writing.' }] },
+      { kind: 'status-update', status: { state: 'working' } },
+      ...answer.map((text, i) => ({ kind: 'artifact-update', append: i > 0, artifact: { artifactId: 'a1', parts: [{ kind: 'text', text }] } })),
+      { kind: 'status-update', status: { state: 'completed' } },
+    ];
+    const body = events.map((r) => `data: ${JSON.stringify({ jsonrpc: '2.0', id: '1', result: r })}\n\n`).join('');
+    const t = setup(() => new Response(body, { headers: { 'content-type': 'text/event-stream' } }));
+    await t.post([t.msg('$p', '@AI in 5 我付了晚餐 £24', ZACK, { 'm.mentions': { user_ids: [NEWS] } })]);
+    await t.runAlarmsFor(10_000);
+    const bodies = t.sent.filter((s) => s.type === 'm.room.message').map((s) => String(s.body.body));
+    expect(bodies.some((b) => b.includes('Group and members exist'))).toBe(false);
+    expect(bodies.at(-1)).toContain('£12');
+  });
+
+  it('drops Markdown images that point at sandbox paths, even inside a code fence', () => {
+    const out = sanitizeMobileLinks('今天可以做的一件小事：列出三樣東西。\n\n```![](sticks/21-zh.jpg)```');
+    expect(out).not.toMatch(/sticks\/21|```|!\[/);
+    expect(out).toContain('列出三樣東西');
+  });
+
+  it('fixes 準 written for permission in Traditional text, without breaking Simplified', () => {
+    expect(toZhHant('FCC 批準 SpaceX 的計劃，獲準部署')).toBe('FCC 批准 SpaceX 的計劃，獲准部署');
+    expect(toZhHant('標準和準備')).toBe('標準和準備');
+    expect(toZhHans('批准')).toBe('批准');
   });
 });
