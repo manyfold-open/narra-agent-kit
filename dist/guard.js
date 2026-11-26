@@ -163,7 +163,9 @@ export function parseMatrixEvent(raw, defaults) {
         const reactionKey = str(relates.key).slice(0, 32);
         if (!replyToEventId || !reactionKey)
             return null;
-        const claimPriority = Number((content['ai.narra.claim'] ?? {}).priority);
+        const claimBlock = (content['ai.narra.claim'] ?? {});
+        // `priority_milli` (integer thousandths) is what kits send; `priority` is the older form.
+        const claimPriority = typeof claimBlock.priority_milli === 'number' ? claimBlock.priority_milli / 1000 : Number(claimBlock.priority);
         return {
             roomId,
             ...(roomName ? { roomName: roomName.slice(0, 200) } : {}),

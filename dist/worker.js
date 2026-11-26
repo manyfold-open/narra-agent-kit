@@ -2356,7 +2356,8 @@ export class BaseNarraRoomCoordinator {
                     eventId: turn.event.eventId,
                     key: CLAIM_REACTION,
                     txnId: await deterministicTxnId(count ? `claim:${turn.event.eventId}:${count}` : `claim:${turn.event.eventId}`),
-                    extra: { 'ai.narra.claim': { priority: Math.round(claimPriority(decision) * 1000) / 1000, reason: decision.reason } },
+                    // Integers only: Synapse refuses an event with a float anywhere in it (canonical JSON).
+                    extra: { 'ai.narra.claim': { priority_milli: Math.round(claimPriority(decision) * 1000), reason: decision.reason } },
                 });
                 if (claim.ok && claim.eventId) {
                     turn.v2ClaimEventId = claim.eventId;
