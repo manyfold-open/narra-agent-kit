@@ -49,7 +49,16 @@ export function parseBrainOutput(raw: string): BrainAction {
 }
 
 /** Instructions sent with every v2 turn. English on purpose: the brain replies in the user's language. */
-export function chatBehaviourNote(opts: { chatType: 'dm' | 'group'; direct: boolean; replyLanguage?: string; proactive?: boolean }): string {
+export function chatBehaviourNote(opts: {
+  chatType: 'dm' | 'group';
+  direct: boolean;
+  replyLanguage?: string;
+  proactive?: boolean;
+  /** Woken as the room's stand-by: nobody answered and the better fits chose not to. */
+  fallback?: boolean;
+  /** Another agent's reply to current_message pointed to this agent. */
+  handoff?: boolean;
+}): string {
   const lines = [
     'You are a member of a Narra Messenger chat where humans and AI agents talk together. Behave like a thoughtful person in a messenger, not like a website or a support bot.',
     opts.replyLanguage
@@ -70,6 +79,20 @@ export function chatBehaviourNote(opts: { chatType: 'dm' | 'group'; direct: bool
   if (opts.proactive) {
     lines.push(
       'Nobody wrote to you: this is your own scheduled turn, and current_message is your instruction for it, not something a person said. Post only if it is worth the group\'s attention right now; otherwise answer [NO_REPLY]. One short message, no greeting.',
+    );
+    return lines.join('\n');
+  }
+  if (opts.chatType === 'group' && opts.handoff) {
+    lines.push(
+      'Another agent in the room pointed to you for a person\'s question (current_message, or when current_message is that agent\'s line, the person\'s message just before it in conversation_so_far). Answer that question yourself now; do not point anywhere else.',
+    );
+    return lines.join('\n');
+  }
+  if (opts.chatType === 'group' && opts.fallback) {
+    lines.push(
+      'Nobody in the room has answered current_message, and the agents that fit it better chose not to. You are the room\'s stand-by.',
+      '- If it is a real question or need, answer it yourself, briefly and helpfully, even if it is outside your speciality: general knowledge is fine, and say plainly if you cannot check live information. Do not only point to another agent.',
+      '- If it is chatter, a reaction or an acknowledgement, or it continues a conversation another agent is clearly still handling, answer [NO_REPLY].',
     );
     return lines.join('\n');
   }

@@ -90,6 +90,7 @@ import {
   buildLedgerSummary,
   emptyRoomState,
   peerAnswered,
+  peerHandoff,
   peerClaimHolder,
   pruneClaims,
   type ReplyMode,
@@ -2788,6 +2789,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         if (relevance.source === 'embedding') await budget.add('relevance', nowMs);
         return {
           score: relevance.score,
+          ...(relevance.rawScore !== undefined ? { rawScore: relevance.rawScore } : {}),
           notMine: relevance.notCosine !== undefined && relevance.cosine !== undefined && relevance.notCosine > relevance.cosine,
           mine: relevance.notCosine !== undefined && relevance.cosine !== undefined && relevance.cosine > relevance.notCosine,
         };
@@ -2825,9 +2827,13 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
   }
 
   /** Another agent answered one of these messages, judged from the latest stored history. */
-  private async peerAnsweredNow(eventIds: string[], selfId: string | undefined): Promise<string | undefined> {
+  private async peerAnsweredNow(
+    eventIds: string[],
+    selfId: string | undefined,
+    pointsHere?: (text: string) => boolean,
+  ): Promise<string | undefined> {
     const history = (await this.ctx.storage.get<HistoryTurn[]>('recentHistory')) ?? [];
-    return peerAnswered(history, eventIds, selfId);
+    return peerAnswered(history, eventIds, selfId, pointsHere);
   }
 
   /**
@@ -3000,7 +3006,15 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     }
 
     if (!decision.direct && !turn.v2ClaimEventId) {
-      const answeredBy = peerAnswered(context.recentHistory, eventIds, spec.matrixId);
+      const pointsHere = (text: string) => isSelfMentioned({ ...turn.event, text, mentions: [] }, spec);
+      const handedBy = decision.reason === 'handoff' ? undefined : peerHandoff(context.recentHistory, eventIds, spec.matrixId, pointsHere);
+      if (handedBy) {
+        // The agent that answered pointed here ("@X knows this better"): that is not an answer.
+        decision = { wake: true, reason: 'handoff', delayMs: 0, claim: true, direct: false, ...(decision.score !== undefined ? { score: decision.score } : {}) };
+        turn.v2Decision = decision;
+        await appendDoLog(this.ctx.storage, `v2 handoff ${turn.event.eventId}: ${handedBy} pointed here`, nowMs, this.env);
+      }
+      const answeredBy = peerAnswered(context.recentHistory, eventIds, spec.matrixId, pointsHere);
       if (answeredBy) {
         await appendDoLog(this.ctx.storage, `v2 yield ${turn.event.eventId}: answered by ${answeredBy}`, nowMs, this.env);
         await this.removePendingTurn(turn.event.eventId);
@@ -3018,9 +3032,10 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         await this.updatePendingTurn({ ...turn, v2Decision: decision, v2WaitingOn: holder, dueAtMs: nowMs + V2_CLAIM_RECHECK_MS });
         return;
       }
-      if (decision.reason === 'fallback' && eventIds.some((id) => (state.released?.[id] ?? 0) > 0)) {
-        // An agent that fit better looked and chose not to answer: do not keep trying down the list.
-        await appendDoLog(this.ctx.storage, `v2 fallback passed ${turn.event.eventId}: a better fit chose not to answer`, nowMs, this.env);
+      if (decision.reason === 'fallback' && eventIds.some((id) => (state.releasedFallback?.[id] ?? 0) > 0)) {
+        // Another stand-by already looked and stayed silent (chatter, most likely): do not keep trying
+        // down the list. A better fit that stayed silent is different: the stand-by is there for that.
+        await appendDoLog(this.ctx.storage, `v2 fallback passed ${turn.event.eventId}: another stand-by chose not to answer`, nowMs, this.env);
         await this.removePendingTurn(turn.event.eventId);
         return;
       }
@@ -3183,6 +3198,8 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
             chat_behaviour: chatBehaviourNote({
               chatType: context.chatType,
               direct: decision.direct,
+              fallback: decision.reason === 'fallback',
+              handoff: decision.reason === 'handoff',
               proactive: Boolean(turn.v2Proactive),
               replyLanguage: languageName(replyLang),
             }),
@@ -3256,7 +3273,9 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       // While the brain was writing, another agent may have answered (e.g. a crisis reply). Unless
       // this agent was addressed directly, a second answer to the same message is noise.
       if (!decision.direct && !turn.v2StreamEventId) {
-        const peer = await this.peerAnsweredNow(eventIds, spec.matrixId);
+        const peer = await this.peerAnsweredNow(eventIds, spec.matrixId, (t) =>
+          isSelfMentioned({ ...turn.event, text: t, mentions: [] }, spec),
+        );
         if (peer) {
           await this.releaseV2Claim(turn);
           await appendDoLog(this.ctx.storage, `v2 yield_after_brain ${turn.event.eventId}: answered by ${peer}`, this.nowMs(), this.env);

@@ -40,6 +40,11 @@ export interface RelevanceScorerOptions {
 
 export interface RelevanceResult {
   score: number;
+  /**
+   * The fit to this agent's profile alone (scaled best cosine), even when another agent's asks are
+   * closer (`score` is then 0). Used only to stand by as a fallback, never to go first.
+   */
+  rawScore?: number;
   /** Raw best cosine, logged so thresholds can be calibrated from real traffic. */
   cosine?: number;
   /** Best cosine against `notExamples`, when given. */
@@ -151,6 +156,7 @@ export async function scoreRelevance(
     const notMine = negatives.length > 0 && notBest > best;
     return {
       score: notMine ? 0 : scaleCosine(best, options.cosineLow, options.cosineHigh),
+      rawScore: scaleCosine(best, options.cosineLow, options.cosineHigh),
       cosine: Math.round(best * 1000) / 1000,
       ...(negatives.length > 0 ? { notCosine: Math.round(notBest * 1000) / 1000 } : {}),
       source: 'embedding',

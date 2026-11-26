@@ -53,6 +53,7 @@ export interface WakeGateInput {
         score: number;
         notMine?: boolean;
         mine?: boolean;
+        rawScore?: number;
     }>;
     options?: Partial<WakeGateOptions>;
 }

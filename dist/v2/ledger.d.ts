@@ -36,6 +36,11 @@ export interface V2RoomState {
     claimReactions: Record<string, string>;
     /** target event id -> how many claims on it were released without an answer */
     released?: Record<string, number>;
+    /**
+     * target event id -> how many stand-by (fallback) claims on it were released without an answer:
+     * the room's last resort looked and stayed silent, so no other stand-by should try.
+     */
+    releasedFallback?: Record<string, number>;
 }
 export declare function emptyRoomState(): V2RoomState;
 /** Live claims on `target`, in the order they were made. */
@@ -87,8 +92,14 @@ export declare function conversationOwner(history: HistoryTurn[], event: Pick<In
 } | undefined;
 /** Recent human messages no agent has answered yet (oldest first). */
 export declare function unansweredHumanMessages(history: HistoryTurn[], nowMs: number, windowMs?: number): HistoryTurn[];
-/** Whether any agent other than `selfId` answered one of `eventIds`. */
-export declare function peerAnswered(history: HistoryTurn[], eventIds: string[], selfId: string | undefined): string | undefined;
+/**
+ * Whether any agent other than `selfId` answered one of `eventIds`. A reply that only points to this
+ * agent ("@London Chinese Food knows this better") is a handoff, not an answer: pass `pointsHere`
+ * to leave those out, so the agent that was pointed to still answers.
+ */
+export declare function peerAnswered(history: HistoryTurn[], eventIds: string[], selfId: string | undefined, pointsHere?: (text: string) => boolean): string | undefined;
+/** The peer reply to one of `eventIds` that points to this agent, if any (see `peerAnswered`). */
+export declare function peerHandoff(history: HistoryTurn[], eventIds: string[], selfId: string | undefined, pointsHere: (text: string) => boolean): string | undefined;
 /** Number of scheduled posts (`ai.narra.broadcast`) any agent made in this room since `sinceMs`. */
 export declare function broadcastsSince(history: HistoryTurn[], sinceMs: number): number;
 export interface LedgerSummaryInput {

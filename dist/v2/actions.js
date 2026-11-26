@@ -67,6 +67,14 @@ export function chatBehaviourNote(opts) {
         lines.push('Nobody wrote to you: this is your own scheduled turn, and current_message is your instruction for it, not something a person said. Post only if it is worth the group\'s attention right now; otherwise answer [NO_REPLY]. One short message, no greeting.');
         return lines.join('\n');
     }
+    if (opts.chatType === 'group' && opts.handoff) {
+        lines.push('Another agent in the room pointed to you for a person\'s question (current_message, or when current_message is that agent\'s line, the person\'s message just before it in conversation_so_far). Answer that question yourself now; do not point anywhere else.');
+        return lines.join('\n');
+    }
+    if (opts.chatType === 'group' && opts.fallback) {
+        lines.push('Nobody in the room has answered current_message, and the agents that fit it better chose not to. You are the room\'s stand-by.', '- If it is a real question or need, answer it yourself, briefly and helpfully, even if it is outside your speciality: general knowledge is fine, and say plainly if you cannot check live information. Do not only point to another agent.', '- If it is chatter, a reaction or an acknowledgement, or it continues a conversation another agent is clearly still handling, answer [NO_REPLY].');
+        return lines.join('\n');
+    }
     if (opts.chatType === 'group' && !opts.direct) {
         lines.push('Nobody @mentioned you, so judge from the room who current_message is for. Read your_open_question, sender_is_talking_with and conversation_so_far:', '- If it continues something you started (an answer to a question you asked, a follow-up to your last reply), it is yours. Answer it, even when it comes from a different person than the one you asked or minutes later, and even if it is only a word or two ("工作", "Holborn", "the second one"). Never answer [NO_REPLY] to an answer to your own question: carry on (do what you offered) or ask one short line to clarify.', '- If it continues another agent\'s conversation, leave it to that agent: [NO_REPLY].', '- Otherwise answer only if it is a real question or need you can clearly help with. If another agent in the room fits much better and nobody has answered, you may say so in one short line that names it with @ (for example "@Spotted London knows this better"), at most once per question.');
     }

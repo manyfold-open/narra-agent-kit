@@ -94,6 +94,17 @@ export async function decideWake(input) {
         return drop('mode_mention');
     if (input.budgetExhausted)
         return drop('budget');
+    /** A stand-by (fallback) decision for `fit`, or undefined when it is too far off. */
+    const standBy = (fit, needed) => {
+        if (!(opts.fallbackThreshold > 0) || fit < opts.fallbackThreshold)
+            return undefined;
+        // Below 1 on purpose: a stand-by never outranks an agent that goes first (claimPriority).
+        const capped = Math.min(fit, 0.99);
+        const closeness = Math.min(1, Math.max(0, (capped - opts.fallbackThreshold) / Math.max(0.01, needed - opts.fallbackThreshold)));
+        const jitter = hashFraction(`fallback:${event.eventId}:${selfId ?? spec.id}`) * 500;
+        const delayMs = Math.round(opts.fallbackDelayMs - closeness * opts.fallbackSpreadMs + jitter);
+        return { wake: true, reason: 'fallback', delayMs, claim: true, direct: false, score: capped };
+    };
     // Who this message most likely continues with, judged from the room (the same for every agent):
     // the agent whose question is still waiting for an answer, from anyone, else the agent that was
     // just talking with this sender.
@@ -110,28 +121,27 @@ export async function decideWake(input) {
     if (partner && partner === selfId) {
         // Short follow-ups ("Holborn", "the second one?") stay with this agent even when they look
         // unrelated, but not when the person clearly moved on to another agent's topic.
-        const { score, notMine } = await getScore();
+        const { score, notMine, rawScore } = await getScore();
         if (!notMine) {
             const reason = owner?.via === 'open_question' ? 'answers_your_question' : 'your_conversation';
             return { wake: true, reason, delayMs: 0, claim: true, direct: false, score };
         }
-        return drop('topic_moved_on', score);
+        // The person moved to another agent's topic: that agent goes first, but this one still stands by
+        // in case nobody takes it (it knows the conversation).
+        return standBy(rawScore ?? score, opts.threshold) ?? drop('topic_moved_on', score);
     }
-    const { score, mine } = await getScore();
+    const { score, mine, notMine, rawScore } = await getScore();
     // The sender talking with another agent raises the bar, so follow-ups stay in that thread. But when
     // this message is closer to this agent's asks than to the other agents' (the topic moved here, and
     // the partner drops it as `topic_moved_on`), the usual bar applies or nobody would answer.
     const inPeerThread = Boolean(partner) && !mine;
     const needed = inPeerThread ? opts.peerConversationThreshold : opts.threshold;
     if (score < needed) {
-        // Not sure enough to go first, but close: stand by in case nobody else takes it.
-        if (opts.fallbackThreshold > 0 && score >= opts.fallbackThreshold) {
-            const closeness = Math.min(1, Math.max(0, (score - opts.fallbackThreshold) / Math.max(0.01, needed - opts.fallbackThreshold)));
-            const jitter = hashFraction(`fallback:${event.eventId}:${selfId ?? spec.id}`) * 500;
-            const delayMs = Math.round(opts.fallbackDelayMs - closeness * opts.fallbackSpreadMs + jitter);
-            return { wake: true, reason: 'fallback', delayMs, claim: true, direct: false, score };
-        }
-        return drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
+        // Not sure enough to go first, but close: stand by in case nobody else takes it. "Closer to another
+        // agent's asks" only stops going first: the right agent is sometimes misjudged that way (a dataset
+        // question scored as another agent's), and a room where every stand-by is zeroed answers nobody.
+        const standByScore = notMine ? Math.max(score, rawScore ?? 0) : score;
+        return standBy(standByScore, needed) ?? drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
     }
     // Higher relevance goes first; a per-agent hash breaks ties so two agents never collide exactly.
     const span = Math.max(0, opts.maxDelayMs - opts.minDelayMs);
