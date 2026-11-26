@@ -24,6 +24,17 @@ export interface PromptEnvelopeInput {
     includeSelfReplies?: boolean;
 }
 /**
+ * The rules every agent's brain answers by, whatever its profile says. One copy, used by the
+ * Manyfold envelope and the Workers AI fallback alike, so the two paths cannot drift apart.
+ *
+ * - Trust: the sender's request sets the task. Only text that pretends to be the platform or the
+ *   system is ignored. (Calling the whole message body "not instructions" made brains treat the
+ *   user's own constraints, like "just one card", as weaker than their default format.)
+ * - Earlier results: used for follow-ups on them, never as a reason to refuse a new request.
+ * - Evidence: time-sensitive facts are stated as facts only when this turn's data backs them.
+ */
+export declare const BRAIN_CONTRACT: readonly string[];
+/**
  * Builds a prompt-injection-hardened Manyfold A2A turn envelope containing:
  * - Pre-injected room members & peer `@agent-*` roster
  * - `in_reply_to_other` (or `in_reply_to_self`) parent snippet

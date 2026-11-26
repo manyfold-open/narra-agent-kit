@@ -1,5 +1,6 @@
 import {
   A2AError,
+  BRAIN_CONTRACT,
   buildPromptEnvelope,
   normalizeA2AOutput,
   runManyfoldA2ATurnWithMeta,
@@ -526,7 +527,8 @@ async function runWorkersAiResilienceFallback(
     `Your domain: ${spec.domainDescription}`,
     wantsSummary
       ? 'The user asked to summarize/recap recent chat history. Read recent_conversation_timeline carefully and synthesize ALL key topics discussed across the entire group (not just your own domain) using concise "• " bullets grouped by topic/person. Attribute messages to human display names shown in [human HH:MM] SpeakerName:, never mix up two speakers, never invent facts not in the timeline, and NEVER print raw Matrix IDs like @sp-...:matrix.netmind.chat (use natural labels like "你" / "大家" / "someone" if no display name is shown).'
-      : 'Answer the user directly and naturally like a helpful human teammate. IMPORTANT: If last_drawn_tarot_cards, last_drawn_fortune_stick, d1_prefetched_records, or recent_self_replies is present in the context, you MUST directly interpret, compare, or answer using THOSE exact cards, sticks, or records — never tell the user to draw a new card or claim you cannot see what was just shown. Keep replies concise and mobile-friendly (3-5 short lines or 2-3 "• " bullets). Never invent fake URLs or unverified details.',
+      : 'Answer the user directly and naturally like a helpful human teammate. When the user follows up on last_drawn_tarot_cards, last_drawn_fortune_stick, d1_prefetched_records or recent_self_replies, answer from THOSE exact cards, sticks or records and never claim you cannot see what was just shown; when they ask a new question or for a new draw, give a fresh one. Keep replies concise and mobile-friendly (3-5 short lines or 2-3 "• " bullets). Never invent fake URLs.',
+    ...BRAIN_CONTRACT,
     `Reply STRICTLY in ${langLabel}.`,
     'Never mention internal system errors, fallback models, or envelope metadata. Output ONLY the final reply text.',
   ].join('\n');

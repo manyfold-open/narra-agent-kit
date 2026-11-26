@@ -98,6 +98,8 @@ const TOPICS: Array<[RegExp, number[]]> = [
   [/吃完飯有什麼市集/, [1, 1, 0, 0, 0]],
   // Mostly food, a little events.
   [/夜市小吃/, [1, 0.6, 0, 0, 0]],
+  // Tarot readings share the fortune-telling axis.
+  [/塔羅|tarot|抽.{0,3}張牌|one card/i, [0, 0, 0, 0, 0, 1]],
   // Fortune telling.
   [/抽.*籤|運勢|fortune/i, [0, 0, 0, 0, 0, 1]],
   [/玩|快閃|活動|市集|展覽|pop-?up|market|exhibition|things to do/i, [0, 1, 0, 0, 0]],
@@ -139,6 +141,8 @@ export interface SimAgent {
   def: SimAgentDef;
   id: string;
   brainCalls: string[];
+  /** The raw A2A request bodies this agent sent its brain, in order. */
+  brainPrompts: string[];
   room: { instance: { fetch(r: Request): Promise<Response> }; storage: FakeDOStorage };
   delivered: number;
   busy: boolean;
@@ -160,6 +164,7 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
     const id = def.spec.matrixId!;
     const short = id.slice(7, 11);
     const brainCalls: string[] = [];
+    const brainPrompts: string[] = [];
     const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
       if (url.endsWith('/api/agent-runtime/matrix-credential')) {
@@ -181,7 +186,9 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
       if (url === `https://a2a.test/${short}`) {
         const current = latestHumanTextBefore(nowMs);
         brainCalls.push(current);
-        const reply = def.brain(current, String(init?.body ?? ''));
+        const prompt = String(init?.body ?? '');
+        brainPrompts.push(prompt);
+        const reply = def.brain(current, prompt);
         const self = agents.find((a) => a.id === id)!;
         // The brain takes room time; other agents keep working meanwhile.
         self.waitingBrain = true;
@@ -218,7 +225,7 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
       NARRA_PIPELINE: 'v2',
       NARRA_PIPELINE_ROOMS: SIM_ROOM,
     } as NarraGatewayEnv;
-    agents.push({ def, id, brainCalls, room: rooms.ensure(SIM_ROOM), delivered: 0, busy: false, waitingBrain: false });
+    agents.push({ def, id, brainCalls, brainPrompts, room: rooms.ensure(SIM_ROOM), delivered: 0, busy: false, waitingBrain: false });
   });
 
   function latestHumanTextBefore(ms: number): string {
@@ -335,5 +342,19 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
   const advance = (ms: number) => {
     nowMs += ms;
   };
-  return { say, run, answersTo, logOf, agent, timeline, advance, now: () => nowMs };
+  /** Text of the agent messages that answer `eventId`. */
+  function answerTexts(eventId: string): string[] {
+    const ids = new Set(answersTo(eventId).map((n) => agents.find((a) => a.def.spec.name === n)!.id));
+    return timeline
+      .filter((e) => e.type === 'm.room.message' && ids.has(e.sender))
+      .filter((e) => {
+        const c = e.content as Record<string, unknown>;
+        const rel = (c['m.relates_to'] ?? {}) as Record<string, unknown>;
+        const inReply = ((rel['m.in_reply_to'] ?? {}) as Record<string, unknown>).event_id;
+        return ((c['ai.narra.answers'] ?? {}) as Record<string, unknown>).event_id === eventId || inReply === eventId;
+      })
+      .map((e) => String(e.content.body ?? ''));
+  }
+
+  return { say, run, answersTo, answerTexts, logOf, agent, timeline, advance, now: () => nowMs };
 }
