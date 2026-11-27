@@ -185,6 +185,31 @@ export function parseMatrixEvent(
     };
   }
 
+  // Hidden agent claim (ai.narra.claim): parsed like a 👀 claim so the ledger treats both the same.
+  if (type === 'ai.narra.claim') {
+    const target = str(content.target);
+    if (!target) return null;
+    const claimPriority = typeof content.priority_milli === 'number' ? content.priority_milli / 1000 : NaN;
+    return {
+      roomId,
+      ...(roomName ? { roomName: roomName.slice(0, 200) } : {}),
+      chatType,
+      eventId,
+      senderId,
+      ...(senderName ? { senderName: senderName.slice(0, 200) } : {}),
+      type,
+      kind: 'reaction',
+      text: '👀',
+      timestampMs,
+      timeIso,
+      mentions: [],
+      replyToEventId: target,
+      reactionKey: '👀',
+      ...(Number.isFinite(claimPriority) ? { claimPriority } : {}),
+      raw: event,
+    };
+  }
+
   // Reaction event (m.reaction -> m.annotation)
   if (type === 'm.reaction') {
     const relates = (content['m.relates_to'] ?? {}) as Record<string, unknown>;

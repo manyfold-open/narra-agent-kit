@@ -41,7 +41,7 @@ export const SYNC_FILTER = JSON.stringify({
     room: {
         timeline: {
             limit: 50,
-            types: ['m.room.message', 'm.reaction', 'm.room.redaction'],
+            types: ['m.room.message', 'm.reaction', 'm.room.redaction', 'ai.narra.claim'],
         },
         state: { types: ['m.room.member'] },
         ephemeral: { types: [] },

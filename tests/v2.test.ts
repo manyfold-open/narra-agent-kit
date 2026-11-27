@@ -549,14 +549,16 @@ function setup(
 }
 
 describe('v2 pipeline end to end', () => {
-  it('claims a relevant group question with 👀, lets Manyfold answer, marks the answer and keeps the 👀', async () => {
+  it('claims a relevant group question (hidden), shows 👀 only when answering, marks the answer and keeps the 👀', async () => {
     const t = setup('今天三則：OpenAI 發新模型、DeepMind 新論文、Anthropic 新功能。');
     await t.post([t.msg('$q', '有啥新聞嗎今天')]);
     await t.runAlarmsFor(10_000);
-    expect(t.sent.map((s) => s.type)).toEqual(['m.reaction', 'm.room.message']);
-    expect(t.sent[0].body['m.relates_to']).toEqual({ rel_type: 'm.annotation', event_id: '$q', key: CLAIM_REACTION });
-    expect(t.sent[1].body.body).toContain('OpenAI');
-    expect(JSON.stringify(t.sent[1].body)).toContain('$q'); // ai.narra.answers marker
+    // The claim is a hidden room event; the visible 👀 goes up right before the answer.
+    expect(t.sent.map((s) => s.type)).toEqual(['ai.narra.claim', 'm.reaction', 'm.room.message']);
+    expect(t.sent[0].body).toMatchObject({ target: '$q', reason: 'relevant' });
+    expect(t.sent[1].body['m.relates_to']).toEqual({ rel_type: 'm.annotation', event_id: '$q', key: CLAIM_REACTION });
+    expect(t.sent[2].body.body).toContain('OpenAI');
+    expect(JSON.stringify(t.sent[2].body)).toContain('$q'); // ai.narra.answers marker
     // The 👀 stays after an answer, so people can see who took the message.
     expect(t.redactions).toEqual([]);
     expect(t.envelopes[0]).toContain('chat_behaviour');
@@ -634,7 +636,8 @@ describe('v2 pipeline end to end', () => {
     const t = setup('[NO_REPLY]');
     await t.post([t.msg('$q', '有啥新聞嗎今天')]);
     await t.runAlarmsFor(10_000);
-    expect(t.sent.map((s) => s.type)).toEqual(['m.reaction']);
+    // Nothing people can see: the only event is the hidden claim, and it is taken back.
+    expect(t.sent.map((s) => s.type)).toEqual(['ai.narra.claim']);
     expect(t.redactions).toEqual(['$out_1']);
   });
 
@@ -686,7 +689,7 @@ describe('v2 pipeline end to end', () => {
     expect(messages.length).toBe(2);
     expect(messages[0].body.body).toBe(parts.slice(0, 2).join(''));
     const final = messages[1].body as { 'm.new_content'?: { body: string }; 'm.relates_to'?: { rel_type: string; event_id: string } };
-    expect(final['m.relates_to']).toMatchObject({ rel_type: 'm.replace', event_id: '$out_2' });
+    expect(final['m.relates_to']).toMatchObject({ rel_type: 'm.replace', event_id: '$out_3' });
     expect(final['m.new_content']?.body).toBe(parts.join(''));
     expect(await t.log()).toMatch(/v2 answered \$q .*streamed/);
   });
