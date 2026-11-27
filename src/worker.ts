@@ -3335,6 +3335,21 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           await appendDoLog(this.ctx.storage, `v2 standby general answer ${turn.event.eventId}`, this.nowMs(), this.env);
         }
       }
+      if (
+        action.kind === 'reply' &&
+        !action.mode &&
+        context.chatType === 'group' &&
+        !decision.direct &&
+        decision.reason === 'your_conversation'
+      ) {
+        // Thanks, "ok" or a laugh to the agent the person was just talking with: an emoji, never text.
+        // Some brains' own instructions insist on a polite line, so the room rule is enforced here.
+        const ask = await this.v2StandbyAskCheck(turn.event, context, spec);
+        if (ask === false) {
+          action = { kind: 'react', emoji: '👍' };
+          await appendDoLog(this.ctx.storage, `v2 acknowledgement ${turn.event.eventId}: text turned into an emoji`, this.nowMs(), this.env);
+        }
+      }
       if (action.kind !== 'reply' && turn.v2StreamEventId) {
         // Text was already showing but the brain ended up choosing not to reply: take it back.
         await this.matrixOp({
