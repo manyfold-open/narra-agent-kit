@@ -657,3 +657,23 @@ describe('v2 room: people never see a 👀 that is taken back', () => {
     expect(visibleEyesTakenBack(sim)).toEqual([]);
   });
 });
+
+// zack test 2026-11-27 13:18 (kit f1d0fa0): right after pika talked with the events agent,
+// 「今晚 Soho 有什麼好吃的中餐？」 went to it as the conversation owner, which answered
+// "no Chinese food pop-ups, only these Western ones" while the food agent waited and yielded.
+describe('v2 room: a new ask for another agent\'s speciality is not kept by the conversation owner', () => {
+  it('the owner steps back instead of offering a substitute; the food agent answers', async () => {
+    const eventsBrain = (t: string, prompt: string) => {
+      if (/中餐/.test(t)) return prompt.includes('all you could offer is a substitute') ? '[NO_REPLY]' : 'EVENTS: 沒有中餐快閃，只有這兩個西式的';
+      return /玩|快閃|活動/.test(t) ? 'EVENTS: 三個活動' : '[NO_REPLY]';
+    };
+    const sim = createRoomSim([food(), events({ brain: eventsBrain }), data()], HUMANS);
+    const a = await sim.say(PIKA, '這週末有什麼快閃活動');
+    await sim.run(30_000);
+    expect(sim.answersTo(a)).toEqual(['EVENTS']);
+    const q = await sim.say(PIKA, '今晚 Soho 有什麼好吃的中餐？');
+    await sim.run(120_000);
+    expect(await sim.logOf('EVENTS')).toMatch(/your_conversation/);
+    expect(sim.answersTo(q)).toEqual(['FOOD']);
+  });
+});
