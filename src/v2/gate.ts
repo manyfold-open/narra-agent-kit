@@ -74,6 +74,7 @@ export interface WakeGateOptions {
    * cosine), when the agent has notExamples. Chatter ("哈哈好喔", "謝謝") sits at the same cosine to
    * every profile (bge-m3 gives it about 0.55), so its relevance looks high while the margin stays
    * near 0; real asks beat the other agents by 0.08 and more. Below it the agent only stands by.
+   * Live data (zack test 2026-11-27): chatter and thanks up to 0.054, real asks from 0.078.
    */
   minRelevantMargin: number;
 }
@@ -86,7 +87,7 @@ export const DEFAULT_WAKE_GATE_OPTIONS: WakeGateOptions = {
   fallbackThreshold: 0.3,
   fallbackDelayMs: 20_000,
   fallbackSpreadMs: 8_000,
-  minRelevantMargin: 0.05,
+  minRelevantMargin: 0.07,
 };
 
 export interface WakeGateInput {
