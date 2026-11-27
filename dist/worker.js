@@ -12,6 +12,7 @@ import { fetchEventContext, fetchMatrixCredential, fetchNarraChatMessagesBacksto
 import { chatBehaviourNote, parseBrainOutput } from './v2/actions.js';
 import { DEFAULT_DAILY_RELEVANCE_LIMIT, NARRA_USAGE_SCHEMA, parseLimit, UsageBudget } from './v2/budget.js';
 import { claimPriority, decideWake } from './v2/gate.js';
+import { checkReplyHelps } from './v2/reply-check.js';
 import { CLAIM_EVENT_TYPE, CLAIM_REACTION, CLAIM_RETRY_REASON, applyClaimReaction, applyClaimRedaction, buildLedgerSummary, emptyRoomState, peerAnswered, peerHandoff, peerClaimHolder, pruneClaims, } from './v2/ledger.js';
 import { pipelineForRoom } from './v2/pipeline.js';
 import { continuousStreamText, newStreamContinuity, shouldFlushStream, streamableText } from './v2/stream.js';
@@ -2125,6 +2126,15 @@ export class BaseNarraRoomCoordinator {
             return undefined;
         }
     }
+    /**
+     * Reply check for an unaddressed group reply (see `v2.replyCheck`): false = drop it, true or
+     * undefined (unavailable) = post it.
+     */
+    async v2ReplyHelps(event, reply, spec, partial) {
+        if (this.getConfig().v2?.replyCheck === false)
+            return undefined;
+        return checkReplyHelps(this.env.AI, { question: event.text ?? '', reply, agentName: spec.name, partial }, { ...(this.env.AI_TRIAGE_MODEL ? { model: this.env.AI_TRIAGE_MODEL } : {}) });
+    }
     /** In a group, only an addressed agent or the conversation's owner reacts with an emoji. */
     mayReactInGroup(context, decision) {
         if (context.chatType !== 'group' || decision.direct)
@@ -2425,7 +2435,11 @@ export class BaseNarraRoomCoordinator {
                 edits: 0,
                 replyToEventId: undefined,
                 chain: Promise.resolve(),
+                /** The reply check passed (or was unavailable) on the streamed start. */
+                checked: false,
             };
+            // An unaddressed group reply is checked before anything is shown (see `v2.replyCheck`).
+            const checkReply = context.chatType === 'group' && !decision.direct && !turn.v2Proactive;
             const continuity = newStreamContinuity();
             const onText = (partial) => {
                 if (!continuousStreamText(continuity, partial, Boolean(stream.shown)))
@@ -2453,6 +2467,15 @@ export class BaseNarraRoomCoordinator {
                         if (await this.outrankedNow(turn, decision, eventIds, spec.matrixId)) {
                             stream.suppressed = true;
                             return;
+                        }
+                        if (checkReply) {
+                            const helps = await this.v2ReplyHelps(turn.event, display, spec, true);
+                            if (helps === false) {
+                                // Looks like a refusal: show nothing yet; the final text gets the last word.
+                                stream.suppressed = true;
+                                return;
+                            }
+                            stream.checked = true;
                         }
                         const quote = await this.computeShouldQuote(turn.event, context.chatType);
                         stream.replyToEventId = quote ? turn.event.eventId : undefined;
@@ -2627,6 +2650,17 @@ export class BaseNarraRoomCoordinator {
                     // Stepping back for a better fit is not "chose not to answer".
                     await this.releaseV2Claim(turn, CLAIM_RETRY_REASON);
                     await appendDoLog(this.ctx.storage, `v2 outranked ${turn.event.eventId}: ${stronger} fits better`, this.nowMs(), this.env);
+                    await this.removePendingTurn(turn.event.eventId);
+                    return;
+                }
+            }
+            if (checkReply && !turn.v2StreamEventId && !stream.checked && !action.mode) {
+                const helps = await this.v2ReplyHelps(turn.event, text, spec, false);
+                if (helps === false) {
+                    // A refusal or a substitute is not an answer: never shown, and the claim is released so the
+                    // agent that can help (waiting on it) goes next.
+                    await this.releaseV2Claim(turn);
+                    await appendDoLog(this.ctx.storage, `v2 dropped reply ${turn.event.eventId} (${decision.reason}): does not help`, this.nowMs(), this.env);
                     await this.removePendingTurn(turn.event.eventId);
                     return;
                 }

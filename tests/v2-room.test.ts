@@ -290,17 +290,10 @@ describe('v2 room: the best fit wins, not the fastest claim', () => {
 // answer. Netmind London Round 4 (kit f1d0fa0): the food agent answered 「iPhone 螢幕摔破了要去哪裡修？」
 // from the stand-by chain, and Penny overrode the food agent's silence on 「肚子餓了」 with a general line.
 describe('v2 room: an ask nobody owns gets no answer (沒人 ＠ 就不回)', () => {
-  // G10: the events agent fits best by topic and stays silent; the data agent is not relevant enough.
-  it('the only relevant agent stays silent: the room stays quiet (房租資料集)', async () => {
-    const sim = createRoomSim(
-      [
-        food(),
-        events({ brain: () => '[NO_REPLY]' }),
-        data({ brain: (t) => (/資料集|黑客松/.test(t) ? 'DATA: 倫敦房租資料集' : '[NO_REPLY]') }),
-      ],
-      HUMANS,
-    );
-    const q = await sim.say(PIKA, '有沒有倫敦房租的公開資料集？');
+  // Nobody relevant: an off-topic ask stays unanswered (see the refusal scenarios below for 房租資料集).
+  it('the only relevant agent stays silent: the room stays quiet (有什麼推薦 after events declined)', async () => {
+    const sim = createRoomSim([food(), events({ brain: () => '[NO_REPLY]' }), data()], HUMANS);
+    const q = await sim.say(PIKA, '倫敦今天天氣怎麼樣？');
     await sim.run(120_000);
     expect(sim.answersTo(q)).toEqual([]);
     expect(sim.agent('DATA').brainCalls).toEqual([]);
@@ -707,5 +700,81 @@ describe('v2 room: no visible sign of answering without a reply', () => {
     const b = await sim.say(PIKA, '這週末有什麼快閃活動');
     await sim.run(60_000);
     expect(sim.answersTo(b)).toEqual(['EVENTS']);
+  });
+});
+
+// zack test 2026-11-27 15:57 (kit 82e5ee7): 「有沒有倫敦房租的公開資料集？」. The events agent's profile
+// is broad, so it claimed first and posted 「這個我幫不上，我只知道倫敦最近有什麼快閃和活動」; the datasets
+// agent saw an answer and yielded. A reply that does not help is not an answer: never shown, and the
+// agent that can help goes next.
+describe('v2 room: a reply that only declines is never shown and is not an answer', () => {
+  const refuses = (line: string) => (t: string) => (/資料集|天氣|中餐/.test(t) ? line : /玩|快閃|活動/.test(t) ? 'EVENTS: 三個活動' : '[NO_REPLY]');
+  const shownBy = (sim: ReturnType<typeof createRoomSim>, name: string) =>
+    sim.timeline.filter((e) => e.sender === sim.agent(name).id && (e.type === 'm.room.message' || e.type === 'm.reaction'));
+
+  it('the broad agent that claims first and refuses is dropped; the datasets agent answers (房租資料集)', async () => {
+    const sim = createRoomSim(
+      [
+        food(),
+        // Like Spotted live: no dataset asks among its notExamples, so it looks relevant to everything in London.
+        events({ notExamples: FOOD_ASKS, brain: refuses('這個我幫不上，我只知道倫敦最近有什麼快閃和活動。'), extra: { v2: first } }),
+        data({ brain: (t) => (/資料集/.test(t) ? 'DATA: London Datastore 有房租統計' : '[NO_REPLY]'), extra: { v2: later } }),
+      ],
+      HUMANS,
+    );
+    const q = await sim.say(PIKA, '有沒有倫敦房租的公開資料集？');
+    await sim.run(120_000);
+    expect(await sim.logOf('EVENTS')).toMatch(/dropped reply .*does not help/);
+    expect(sim.answersTo(q)).toEqual(['DATA']);
+    expect(shownBy(sim, 'EVENTS')).toEqual([]);
+  });
+
+  it('a streamed refusal never shows its 👀 or text, and the right agent still answers', async () => {
+    const long = '這個我幫不上，我只知道倫敦最近有什麼快閃和活動，像是市集、展覽和期間限定的店。想找這週末或今晚的，跟我說你在哪一帶，我再幫你挑。';
+    const sim = createRoomSim(
+      [
+        food(),
+        events({ notExamples: FOOD_ASKS, brain: (t) => (/資料集/.test(t) ? { streamed: long, text: long } : '[NO_REPLY]'), extra: { v2: first } }),
+        data({ brain: (t) => (/資料集/.test(t) ? 'DATA: London Datastore 有房租統計' : '[NO_REPLY]'), extra: { v2: later } }),
+      ],
+      HUMANS,
+    );
+    const q = await sim.say(PIKA, '有沒有倫敦房租的公開資料集？');
+    await sim.run(120_000);
+    expect(sim.answersTo(q)).toEqual(['DATA']);
+    expect(shownBy(sim, 'EVENTS')).toEqual([]);
+  });
+
+  it('a substitute from another speciality is dropped; the food agent answers (今晚 Soho 中餐)', async () => {
+    const sim = createRoomSim(
+      [
+        food({ brain: (t) => (/中餐/.test(t) ? 'FOOD: Soho 三家中餐' : '[NO_REPLY]'), extra: { v2: later } }),
+        events({ notExamples: DATA_ASKS, brain: refuses('沒有中餐快閃，只有這兩個西式的市集'), extra: { v2: first } }),
+      ],
+      HUMANS,
+    );
+    const q = await sim.say(PIKA, '今晚 Soho 有什麼好吃的中餐？');
+    await sim.run(120_000);
+    expect(sim.answersTo(q)).toEqual(['FOOD']);
+    expect(shownBy(sim, 'EVENTS')).toEqual([]);
+  });
+
+  it('the conversation owner refusing an off-topic ask is dropped, and the room stays quiet (天氣)', async () => {
+    const sim = createRoomSim([food(), events({ brain: refuses('天氣我幫不上，我只知道活動') }), data()], HUMANS);
+    const a = await sim.say(PIKA, '這週末有什麼快閃活動');
+    await sim.run(30_000);
+    expect(sim.answersTo(a)).toEqual(['EVENTS']);
+    const q = await sim.say(PIKA, '倫敦今天天氣怎麼樣？');
+    await sim.run(120_000);
+    expect(sim.answersTo(q)).toEqual([]);
+    expect(sim.answerTexts(q).join('')).not.toMatch(/幫不上/);
+  });
+
+  it('a helpful reply is checked and posted', async () => {
+    const sim = createRoomSim([food(), events(), data()], HUMANS);
+    const q = await sim.say(PIKA, '這週末有什麼快閃活動');
+    await sim.run(30_000);
+    expect(sim.answersTo(q)).toEqual(['EVENTS']);
+    expect(sim.replyChecks).toEqual([{ agent: 'EVENTS', reply: 'EVENTS: 三個活動', helps: true }]);
   });
 });

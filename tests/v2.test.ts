@@ -936,3 +936,20 @@ describe('v2 fixes from Netmind London 15:01–15:13', () => {
     expect(chatBehaviourNote({ chatType: 'group', direct: false })).toMatch(/Never answer a repeated question with \[NO_REPLY\]/);
   });
 });
+
+describe('v2 reply check', () => {
+  it('parses the verdict and fails open on anything unclear', async () => {
+    const { parseReplyVerdict, checkReplyHelps, REPLY_CHECK_MARKER } = await import('../src/v2/reply-check.js');
+    expect(parseReplyVerdict({ response: '{"helps":false}' })).toBe(false);
+    expect(parseReplyVerdict({ response: 'Sure: {"helps": "true"}' })).toBe(true);
+    expect(parseReplyVerdict({ response: 'no idea' })).toBeUndefined();
+    expect(await checkReplyHelps(undefined, { question: 'q', reply: 'r', agentName: 'A' })).toBeUndefined();
+    const failing = { run: async () => { throw new Error('down'); } };
+    expect(await checkReplyHelps(failing, { question: 'q', reply: 'r', agentName: 'A' })).toBeUndefined();
+    let system = '';
+    const ai = { run: async (_m: string, input: { messages: Array<{ role: string; content: string }> }) => { system = input.messages[0].content; return { response: '{"helps":false}' }; } };
+    expect(await checkReplyHelps(ai, { question: '有沒有倫敦房租的公開資料集？', reply: '這個我幫不上，我只知道快閃', agentName: 'Spotted', partial: true })).toBe(false);
+    expect(system.startsWith(REPLY_CHECK_MARKER)).toBe(true);
+    expect(system).toMatch(/may stop mid-sentence/);
+  });
+});

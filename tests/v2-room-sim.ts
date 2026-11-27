@@ -10,6 +10,7 @@ import {
   type NarraGatewayEnv,
 } from '../src/index.js';
 import { createD1 } from './d1.js';
+import { REPLY_CHECK_MARKER } from '../src/v2/reply-check.js';
 
 export const SIM_ROOM = '!simroom:matrix.netmind.chat';
 export const START_MS = Date.UTC(2026, 10, 26, 11, 0, 0);
@@ -115,7 +116,8 @@ const TOPICS: Array<[RegExp, number[]]> = [
   [/會下雨/, [0, 0.7, 0.5, 0, 0.5]],
   [/general helper/, [0, 0, 0, 0, 1]],
   // Live zack test 2026-11-26 (G10, G14): closest to the events agent, but data fits on its own.
-  [/房租.*資料集/, [0, 0.8, 0.6, 0, 0]],
+  // After manyfold-data#83 the datasets agent is the clear fit (live 15:57: cos .662 vs not .582).
+  [/房租.*資料集/, [0, 0.8, 1, 0, 0]],
   [/天氣|好喔哈哈/, [0, 0.8, 0.5, 0, 0.3]],
   // G17: food and events both fit fully.
   [/點心/, [1, 1, 0, 0, 0]],
@@ -137,6 +139,9 @@ const TOPICS: Array<[RegExp, number[]]> = [
 ];
 
 /** What the fake ask model treats as chatter or thanks. */
+/** What the sim's reply check treats as a refusal or a substitute (the real check is a model). */
+export const SIM_REFUSAL = /幫不上|只知道|can only|can't help|沒有.*只有/i;
+
 export const SIM_CHATTER = /哈哈|謝謝|好喔|^ok\b|\blol\b|^讚/i;
 
 export function fakeEmbedding(text: string): number[] {
@@ -196,6 +201,7 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
 
   /** Agents that answered with the general model (stand-by fallback), in order. */
   const generalCalls: string[] = [];
+  const replyChecks: Array<{ agent: string; reply: string; helps: boolean }> = [];
   const agents: SimAgent[] = [];
   defs.forEach((def) => {
     const id = def.spec.matrixId!;
@@ -269,6 +275,13 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
           if (input.messages) {
             const system = input.messages.find((m) => m.role === 'system')?.content ?? '';
             const user = input.messages.find((m) => m.role === 'user')?.content ?? '';
+            if (system.startsWith(REPLY_CHECK_MARKER)) {
+              // Reply check: a reply that only declines, or offers something else, does not help.
+              const reply = /reply: ([\s\S]*)/.exec(user)?.[1] ?? '';
+              const helps = !SIM_REFUSAL.test(reply);
+              replyChecks.push({ agent: def.spec.name, reply, helps });
+              return { response: JSON.stringify({ helps }) };
+            }
             if (system.includes('"ask"')) {
               // Ask model: the newest message is a question or need unless it is chatter or thanks.
               const newest = /newest_message: (.*)/.exec(user)?.[1] ?? '';
@@ -423,7 +436,7 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
       .map((e) => String(e.content.body ?? ''));
   }
 
-  return { say, run, answersTo, answerTexts, logOf, agent, timeline, advance, generalCalls, now: () => nowMs };
+  return { say, run, answersTo, answerTexts, logOf, agent, timeline, advance, generalCalls, replyChecks, now: () => nowMs };
 }
 
 /** True when `value` holds a number Matrix canonical JSON refuses (a float, or outside +-2^53). */
