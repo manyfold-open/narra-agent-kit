@@ -207,8 +207,18 @@ export interface OpenQuestion {
   askedTo?: string;
 }
 
-function asksSomething(text: string): boolean {
-  return /[?？]/.test(text.replace(/https?:\/\/\S+/g, ''));
+/**
+ * Whether an agent message puts a question to the room. Question marks inside list items do not count:
+ * "you could also ask: • …？ • …？" offers follow-ups the person may ask, it does not wait for an
+ * answer, so a later "謝謝" is not an answer to it.
+ */
+export function asksSomething(text: string): boolean {
+  const prose = text
+    .replace(/https?:\/\/\S+/g, '')
+    .split('\n')
+    .filter((line) => !/^\s*(?:[•·\-*–—]|\d+[.)、]|[a-zA-Z][.)])\s*/.test(line))
+    .join('\n');
+  return /[?？]/.test(prose);
 }
 
 /**

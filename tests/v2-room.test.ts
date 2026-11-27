@@ -534,3 +534,30 @@ describe('v2 room: stand-bys take turns (zack test 17:39, 2026-11-26)', () => {
   });
 });
 
+
+// Live zack test 2026-11-27 (kit 6e23085): chatter woke four agents as "relevant" one after another,
+// and a stand-by limited to its own topic answered "I can only talk about AI news".
+describe('v2 room: chatter stays invisible; a stand-by always gives a real answer', () => {
+  const claimsOn = (sim: ReturnType<typeof createRoomSim>, q: string) =>
+    sim.timeline.filter((e) => e.type === 'm.reaction' && (e.content['m.relates_to'] as { event_id: string }).event_id === q);
+
+  it('chatter equally close to every agent: no 👀, no brain call', async () => {
+    const sim = createRoomSim([food(), events(), data(), penny({ bill: false })], HUMANS);
+    const q = await sim.say(PIKA, '哈哈好喔');
+    await sim.run(120_000);
+    expect(sim.answersTo(q)).toEqual([]);
+    expect(claimsOn(sim, q)).toEqual([]);
+    for (const name of ['FOOD', 'EVENTS', 'DATA', 'PENNY']) expect(sim.agent(name).brainCalls).toEqual([]);
+    expect(await sim.logOf('FOOD')).toMatch(/fallback skipped .*not an ask/);
+  });
+
+  it('a real question no brain will take still gets one general answer from the first stand-by', async () => {
+    const sim = createRoomSim([food(), events(), data({ brain: () => '[NO_REPLY]' })], HUMANS);
+    const q = await sim.say(PIKA, '倫敦今天天氣怎麼樣？');
+    await sim.run(120_000);
+    const answers = sim.answersTo(q);
+    expect(answers).toHaveLength(1);
+    expect(sim.generalCalls).toEqual([answers[0]]);
+    expect(await sim.logOf(answers[0])).toMatch(/standby general answer/);
+  });
+});

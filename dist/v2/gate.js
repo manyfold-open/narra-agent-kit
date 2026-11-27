@@ -16,6 +16,7 @@ export const DEFAULT_WAKE_GATE_OPTIONS = {
     fallbackThreshold: 0.3,
     fallbackDelayMs: 20_000,
     fallbackSpreadMs: 8_000,
+    minRelevantMargin: 0.05,
 };
 /**
  * How strongly a decision holds the message, sent with the 👀 claim. The highest live claim answers;
@@ -159,6 +160,10 @@ export async function decideWake(input) {
         // question scored as another agent's), and a room where every stand-by is zeroed answers nobody.
         const standByScore = notMine ? Math.max(score, rawScore ?? 0) : score;
         return standBy(standByScore, needed) ?? drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
+    }
+    if (margin !== undefined && margin < opts.minRelevantMargin) {
+        // Looks relevant, but no closer to this agent than to the others: chatter, or nobody's topic.
+        return standBy(Math.min(score, rawScore ?? score), needed) ?? drop('low_margin', score);
     }
     // Higher relevance goes first. Relevance saturates at 1, so the margin over the other agents' asks
     // orders equally confident agents; a per-agent hash breaks exact ties.

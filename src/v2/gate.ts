@@ -32,6 +32,7 @@ export type WakeReason =
   | 'peer_conversation'
   | 'topic_moved_on'
   | 'low_relevance'
+  | 'low_margin'
   | 'budget';
 
 export interface WakeDecision {
@@ -68,6 +69,13 @@ export interface WakeGateOptions {
   fallbackDelayMs: number;
   /** ...minus up to this much for a better fit, so the closest agent goes first. */
   fallbackSpreadMs: number;
+  /**
+   * Going first also needs this margin over the other agents' asks (cosine minus best not-example
+   * cosine), when the agent has notExamples. Chatter ("哈哈好喔", "謝謝") sits at the same cosine to
+   * every profile (bge-m3 gives it about 0.55), so its relevance looks high while the margin stays
+   * near 0; real asks beat the other agents by 0.08 and more. Below it the agent only stands by.
+   */
+  minRelevantMargin: number;
 }
 
 export const DEFAULT_WAKE_GATE_OPTIONS: WakeGateOptions = {
@@ -78,6 +86,7 @@ export const DEFAULT_WAKE_GATE_OPTIONS: WakeGateOptions = {
   fallbackThreshold: 0.3,
   fallbackDelayMs: 20_000,
   fallbackSpreadMs: 8_000,
+  minRelevantMargin: 0.05,
 };
 
 export interface WakeGateInput {
@@ -246,6 +255,10 @@ export async function decideWake(input: WakeGateInput): Promise<WakeDecision> {
     // question scored as another agent's), and a room where every stand-by is zeroed answers nobody.
     const standByScore = notMine ? Math.max(score, rawScore ?? 0) : score;
     return standBy(standByScore, needed) ?? drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
+  }
+  if (margin !== undefined && margin < opts.minRelevantMargin) {
+    // Looks relevant, but no closer to this agent than to the others: chatter, or nobody's topic.
+    return standBy(Math.min(score, rawScore ?? score), needed) ?? drop('low_margin', score);
   }
 
   // Higher relevance goes first. Relevance saturates at 1, so the margin over the other agents' asks

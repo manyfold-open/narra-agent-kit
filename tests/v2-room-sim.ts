@@ -84,6 +84,8 @@ function sse(text: string): Response {
 
 /** Topic axes for the fake embedding: food, events, data, money, chatter, fortune. */
 const TOPICS: Array<[RegExp, number[]]> = [
+  // Live zack test 2026-11-27: chatter is equally close to every profile (bge-m3 ≈ 0.55 to all).
+  [/哈哈好喔|謝謝你們/, [1, 1, 1, 0, 0, 0]],
   // Live zack test 17:39: nobody's topic, several stand-bys at once.
   [/會下雨/, [0, 0.7, 0.5, 0, 0.5]],
   [/general helper/, [0, 0, 0, 0, 1]],
@@ -108,6 +110,9 @@ const TOPICS: Array<[RegExp, number[]]> = [
   [/玩|快閃|活動|市集|展覽|pop-?up|market|exhibition|things to do/i, [0, 1, 0, 0, 0]],
   [/吃|餐|火鍋|餓|拉麵|food|dinner|restaurant/i, [1, 0, 0, 0, 0]],
 ];
+
+/** What the fake ask model treats as chatter or thanks. */
+export const SIM_CHATTER = /哈哈|謝謝|好喔|^ok\b|\blol\b|^讚/i;
 
 export function fakeEmbedding(text: string): number[] {
   for (const [re, v] of TOPICS) if (re.test(text)) return v;
@@ -162,6 +167,8 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
     ...defs.map((d) => ({ matrixId: d.spec.matrixId!, displayName: d.spec.name, isAgent: true })),
   ];
 
+  /** Agents that answered with the general model (stand-by fallback), in order. */
+  const generalCalls: string[] = [];
   const agents: SimAgent[] = [];
   defs.forEach((def) => {
     const id = def.spec.matrixId!;
@@ -224,7 +231,24 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
     const rooms = fakeNamespace((s) => new gw.BaseNarraRoomCoordinator(s, env));
     env = {
       DB: createD1(),
-      AI: { run: async (_m: string, input: { text: string[] }) => ({ data: input.text.map(fakeEmbedding) }) },
+      AI: {
+        run: async (_m: string, input: { text?: string[]; messages?: Array<{ role: string; content: string }> }) => {
+          if (input.messages) {
+            const system = input.messages.find((m) => m.role === 'system')?.content ?? '';
+            const user = input.messages.find((m) => m.role === 'user')?.content ?? '';
+            if (system.includes('"ask"')) {
+              // Ask model: the newest message is a question or need unless it is chatter or thanks.
+              const newest = /newest_message: (.*)/.exec(user)?.[1] ?? '';
+              const ask = !SIM_CHATTER.test(newest.trim());
+              return { response: JSON.stringify({ ask, fit: ask ? 0.5 : 0, reason: ask ? 'ask' : 'chatter', lang: 'zh-Hant' }) };
+            }
+            // General model (stand-by answer when the agent's own brain is limited to its topic).
+            generalCalls.push(def.spec.name);
+            return { response: `GENERAL(${def.spec.name}): 我查不到即時資料，大致是這樣` };
+          }
+          return { data: (input.text ?? []).map(fakeEmbedding) };
+        },
+      },
       NARRA_GATEWAY_ENABLED: 'on',
       NARRA_SYNC: 'on',
       NARRA_AGENT_TOKEN: 'narra_test',
@@ -364,7 +388,7 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
       .map((e) => String(e.content.body ?? ''));
   }
 
-  return { say, run, answersTo, answerTexts, logOf, agent, timeline, advance, now: () => nowMs };
+  return { say, run, answersTo, answerTexts, logOf, agent, timeline, advance, generalCalls, now: () => nowMs };
 }
 
 /** True when `value` holds a number Matrix canonical JSON refuses (a float, or outside +-2^53). */
