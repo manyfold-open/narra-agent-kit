@@ -53,6 +53,13 @@ const V2_CRISIS_STEP_MS = 2_500;
  */
 const V2_STANDBY_STAGGER_MS = 30_000;
 /**
+ * Appended to the room envelope when a stand-by answers with the general model. The envelope offers
+ * [NO_REPLY] and frames the agent's own speciality, so without this the general model stays silent too.
+ */
+const V2_STANDBY_GENERAL_NOTE = 'Final instruction (overrides chat_behaviour): current_message is a real question that nobody in the room answered, and you are answering it now. ' +
+    'Answer it directly in 1-3 short sentences from general knowledge, even though it is outside your speciality. If it needs live data you cannot check (weather, prices, news), ' +
+    'say so plainly and give the best general answer plus where to check. Never output [NO_REPLY], never only refuse, never point to another agent.';
+/**
  * v2: a stand-by claims, then waits this long before calling its brain: stand-bys with similar fit
  * reach the room within a second or two of each other, and only the strongest (then earliest) claim
  * goes on. The others step back without it counting as a look.
@@ -2579,7 +2586,7 @@ export class BaseNarraRoomCoordinator {
                 // chatter that looks equally close to everyone from reaching a stand-by brain.)
                 // The room's stand-by for a real question, but its brain is limited to its own topic: answer with
                 // the general model instead of leaving the question (or replying "I can only talk about X").
-                const general = await runWorkersAiResilienceFallback(this.env.AI, this.env.AI_TRIAGE_MODEL, spec, sentEnvelope, replyLang, false);
+                const general = await runWorkersAiResilienceFallback(this.env.AI, this.env.AI_TRIAGE_MODEL, spec, `${sentEnvelope}\n\n${V2_STANDBY_GENERAL_NOTE}`, replyLang, false);
                 if (general && !isSilence(general)) {
                     action = parseBrainOutput(general);
                     await appendDoLog(this.ctx.storage, `v2 standby general answer ${turn.event.eventId}`, this.nowMs(), this.env);

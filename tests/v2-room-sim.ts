@@ -244,6 +244,8 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
             }
             // General model (stand-by answer when the agent's own brain is limited to its topic).
             generalCalls.push(def.spec.name);
+            // Like the real model: without an explicit "answer now", it follows the envelope's [NO_REPLY] option.
+            if (!user.includes('Never output [NO_REPLY]')) return { response: '[NO_REPLY]' };
             return { response: `GENERAL(${def.spec.name}): 我查不到即時資料，大致是這樣` };
           }
           return { data: (input.text ?? []).map(fakeEmbedding) };
