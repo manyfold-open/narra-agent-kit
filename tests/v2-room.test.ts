@@ -770,6 +770,23 @@ describe('v2 room: a reply that only declines is never shown and is not an answe
     expect(sim.answerTexts(q).join('')).not.toMatch(/幫不上/);
   });
 
+  // zack test 16:08 (kit 6196077): the datasets agent answered 「目前沒有倫敦房租的資料集，我查過所有資料集…」
+  // and the check dropped it as a refusal. "I looked in my own data and it is not there" is an answer.
+  it('the right agent saying it checked and has nothing is an answer, not a refusal (房租資料集)', async () => {
+    const sim = createRoomSim(
+      [
+        food(),
+        events({ notExamples: FOOD_ASKS, brain: refuses('這個我幫不上，我只知道倫敦最近有什麼快閃和活動。'), extra: { v2: first } }),
+        data({ brain: (t) => (/資料集/.test(t) ? 'Manyfold Data 目前沒有倫敦房租的資料集，我查過所有資料集，需求已記下。' : '[NO_REPLY]'), extra: { v2: later } }),
+      ],
+      HUMANS,
+    );
+    const q = await sim.say(PIKA, '有沒有倫敦房租的公開資料集？');
+    await sim.run(120_000);
+    expect(sim.answersTo(q)).toEqual(['DATA']);
+    expect(shownBy(sim, 'EVENTS')).toEqual([]);
+  });
+
   it('a helpful reply is checked and posted', async () => {
     const sim = createRoomSim([food(), events(), data()], HUMANS);
     const q = await sim.say(PIKA, '這週末有什麼快閃活動');
