@@ -113,6 +113,13 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
          */
         standbyAskCheck?: boolean;
         /**
+         * Before an unaddressed group reply is shown, ask the Workers AI model whether it actually helps
+         * with what was asked. A pure refusal ("I can't help, I only know X") or a substitute from another
+         * topic is dropped and does not count as an answer, so the agent that can help goes next.
+         * Default on; fails open (posts) when Workers AI is unavailable. false turns it off.
+         */
+        replyCheck?: boolean;
+        /**
          * Agent-specific wake decision from its own state (not phrase lists), checked before relevance:
          * 'wake' answers the message, 'skip' ignores it, null lets the kit decide.
          */
@@ -403,6 +410,11 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
     private v2Gate;
     /** Ask check: true/false from the ask model, undefined when it is unavailable (fail open). */
     private v2AskCheck;
+    /**
+     * Reply check for an unaddressed group reply (see `v2.replyCheck`): false = drop it, true or
+     * undefined (unavailable) = post it.
+     */
+    private v2ReplyHelps;
     /** In a group, only an addressed agent or the conversation's owner reacts with an emoji. */
     private mayReactInGroup;
     private describeGate;

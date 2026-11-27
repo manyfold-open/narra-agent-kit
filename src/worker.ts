@@ -83,6 +83,7 @@ import type {
 import { chatBehaviourNote, parseBrainOutput } from './v2/actions.js';
 import { DEFAULT_DAILY_RELEVANCE_LIMIT, NARRA_USAGE_SCHEMA, parseLimit, UsageBudget } from './v2/budget.js';
 import { claimPriority, decideWake, type WakeDecision, type WakeGateOptions } from './v2/gate.js';
+import { checkReplyHelps } from './v2/reply-check.js';
 import {
   CLAIM_EVENT_TYPE,
   CLAIM_REACTION,
@@ -249,6 +250,13 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
      * unavailable. false turns it off.
      */
     standbyAskCheck?: boolean;
+    /**
+     * Before an unaddressed group reply is shown, ask the Workers AI model whether it actually helps
+     * with what was asked. A pure refusal ("I can't help, I only know X") or a substitute from another
+     * topic is dropped and does not count as an answer, so the agent that can help goes next.
+     * Default on; fails open (posts) when Workers AI is unavailable. false turns it off.
+     */
+    replyCheck?: boolean;
     /**
      * Agent-specific wake decision from its own state (not phrase lists), checked before relevance:
      * 'wake' answers the message, 'skip' ignores it, null lets the kit decide.
@@ -2830,6 +2838,19 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
     }
   }
 
+  /**
+   * Reply check for an unaddressed group reply (see `v2.replyCheck`): false = drop it, true or
+   * undefined (unavailable) = post it.
+   */
+  private async v2ReplyHelps(event: InboundEvent, reply: string, spec: AgentSpec, partial: boolean): Promise<boolean | undefined> {
+    if (this.getConfig().v2?.replyCheck === false) return undefined;
+    return checkReplyHelps(
+      this.env.AI,
+      { question: event.text ?? '', reply, agentName: spec.name, partial },
+      { ...(this.env.AI_TRIAGE_MODEL ? { model: this.env.AI_TRIAGE_MODEL } : {}) },
+    );
+  }
+
   /** In a group, only an addressed agent or the conversation's owner reacts with an emoji. */
   private mayReactInGroup(context: RoomContext, decision: WakeDecision): boolean {
     if (context.chatType !== 'group' || decision.direct) return true;
@@ -3168,7 +3189,11 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         edits: 0,
         replyToEventId: undefined as string | undefined,
         chain: Promise.resolve() as Promise<unknown>,
+        /** The reply check passed (or was unavailable) on the streamed start. */
+        checked: false,
       };
+      // An unaddressed group reply is checked before anything is shown (see `v2.replyCheck`).
+      const checkReply = context.chatType === 'group' && !decision.direct && !turn.v2Proactive;
       const continuity = newStreamContinuity();
       const onText = (partial: string): void => {
         if (!continuousStreamText(continuity, partial, Boolean(stream.shown))) return;
@@ -3191,6 +3216,15 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
               if (await this.outrankedNow(turn, decision, eventIds, spec.matrixId)) {
                 stream.suppressed = true;
                 return;
+              }
+              if (checkReply) {
+                const helps = await this.v2ReplyHelps(turn.event, display, spec, true);
+                if (helps === false) {
+                  // Looks like a refusal: show nothing yet; the final text gets the last word.
+                  stream.suppressed = true;
+                  return;
+                }
+                stream.checked = true;
               }
               const quote = await this.computeShouldQuote(turn.event, context.chatType);
               stream.replyToEventId = quote ? turn.event.eventId : undefined;
@@ -3381,6 +3415,17 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
           // Stepping back for a better fit is not "chose not to answer".
           await this.releaseV2Claim(turn, CLAIM_RETRY_REASON);
           await appendDoLog(this.ctx.storage, `v2 outranked ${turn.event.eventId}: ${stronger} fits better`, this.nowMs(), this.env);
+          await this.removePendingTurn(turn.event.eventId);
+          return;
+        }
+      }
+      if (checkReply && !turn.v2StreamEventId && !stream.checked && !action.mode) {
+        const helps = await this.v2ReplyHelps(turn.event, text, spec, false);
+        if (helps === false) {
+          // A refusal or a substitute is not an answer: never shown, and the claim is released so the
+          // agent that can help (waiting on it) goes next.
+          await this.releaseV2Claim(turn);
+          await appendDoLog(this.ctx.storage, `v2 dropped reply ${turn.event.eventId} (${decision.reason}): does not help`, this.nowMs(), this.env);
           await this.removePendingTurn(turn.event.eventId);
           return;
         }
