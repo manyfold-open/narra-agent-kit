@@ -69,6 +69,25 @@ function fakeNamespace<T extends { fetch(r: Request): Promise<Response> }>(facto
   return { namespace, ensure };
 }
 
+/** A stream that shows `streamed` while the brain works (two growing artifact chunks), then ends with `text`. */
+function sseStreamed(streamed: string, text: string): Response {
+  const half = Math.ceil(streamed.length / 2);
+  const results = [
+    { kind: 'artifact-update', append: false, artifact: { artifactId: 'a1', parts: [{ kind: 'text', text: streamed.slice(0, half) }] } },
+    { kind: 'artifact-update', append: true, artifact: { artifactId: 'a1', parts: [{ kind: 'text', text: streamed.slice(half) }] } },
+    { kind: 'status-update', status: { state: 'completed', message: { role: 'agent', parts: [{ kind: 'text', text }] } } },
+  ];
+  return new Response(
+    new ReadableStream({
+      start(c) {
+        for (const result of results) c.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ jsonrpc: '2.0', id: '1', result })}\n\n`));
+        c.close();
+      },
+    }),
+    { headers: { 'content-type': 'text/event-stream' } },
+  );
+}
+
 function sse(text: string): Response {
   const body = `data: ${JSON.stringify({ jsonrpc: '2.0', id: '1', result: { kind: 'status-update', status: { state: 'completed', message: { role: 'agent', parts: [{ kind: 'text', text }] } } } })}\n\n`;
   return new Response(
@@ -135,7 +154,7 @@ export interface SimEvent {
 }
 
 /** What the agent's Manyfold brain answers for a turn; `fail` makes the A2A call fail. */
-export type BrainReply = string | { fail: true };
+export type BrainReply = string | { fail: true } | { streamed: string; text: string };
 
 /** How long a brain call takes in room time (a real Manyfold turn takes seconds). */
 export const BRAIN_LATENCY_MS = 4_000;
@@ -157,6 +176,8 @@ export interface SimAgent {
   brainCalls: string[];
   /** The raw A2A request bodies this agent sent its brain, in order. */
   brainPrompts: string[];
+  /** Room times at which this agent turned its "typing…" indicator on (people see it). */
+  typingOn: number[];
   room: { instance: { fetch(r: Request): Promise<Response> }; storage: FakeDOStorage };
   delivered: number;
   busy: boolean;
@@ -181,12 +202,17 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
     const short = id.slice(7, 11);
     const brainCalls: string[] = [];
     const brainPrompts: string[] = [];
+    const typingOn: number[] = [];
     const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
       if (url.endsWith('/api/agent-runtime/matrix-credential')) {
         return Response.json({ status: 'ok', data: { homeserver_url: 'https://matrix.netmind.chat', matrix_user_id: id, access_token: 'syt_test' } });
       }
-      if (url.includes('/typing/') || url.includes('/receipt/')) return Response.json({});
+      if (url.includes('/typing/')) {
+        if ((JSON.parse(String(init?.body ?? '{}')) as { typing?: boolean }).typing) typingOn.push(nowMs);
+        return Response.json({});
+      }
+      if (url.includes('/receipt/')) return Response.json({});
       if (url.includes('/redact/')) {
         const target = decodeURIComponent(url.split('/redact/')[1].split('/')[0]);
         const eventId = `$${short}_r${++seq}`;
@@ -214,9 +240,10 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
         // The brain takes room time; other agents keep working meanwhile.
         self.waitingBrain = true;
         await new Promise<void>((resolve) =>
-          brainWaiters.push({ at: nowMs + (typeof reply === 'string' ? BRAIN_LATENCY_MS : BRAIN_FAIL_AFTER_MS), agent: self, resolve }),
+          brainWaiters.push({ at: nowMs + ('fail' in Object(reply) ? BRAIN_FAIL_AFTER_MS : BRAIN_LATENCY_MS), agent: self, resolve }),
         );
         self.waitingBrain = false;
+        if (typeof reply !== 'string' && 'streamed' in reply) return sseStreamed(reply.streamed, reply.text);
         if (typeof reply !== 'string') return new Response('upstream timeout', { status: 504 });
         return sse(reply);
       }
@@ -265,7 +292,7 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
       NARRA_PIPELINE: 'v2',
       NARRA_PIPELINE_ROOMS: SIM_ROOM,
     } as NarraGatewayEnv;
-    agents.push({ def, id, brainCalls, brainPrompts, room: rooms.ensure(SIM_ROOM), delivered: 0, busy: false, waitingBrain: false });
+    agents.push({ def, id, brainCalls, brainPrompts, typingOn, room: rooms.ensure(SIM_ROOM), delivered: 0, busy: false, waitingBrain: false });
   });
 
   function latestHumanTextBefore(ms: number): string {

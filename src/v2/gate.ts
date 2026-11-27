@@ -31,6 +31,7 @@ export type WakeReason =
   | 'peer_conversation'
   | 'topic_moved_on'
   | 'low_relevance'
+  | 'low_margin'
   | 'budget';
 
 export interface WakeDecision {
@@ -71,6 +72,12 @@ export interface WakeGateOptions {
    * Live data (zack test 2026-11-27): chatter and thanks up to 0.054, real asks from 0.078.
    */
   minRelevantMargin: number;
+  /**
+   * Relevance a low-margin message needs to be checked as a possible ask at all. A real ask that fits
+   * two agents saturates relevance for both (live: 1.00, cos .73); a need every agent is faintly close
+   * to does not (Netmind London 15:13: 「我好餓」 at 0.64, cos .543 vs not .542, for the fortune agent).
+   */
+  askCheckMinScore: number;
 }
 
 export const DEFAULT_WAKE_GATE_OPTIONS: WakeGateOptions = {
@@ -79,6 +86,7 @@ export const DEFAULT_WAKE_GATE_OPTIONS: WakeGateOptions = {
   maxDelayMs: 4_000,
   minDelayMs: 600,
   minRelevantMargin: 0.07,
+  askCheckMinScore: 0.9,
 };
 
 export interface WakeGateInput {
@@ -232,6 +240,7 @@ export async function decideWake(input: WakeGateInput): Promise<WakeDecision> {
     return drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
   }
   if (margin !== undefined && margin < opts.minRelevantMargin) {
+    if (score < opts.askCheckMinScore) return drop('low_margin', score);
     // Looks relevant, but no closer to this agent than to the others: chatter, or a real ask that fits
     // two agents. Go after the clear fits, and only once the ask model says it is a real ask.
     const jitter = hashFraction(`${event.eventId}:${selfId ?? spec.id}`) * 150;

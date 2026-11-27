@@ -2401,9 +2401,14 @@ export class BaseNarraRoomCoordinator {
                 await this.removePendingTurn(turn.event.eventId);
                 return;
             }
-            void this.matrixOp({ op: 'typing', roomId, typing: true }).catch(() => undefined);
-            const typingTimer = setInterval(() => {
+            // "typing…" is a promise to reply. Only an addressed turn (it always answers) shows it while the
+            // brain works; an unaddressed one may still choose silence, and people would see it type and stop.
+            const showTyping = decision.direct || context.chatType === 'dm';
+            if (showTyping)
                 void this.matrixOp({ op: 'typing', roomId, typing: true }).catch(() => undefined);
+            const typingTimer = setInterval(() => {
+                if (showTyping)
+                    void this.matrixOp({ op: 'typing', roomId, typing: true }).catch(() => undefined);
             }, TYPING_REFRESH_MS);
             let raw = '';
             // Reply in the asker's language: zh-Hant, zh-Hans or English; anything else in English.
@@ -2542,7 +2547,8 @@ export class BaseNarraRoomCoordinator {
             }
             finally {
                 clearInterval(typingTimer);
-                await this.matrixOp({ op: 'typing', roomId, typing: false }).catch(() => undefined);
+                if (showTyping)
+                    await this.matrixOp({ op: 'typing', roomId, typing: false }).catch(() => undefined);
             }
             let action = parseBrainOutput(raw);
             nowMs = this.nowMs();
@@ -2559,24 +2565,11 @@ export class BaseNarraRoomCoordinator {
                     await appendDoLog(this.ctx.storage, `v2 acknowledgement ${turn.event.eventId}: text turned into an emoji`, this.nowMs(), this.env);
                 }
             }
-            if (action.kind !== 'reply' && turn.v2StreamEventId) {
-                // Text was already showing but the brain ended up choosing not to reply: take it back.
-                await this.matrixOp({
-                    op: 'redact',
-                    roomId,
-                    eventId: turn.v2StreamEventId,
-                    txnId: await deterministicTxnId(`unstream:${turn.v2StreamEventId}`),
-                }).catch(() => undefined);
-                turn.v2StreamEventId = undefined;
-                if (turn.v2EyesEventId) {
-                    await this.matrixOp({
-                        op: 'redact',
-                        roomId,
-                        eventId: turn.v2EyesEventId,
-                        txnId: await deterministicTxnId(`uneyes:${turn.v2EyesEventId}`),
-                    }).catch(() => undefined);
-                    turn.v2EyesEventId = undefined;
-                }
+            if (action.kind !== 'reply' && turn.v2StreamEventId && stream.shown) {
+                // People already saw the 👀 and the start of this reply: it is committed. Taking it back would
+                // show a 👀 (and text) that comes and goes, so the shown text stands as the reply.
+                action = { kind: 'reply', text: stream.shown };
+                await appendDoLog(this.ctx.storage, `v2 kept streamed reply ${turn.event.eventId}`, this.nowMs(), this.env);
             }
             if (action.kind === 'silent') {
                 await this.releaseV2Claim(turn);

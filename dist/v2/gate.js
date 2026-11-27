@@ -14,6 +14,7 @@ export const DEFAULT_WAKE_GATE_OPTIONS = {
     maxDelayMs: 4_000,
     minDelayMs: 600,
     minRelevantMargin: 0.07,
+    askCheckMinScore: 0.9,
 };
 /**
  * How strongly a decision holds the message, sent with the 👀 claim. The highest live claim answers;
@@ -142,6 +143,8 @@ export async function decideWake(input) {
         return drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
     }
     if (margin !== undefined && margin < opts.minRelevantMargin) {
+        if (score < opts.askCheckMinScore)
+            return drop('low_margin', score);
         // Looks relevant, but no closer to this agent than to the others: chatter, or a real ask that fits
         // two agents. Go after the clear fits, and only once the ask model says it is a real ask.
         const jitter = hashFraction(`${event.eventId}:${selfId ?? spec.id}`) * 150;
