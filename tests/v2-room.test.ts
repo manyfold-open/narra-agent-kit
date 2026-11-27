@@ -561,3 +561,39 @@ describe('v2 room: chatter stays invisible; a stand-by always gives a real answe
     expect(await sim.logOf(answers[0])).toMatch(/standby general answer/);
   });
 });
+
+// Live zack test 2026-11-27 11:50 (kit d5d39e6): the agent the person had just talked with replied
+// with text to 「謝謝！」, and answered 「天氣我幫不上…」 to a weather question, which ended the room's search.
+describe('v2 room: the conversation owner thanks with an emoji and never just refuses', () => {
+  it('a brain that insists on a polite line to thanks still shows only an emoji', async () => {
+    const polite = (t: string) => (/謝謝/.test(t) ? '不客氣，玩得開心！' : /玩|快閃|活動/.test(t) ? 'EVENTS: 三個活動' : '[NO_REPLY]');
+    const sim = createRoomSim([food(), events({ brain: polite }), data()], HUMANS);
+    const a = await sim.say(PIKA, '這週末有什麼快閃活動');
+    await sim.run(30_000);
+    expect(sim.answersTo(a)).toEqual(['EVENTS']);
+    const q = await sim.say(PIKA, '謝謝');
+    await sim.run(60_000);
+    expect(sim.answersTo(q)).toEqual([]);
+    const redacted = new Set(sim.timeline.filter((e) => e.type === 'm.room.redaction').map((e) => e.redacts));
+    const keys = sim.timeline
+      .filter((e) => e.type === 'm.reaction' && !redacted.has(e.event_id) && (e.content['m.relates_to'] as { event_id: string }).event_id === q)
+      .map((e) => (e.content['m.relates_to'] as { key: string }).key);
+    expect(keys).toEqual(['👍']);
+    expect(await sim.logOf('EVENTS')).toMatch(/acknowledgement .*emoji/);
+  });
+
+  it('an off-topic question to the agent you were talking with still gets a real answer from the room', async () => {
+    const refuses = (t: string, prompt: string) =>
+      /天氣/.test(t) ? (prompt.includes('do not say so: answer [NO_REPLY]') ? '[NO_REPLY]' : 'EVENTS: 天氣我幫不上') : /玩|快閃|活動/.test(t) ? 'EVENTS: 三個活動' : '[NO_REPLY]';
+    const sim = createRoomSim([food(), events({ brain: refuses }), data({ brain: () => '[NO_REPLY]' })], HUMANS);
+    const a = await sim.say(PIKA, '這週末有什麼快閃活動');
+    await sim.run(30_000);
+    expect(sim.answersTo(a)).toEqual(['EVENTS']);
+    const q = await sim.say(PIKA, '倫敦今天天氣怎麼樣？');
+    await sim.run(120_000);
+    const answers = sim.answersTo(q);
+    expect(answers).toHaveLength(1);
+    expect(answers[0]).not.toBe('EVENTS');
+    expect(sim.generalCalls).toEqual(answers);
+  });
+});

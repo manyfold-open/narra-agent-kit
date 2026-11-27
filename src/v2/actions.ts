@@ -103,6 +103,7 @@ export function chatBehaviourNote(opts: {
       '- If it continues something you started (an answer to a question you asked, a follow-up to your last reply), it is yours. Answer it, even when it comes from a different person than the one you asked or minutes later, and even if it is only a word or two ("工作", "Holborn", "the second one"). Never answer [NO_REPLY] to an answer to your own question: carry on (do what you offered) or ask one short line to clarify.',
       '- If it continues another agent\'s conversation, leave it to that agent: [NO_REPLY].',
       '- Otherwise answer only if it is a real question or need you can clearly help with. If another agent in the room fits much better and nobody has answered, you may say so in one short line that names it with @ (for example "@Spotted London knows this better"), at most once per question.',
+      '- If you cannot help with it at all, do not say so: answer [NO_REPLY]. A reply like "I can only talk about X" counts as an answer and stops the room\'s stand-by from answering it.',
     );
   }
   return lines.join('\n');
