@@ -418,6 +418,8 @@ interface PendingTurn {
   v2StandbySettled?: boolean;
   /** v2 stand-by: the ask check's verdict (true = a real question or need; false = chatter). */
   v2StandbyAsk?: boolean;
+  /** v2 stand-by: already spread out by fit once after an agent let the message go. */
+  v2StandbyStaggered?: boolean;
 }
 
 /** A real question nobody claimed: the first elected agent answers after this long... */
@@ -3083,14 +3085,17 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         await this.removePendingTurn(turn.event.eventId);
         return;
       }
-      if (decision.reason === 'fallback' && turn.v2WaitingOn) {
+      const someoneLooked = eventIds.some((id) => (state.released?.[id] ?? 0) > 0);
+      if (decision.reason === 'fallback' && (turn.v2WaitingOn || (someoneLooked && !turn.v2StandbyStaggered))) {
         // Every stand-by was waiting on the same claim and sees it go at the same moment. Spread out
-        // again by fit, so the best one claims first and the others wait on its 👀.
+        // again by fit, so the best one claims first and the others wait on its 👀. A stand-by that
+        // comes due just after an agent looked and let go (it never saw the claim) spreads out too,
+        // or a weaker fit that happened to be due first would claim ahead of the best one.
         const fit = Math.min(0.99, Math.max(0, decision.score ?? 0));
         const jitter = hashFraction(`standby:${turn.event.eventId}:${spec.matrixId ?? spec.id}`) * 400;
         const waitMs = Math.round((1 - fit) * V2_STANDBY_STAGGER_MS + jitter);
         await appendDoLog(this.ctx.storage, `v2 standby ${turn.event.eventId}: ${turn.v2WaitingOn} released it, next in ${waitMs}ms`, nowMs, this.env);
-        await this.updatePendingTurn({ ...turn, v2Decision: decision, v2WaitingOn: undefined, dueAtMs: nowMs + waitMs });
+        await this.updatePendingTurn({ ...turn, v2Decision: decision, v2WaitingOn: undefined, v2StandbyStaggered: true, dueAtMs: nowMs + waitMs });
         return;
       }
       if (turn.v2WaitingOn) {
@@ -3104,6 +3109,7 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
       // every agent; without this, each stand-by would put up a 👀 and call its brain just to stay silent.
       const ask = await this.v2StandbyAskCheck(turn.event, context, spec);
       turn.v2StandbyAsk = ask;
+      await appendDoLog(this.ctx.storage, `v2 standby ask ${turn.event.eventId}: ${ask === undefined ? 'unknown' : ask}`, nowMs, this.env);
       if (ask === false) {
         await appendDoLog(this.ctx.storage, `v2 fallback skipped ${turn.event.eventId}: not an ask`, nowMs, this.env);
         await this.removePendingTurn(turn.event.eventId);
@@ -3326,13 +3332,17 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
 
       let action = parseBrainOutput(raw);
       nowMs = this.nowMs();
-      if (action.kind === 'silent' && decision.reason === 'fallback' && context.chatType === 'group' && turn.v2StandbyAsk === true && sentEnvelope) {
+      if (action.kind === 'silent' && decision.reason === 'fallback' && context.chatType === 'group' && turn.v2StandbyAsk !== false && sentEnvelope) {
+        // (Unknown counts as an ask here: the ask model failed open, and the margin floor already keeps
+        // chatter that looks equally close to everyone from reaching a stand-by brain.)
         // The room's stand-by for a real question, but its brain is limited to its own topic: answer with
         // the general model instead of leaving the question (or replying "I can only talk about X").
         const general = await runWorkersAiResilienceFallback(this.env.AI, this.env.AI_TRIAGE_MODEL, spec, sentEnvelope, replyLang, false);
         if (general && !isSilence(general)) {
           action = parseBrainOutput(general);
           await appendDoLog(this.ctx.storage, `v2 standby general answer ${turn.event.eventId}`, this.nowMs(), this.env);
+        } else {
+          await appendDoLog(this.ctx.storage, `v2 standby general answer ${turn.event.eventId}: none (${general === null ? 'unavailable' : 'silent'})`, this.nowMs(), this.env);
         }
       }
       if (
@@ -3416,7 +3426,8 @@ export class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = NarraGatewa
         // A better-fitting agent claimed while this brain was working: it answers, this one steps back.
         const stronger = await this.outrankedNow(turn, decision, eventIds, spec.matrixId);
         if (stronger) {
-          await this.releaseV2Claim(turn);
+          // Stepping back for a better fit is not "chose not to answer": it must not use up a stand-by try.
+          await this.releaseV2Claim(turn, CLAIM_RETRY_REASON);
           await appendDoLog(this.ctx.storage, `v2 outranked ${turn.event.eventId}: ${stronger} fits better`, this.nowMs(), this.env);
           await this.removePendingTurn(turn.event.eventId);
           return;
