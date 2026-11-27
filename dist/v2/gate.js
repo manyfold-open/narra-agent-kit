@@ -16,7 +16,7 @@ export const DEFAULT_WAKE_GATE_OPTIONS = {
     fallbackThreshold: 0.3,
     fallbackDelayMs: 20_000,
     fallbackSpreadMs: 8_000,
-    minRelevantMargin: 0.05,
+    minRelevantMargin: 0.07,
 };
 /**
  * How strongly a decision holds the message, sent with the 👀 claim. The highest live claim answers;
