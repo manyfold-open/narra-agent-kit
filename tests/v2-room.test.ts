@@ -527,7 +527,7 @@ describe('v2 room: chatter stays invisible', () => {
     expect(sim.answersTo(q)).toEqual([]);
     expect(claimsOn(sim, q)).toEqual([]);
     for (const name of ['FOOD', 'EVENTS', 'DATA', 'PENNY']) expect(sim.agent(name).brainCalls).toEqual([]);
-    expect(await sim.logOf('FOOD')).toMatch(/v2 skipped .*not an ask/);
+    expect(await sim.logOf('FOOD')).toMatch(/low_margin/);
   });
 
   it('a real ask that fits two agents equally still gets exactly one answer', async () => {
@@ -637,5 +637,75 @@ describe('v2 room: a new ask for another agent\'s speciality is not kept by the 
     const q = await sim.say(PIKA, '今晚 Soho 有什麼好吃的中餐？');
     await sim.run(120_000);
     expect(sim.answersTo(q)).toEqual(['FOOD']);
+  });
+});
+
+// Netmind London 2026-11-27 15:01–15:13 (kit 9f15ec3): agents looked at messages they never answered.
+// Hidden claims are invisible, but the brain call put "typing…" on screen, so people saw an agent
+// start and stop; and a repeated ask the agent had answered before got silence. A visible sign that
+// an agent is answering (typing, 👀, streamed text) must always end in a reply.
+describe('v2 room: no visible sign of answering without a reply', () => {
+  const redactedVisible = (sim: ReturnType<typeof createRoomSim>) => {
+    const redacted = new Set(sim.timeline.filter((e) => e.type === 'm.room.redaction').map((e) => e.redacts));
+    return sim.timeline.filter((e) => (e.type === 'm.reaction' || e.type === 'm.room.message') && redacted.has(e.event_id));
+  };
+
+  it('an agent that looks at the weather and stays silent never shows "typing…" (倫敦今天天氣怎麼樣？)', async () => {
+    const sim = createRoomSim([food(), events({ brain: () => '[NO_REPLY]' }), data(), penny({ bill: false })], HUMANS);
+    const q = await sim.say(PIKA, '倫敦今天天氣怎麼樣？');
+    await sim.run(120_000);
+    expect(await sim.logOf('EVENTS')).toMatch(/v2 silent/);
+    expect(sim.answersTo(q)).toEqual([]);
+    for (const a of ['FOOD', 'EVENTS', 'DATA', 'PENNY']) expect(sim.agent(a).typingOn).toEqual([]);
+    expect(sim.timeline.filter((e) => e.type === 'm.reaction')).toEqual([]);
+  });
+
+  it('the agent that steps back shows nothing; only the answerer is seen (Soho 點心)', async () => {
+    const sim = createRoomSim(
+      [
+        food({ brain: (t) => (/點心/.test(t) ? 'FOOD: Soho 三家點心' : '[NO_REPLY]'), extra: { v2: later } }),
+        events({ brain: () => '[NO_REPLY]', extra: { v2: first } }),
+      ],
+      HUMANS,
+    );
+    const q = await sim.say(PIKA, '推薦一家 Soho 的點心');
+    await sim.run(120_000);
+    expect(sim.answersTo(q)).toEqual(['FOOD']);
+    expect(sim.agent('EVENTS').typingOn).toEqual([]);
+    expect(redactedVisible(sim)).toEqual([]);
+  });
+
+  it('text that already started showing is never taken back, even when the room rule turns it into an emoji', async () => {
+    const long = '不客氣！很高興能幫上忙，這週末的快閃活動都很熱門，記得早點出門排隊，也可以先在官網確認營業時間和票價，祝你玩得開心！有任何新活動消息，我也會第一時間告訴你，週末愉快！';
+    const polite = (t: string) => (/謝謝/.test(t) ? { streamed: long, text: long } : /玩|快閃|活動/.test(t) ? 'EVENTS: 三個活動' : '[NO_REPLY]');
+    const sim = createRoomSim([food(), events({ brain: polite }), data()], HUMANS);
+    const a = await sim.say(PIKA, '這週末有什麼快閃活動');
+    await sim.run(30_000);
+    expect(sim.answersTo(a)).toEqual(['EVENTS']);
+    const q = await sim.say(PIKA, '謝謝');
+    await sim.run(60_000);
+    expect(await sim.logOf('EVENTS')).toMatch(/your_conversation/);
+    expect(sim.timeline.some((e) => e.type === 'm.room.message' && e.sender === sim.agent('EVENTS').id && String(e.content.body).startsWith('不客氣'))).toBe(true);
+    expect(redactedVisible(sim)).toEqual([]);
+    expect(sim.answersTo(q)).toEqual(['EVENTS']);
+  });
+
+  it('a question asked again is answered again, not met with silence (週末吃完飯可以去哪裡逛逛 ×2)', async () => {
+    const seen = new Set<string>();
+    const eventsBrain = (t: string, prompt: string) => {
+      if (!/逛|玩|快閃|活動/.test(t)) return '[NO_REPLY]';
+      // Like the live brain: it already recommended these, so it stays silent unless told a repeat needs an answer.
+      if (seen.has(t) && !prompt.includes('Never answer a repeated question with [NO_REPLY]')) return '[NO_REPLY]';
+      seen.add(t);
+      return 'EVENTS: 三個活動';
+    };
+    const sim = createRoomSim([food(), events({ brain: eventsBrain }), data()], HUMANS);
+    const a = await sim.say(PIKA, '這週末有什麼快閃活動');
+    await sim.run(60_000);
+    expect(sim.answersTo(a)).toEqual(['EVENTS']);
+    await sim.advance(120_000);
+    const b = await sim.say(PIKA, '這週末有什麼快閃活動');
+    await sim.run(60_000);
+    expect(sim.answersTo(b)).toEqual(['EVENTS']);
   });
 });

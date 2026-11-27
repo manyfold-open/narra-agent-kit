@@ -447,7 +447,7 @@ function sse(text: string): Response {
 const ROOM = '!zacktest:matrix.netmind.chat';
 
 function setup(
-  brainReply: string | (() => string | Response),
+  brainReply: string | (() => string | Response | Promise<string | Response>),
   extraConfig: Partial<NarraGatewayConfig<NarraGatewayEnv>> = {},
   extraEnv: Partial<NarraGatewayEnv> = {},
 ) {
@@ -475,7 +475,7 @@ function setup(
       const req = JSON.parse(String(init?.body ?? '{}')) as { params: { message: { parts: Array<{ text: string }> } } };
       envelopes.push(req.params.message.parts[0].text);
       rawRequests.push(String(init?.body ?? ''));
-      const reply = typeof brainReply === 'function' ? brainReply() : brainReply;
+      const reply = typeof brainReply === 'function' ? await brainReply() : brainReply;
       return reply instanceof Response ? reply : sse(reply);
     }
     return new Response('not found', { status: 404 });
@@ -750,9 +750,9 @@ describe('v2 pipeline end to end', () => {
 
   it('does not post a brain reply when another agent answered while it was thinking', async () => {
     let t!: ReturnType<typeof setup>;
-    t = setup(() => {
+    t = setup(async () => {
       // The peer's answer arrives while the brain is still working.
-      void t.post([
+      await t.post([
         {
           event_id: '$peer_answer',
           sender: SPOTTED,
@@ -913,10 +913,26 @@ describe('v2 fixes from the 11-27 retest', () => {
   it('looks relevant but no closer to this agent than the others: goes last, and only after the ask check', async () => {
     const e = ev('$chat', '哈哈好喔', NOW);
     const d = await decideWake({ event: e, context: ctx(), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.76, rawScore: 0.76, margin: 0.02, mine: true }) });
-    expect(d).toMatchObject({ wake: true, reason: 'relevant', askCheck: true });
+    // Chatter does not saturate relevance (0.76): dropped without even an ask check.
+    expect(d).toMatchObject({ wake: false, reason: 'low_margin' });
+    const tie = await decideWake({ event: ev('$tie', '吃完飯有什麼市集可以逛', NOW), context: ctx(), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 1, rawScore: 1, margin: 0.02, mine: true }) });
+    expect(tie).toMatchObject({ wake: true, reason: 'relevant', askCheck: true });
     const real = await decideWake({ event: ev('$ask', '推薦一家 Soho 的點心', NOW), context: ctx(), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 1, rawScore: 1, margin: 0.155, mine: true }) });
     expect(real).toMatchObject({ wake: true, reason: 'relevant' });
     expect(real.askCheck).toBeUndefined();
-    expect(real.delayMs).toBeLessThan(d.delayMs);
+    expect(real.delayMs).toBeLessThan(tie.delayMs);
+  });
+});
+
+describe('v2 fixes from Netmind London 15:01–15:13', () => {
+  it('a need every agent is faintly close to is not checked as an ask; a two-agent ask still is', async () => {
+    const weak = await decideWake({ event: ev('$hungry', '我好餓', NOW), context: ctx(), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.64, rawScore: 0.64, margin: 0.001, mine: true }) });
+    expect(weak).toMatchObject({ wake: false, reason: 'low_margin' });
+    const both = await decideWake({ event: ev('$both', '週末吃完飯可以去哪裡逛逛', NOW), context: ctx(), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 1, rawScore: 1, margin: 0.054, mine: true }) });
+    expect(both).toMatchObject({ wake: true, reason: 'relevant', askCheck: true });
+  });
+
+  it('tells the brain a repeated question still needs an answer', () => {
+    expect(chatBehaviourNote({ chatType: 'group', direct: false })).toMatch(/Never answer a repeated question with \[NO_REPLY\]/);
   });
 });

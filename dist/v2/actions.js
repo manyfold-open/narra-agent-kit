@@ -56,6 +56,7 @@ export function chatBehaviourNote(opts) {
             : 'Direct chat: be helpful and natural; a little longer is fine, but stay under 2000 characters.',
         'Answer only current_message. earlier_unanswered_messages is background so you understand the room: do not answer those yourself (another agent may be on it). If one is clearly yours and has waited a long time, you may at most ask in one short line whether they still want it.',
         'Do not repeat recommendations, facts or questions listed in your_recent_messages_here unless the person asks for them again. Ask at most one question, and only if you truly need the answer.',
+        'If the person asks the same thing again, they still want an answer: give new options if you have them, otherwise a short recap of the best one. Never answer a repeated question with [NO_REPLY].',
         'Thanks, praise, "ok", "got it" and similar acknowledgements: always answer with [REACT <emoji>] alone, never with text. This rule comes first, even right after your own question or reading.',
         'Start your output with ONE directive line only when it applies:',
         '[NO_REPLY] - stay silent: people are chatting among themselves, another agent already covers it, or you have nothing useful to add.',
