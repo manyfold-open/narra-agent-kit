@@ -23,8 +23,6 @@ export declare function chatBehaviourNote(opts: {
     direct: boolean;
     replyLanguage?: string;
     proactive?: boolean;
-    /** Woken as the room's stand-by: nobody answered and the better fits chose not to. */
-    fallback?: boolean;
     /** Another agent's reply to current_message pointed to this agent. */
     handoff?: boolean;
 }): string;

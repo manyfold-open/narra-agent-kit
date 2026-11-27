@@ -44,11 +44,6 @@ export interface V2RoomState {
     claimReactions: Record<string, string>;
     /** target event id -> how many claims on it were released without an answer */
     released?: Record<string, number>;
-    /**
-     * target event id -> how many stand-by (fallback) claims on it were released without an answer:
-     * the room's last resort looked and stayed silent, so no other stand-by should try.
-     */
-    releasedFallback?: Record<string, number>;
 }
 export declare function emptyRoomState(): V2RoomState;
 /** Live claims on `target`, in the order they were made. */

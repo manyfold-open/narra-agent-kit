@@ -47,26 +47,6 @@ const GROUP_FALLBACK_STEP_MS = 8_000;
 const GROUP_FALLBACK_MAX_RANK = 3;
 /** v2: gap between agents' turns to answer an unaddressed crisis message, in room-agent order. */
 const V2_CRISIS_STEP_MS = 2_500;
-/**
- * v2: a stand-by that resumes after the agent it waited on let go waits again, (1 - fit) x this, so
- * the stand-bys go one at a time, best fit first, instead of all calling their brains at once.
- */
-const V2_STANDBY_STAGGER_MS = 30_000;
-/**
- * Appended to the room envelope when a stand-by answers with the general model. The envelope offers
- * [NO_REPLY] and frames the agent's own speciality, so without this the general model stays silent too.
- */
-const V2_STANDBY_GENERAL_NOTE = 'Final instruction (overrides chat_behaviour): current_message is a real question that nobody in the room answered, and you are answering it now. ' +
-    'Answer it directly in 1-3 short sentences from general knowledge, even though it is outside your speciality. If it needs live data you cannot check (weather, prices, news), ' +
-    'say so plainly and give the best general answer plus where to check. Never output [NO_REPLY], never only refuse, never point to another agent.';
-/**
- * v2: a stand-by claims, then waits this long before calling its brain: stand-bys with similar fit
- * reach the room within a second or two of each other, and only the strongest (then earliest) claim
- * goes on. The others step back without it counting as a look.
- */
-const V2_STANDBY_SETTLE_MS = 2_500;
-/** v2: stand-bys that may look at one message before the rest give up (chatter costs at most this many). */
-const V2_MAX_STANDBY_TRIES = 2;
 /** v2: how often a turn waiting on another agent's 👀 checks whether it answered or let go. */
 const V2_CLAIM_RECHECK_MS = 2_000;
 const GROUP_FALLBACK_NOTE = 'No other AI agent in this group answered this question. Answer it yourself, briefly and helpfully, ' +
@@ -2132,8 +2112,8 @@ export class BaseNarraRoomCoordinator {
         });
         return { decision, ...(relevance ? { relevance } : {}) };
     }
-    /** Stand-by ask check: true/false from the ask model, undefined when it is unavailable (fail open). */
-    async v2StandbyAskCheck(event, context, spec) {
+    /** Ask check: true/false from the ask model, undefined when it is unavailable (fail open). */
+    async v2AskCheck(event, context, spec) {
         if (this.getConfig().v2?.standbyAskCheck === false)
             return undefined;
         try {
@@ -2367,43 +2347,22 @@ export class BaseNarraRoomCoordinator {
                 await this.updatePendingTurn({ ...turn, v2Decision: decision, v2WaitingOn: holder, dueAtMs: nowMs + V2_CLAIM_RECHECK_MS });
                 return;
             }
-            const standByTries = Math.max(0, ...eventIds.map((id) => state.releasedFallback?.[id] ?? 0));
-            if (decision.reason === 'fallback' && standByTries >= V2_MAX_STANDBY_TRIES) {
-                // Stand-bys already looked and stayed silent (chatter, most likely): do not keep trying down the
-                // list. A better fit that stayed silent is different: the stand-bys are there for that.
-                await appendDoLog(this.ctx.storage, `v2 fallback passed ${turn.event.eventId}: ${standByTries} stand-bys chose not to answer`, nowMs, this.env);
-                await this.removePendingTurn(turn.event.eventId);
-                return;
-            }
-            const someoneLooked = eventIds.some((id) => (state.released?.[id] ?? 0) > 0);
-            if (decision.reason === 'fallback' && (turn.v2WaitingOn || (someoneLooked && !turn.v2StandbyStaggered))) {
-                // Every stand-by was waiting on the same claim and sees it go at the same moment. Spread out
-                // again by fit, so the best one claims first and the others wait on its 👀. A stand-by that
-                // comes due just after an agent looked and let go (it never saw the claim) spreads out too,
-                // or a weaker fit that happened to be due first would claim ahead of the best one.
-                const fit = Math.min(0.99, Math.max(0, decision.score ?? 0));
-                const jitter = hashFraction(`standby:${turn.event.eventId}:${spec.matrixId ?? spec.id}`) * 400;
-                const waitMs = Math.round((1 - fit) * V2_STANDBY_STAGGER_MS + jitter);
-                await appendDoLog(this.ctx.storage, `v2 standby ${turn.event.eventId}: ${turn.v2WaitingOn} released it, next in ${waitMs}ms`, nowMs, this.env);
-                await this.updatePendingTurn({ ...turn, v2Decision: decision, v2WaitingOn: undefined, v2StandbyStaggered: true, dueAtMs: nowMs + waitMs });
-                return;
-            }
             if (turn.v2WaitingOn) {
                 await appendDoLog(this.ctx.storage, `v2 resume ${turn.event.eventId}: ${turn.v2WaitingOn} released it`, nowMs, this.env);
                 turn.v2WaitingOn = undefined;
             }
         }
-        if (decision.reason === 'fallback' && context.chatType === 'group' && !turn.v2ClaimEventId && turn.v2StandbyAsk === undefined) {
-            // A stand-by takes a message only if it is a real question or need. Chatter often scores close to
-            // every agent; without this, each stand-by would put up a 👀 and call its brain just to stay silent.
-            const ask = await this.v2StandbyAskCheck(turn.event, context, spec);
-            turn.v2StandbyAsk = ask;
-            await appendDoLog(this.ctx.storage, `v2 standby ask ${turn.event.eventId}: ${ask === undefined ? 'unknown' : ask}`, nowMs, this.env);
+        if (decision.askCheck && context.chatType === 'group' && !turn.v2ClaimEventId && turn.v2AskVerdict === undefined) {
+            // Chatter sits equally close to every agent: without this, each would claim and call its brain
+            // just to stay silent. A real ask that fits two agents passes and the better claim answers.
+            const ask = await this.v2AskCheck(turn.event, context, spec);
+            await appendDoLog(this.ctx.storage, `v2 ask check ${turn.event.eventId}: ${ask === undefined ? 'unknown' : ask}`, nowMs, this.env);
             if (ask === false) {
-                await appendDoLog(this.ctx.storage, `v2 fallback skipped ${turn.event.eventId}: not an ask`, nowMs, this.env);
+                await appendDoLog(this.ctx.storage, `v2 skipped ${turn.event.eventId}: not an ask`, nowMs, this.env);
                 await this.removePendingTurn(turn.event.eventId);
                 return;
             }
+            turn.v2AskVerdict = ask ?? true;
             await this.updatePendingTurn({ ...turn, v2Decision: decision });
         }
         try {
@@ -2431,28 +2390,6 @@ export class BaseNarraRoomCoordinator {
                     await this.updatePendingTurn(turn);
                 }
             }
-            if (decision.reason === 'fallback' && context.chatType === 'group' && turn.v2ClaimEventId) {
-                if (!turn.v2StandbySettled) {
-                    // Let the other stand-bys' claims arrive before calling the brain.
-                    await this.updatePendingTurn({ ...turn, v2Decision: decision, v2StandbySettled: true, dueAtMs: this.nowMs() + V2_STANDBY_SETTLE_MS });
-                    return;
-                }
-                const latest = (await this.ctx.storage.get('v2State')) ?? emptyRoomState();
-                const peer = peerAnswered(context.recentHistory, eventIds, spec.matrixId);
-                const tries = Math.max(0, ...eventIds.map((id) => latest.releasedFallback?.[id] ?? 0));
-                const stronger = peer ? undefined : await this.outrankedNow(turn, decision, eventIds, spec.matrixId);
-                if (peer || stronger || tries >= V2_MAX_STANDBY_TRIES) {
-                    await this.releaseV2Claim(turn, CLAIM_RETRY_REASON);
-                    if (stronger && !peer && tries < V2_MAX_STANDBY_TRIES) {
-                        await appendDoLog(this.ctx.storage, `v2 standby ${turn.event.eventId}: ${stronger} goes first`, this.nowMs(), this.env);
-                        await this.updatePendingTurn({ ...turn, v2Decision: decision, v2StandbySettled: false, v2WaitingOn: stronger, dueAtMs: this.nowMs() + V2_CLAIM_RECHECK_MS });
-                        return;
-                    }
-                    await appendDoLog(this.ctx.storage, `v2 fallback passed ${turn.event.eventId}: ${peer ? `answered by ${peer}` : `${tries} stand-bys chose not to answer`}`, this.nowMs(), this.env);
-                    await this.removePendingTurn(turn.event.eventId);
-                    return;
-                }
-            }
             const safety = cfg.v2?.safetyReply
                 ? await Promise.resolve(cfg.v2.safetyReply(this.env, turn.event, context, { replyLang: replyLangForHooks })).catch(() => null)
                 : null;
@@ -2469,7 +2406,6 @@ export class BaseNarraRoomCoordinator {
                 void this.matrixOp({ op: 'typing', roomId, typing: true }).catch(() => undefined);
             }, TYPING_REFRESH_MS);
             let raw = '';
-            let sentEnvelope = '';
             // Reply in the asker's language: zh-Hant, zh-Hans or English; anything else in English.
             const replyLang = replyLanguageFor(turn.event.text ?? '', {
                 mentionNames: [spec.name, ...(spec.aliases ?? []), ...context.members.flatMap((m) => (m.displayName ? [m.displayName] : []))],
@@ -2557,7 +2493,7 @@ export class BaseNarraRoomCoordinator {
                 ]);
                 if (!cred || !cred.url || !cred.token)
                     throw new A2AError('No A2A credential available for Narra gateway.', false);
-                const envelope = (sentEnvelope = buildPromptEnvelope({
+                const envelope = buildPromptEnvelope({
                     event: turn.event,
                     context,
                     decision: triageLike,
@@ -2582,13 +2518,12 @@ export class BaseNarraRoomCoordinator {
                         chat_behaviour: chatBehaviourNote({
                             chatType: context.chatType,
                             direct: decision.direct,
-                            fallback: decision.reason === 'fallback',
                             handoff: decision.reason === 'handoff',
                             proactive: Boolean(turn.v2Proactive),
                             replyLanguage: languageName(replyLang),
                         }),
                     },
-                }));
+                });
                 const res = await runManyfoldA2ATurnWithMeta({
                     credential: { rpcUrl: cred.url, token: cred.token, label: cred.label ?? spec.name },
                     envelope,
@@ -2611,20 +2546,6 @@ export class BaseNarraRoomCoordinator {
             }
             let action = parseBrainOutput(raw);
             nowMs = this.nowMs();
-            if (action.kind === 'silent' && decision.reason === 'fallback' && context.chatType === 'group' && turn.v2StandbyAsk !== false && sentEnvelope) {
-                // (Unknown counts as an ask here: the ask model failed open, and the margin floor already keeps
-                // chatter that looks equally close to everyone from reaching a stand-by brain.)
-                // The room's stand-by for a real question, but its brain is limited to its own topic: answer with
-                // the general model instead of leaving the question (or replying "I can only talk about X").
-                const general = await runWorkersAiResilienceFallback(this.env.AI, this.env.AI_TRIAGE_MODEL, spec, `${sentEnvelope}\n\n${V2_STANDBY_GENERAL_NOTE}`, replyLang, false);
-                if (general && !isSilence(general)) {
-                    action = parseBrainOutput(general);
-                    await appendDoLog(this.ctx.storage, `v2 standby general answer ${turn.event.eventId}`, this.nowMs(), this.env);
-                }
-                else {
-                    await appendDoLog(this.ctx.storage, `v2 standby general answer ${turn.event.eventId}: none (${general === null ? 'unavailable' : 'silent'})`, this.nowMs(), this.env);
-                }
-            }
             if (action.kind === 'reply' &&
                 !action.mode &&
                 context.chatType === 'group' &&
@@ -2632,7 +2553,7 @@ export class BaseNarraRoomCoordinator {
                 decision.reason === 'your_conversation') {
                 // Thanks, "ok" or a laugh to the agent the person was just talking with: an emoji, never text.
                 // Some brains' own instructions insist on a polite line, so the room rule is enforced here.
-                const ask = await this.v2StandbyAskCheck(turn.event, context, spec);
+                const ask = await this.v2AskCheck(turn.event, context, spec);
                 if (ask === false) {
                     action = { kind: 'react', emoji: '👍' };
                     await appendDoLog(this.ctx.storage, `v2 acknowledgement ${turn.event.eventId}: text turned into an emoji`, this.nowMs(), this.env);
@@ -2710,7 +2631,7 @@ export class BaseNarraRoomCoordinator {
                 // A better-fitting agent claimed while this brain was working: it answers, this one steps back.
                 const stronger = await this.outrankedNow(turn, decision, eventIds, spec.matrixId);
                 if (stronger) {
-                    // Stepping back for a better fit is not "chose not to answer": it must not use up a stand-by try.
+                    // Stepping back for a better fit is not "chose not to answer".
                     await this.releaseV2Claim(turn, CLAIM_RETRY_REASON);
                     await appendDoLog(this.ctx.storage, `v2 outranked ${turn.event.eventId}: ${stronger} fits better`, this.nowMs(), this.env);
                     await this.removePendingTurn(turn.event.eventId);

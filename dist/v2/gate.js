@@ -13,15 +13,11 @@ export const DEFAULT_WAKE_GATE_OPTIONS = {
     peerConversationThreshold: 0.65,
     maxDelayMs: 4_000,
     minDelayMs: 600,
-    fallbackThreshold: 0.3,
-    fallbackDelayMs: 20_000,
-    fallbackSpreadMs: 8_000,
     minRelevantMargin: 0.07,
 };
 /**
  * How strongly a decision holds the message, sent with the 👀 claim. The highest live claim answers;
- * arrival order only breaks ties. Continuing a conversation beats topical fit, and a confident fit
- * beats a stand-by fallback.
+ * arrival order only breaks ties. Continuing a conversation beats topical fit.
  */
 /** Margin (own cosine minus best not-example cosine) at which an agent counts as a clear winner. */
 const CLEAR_MARGIN = 0.3;
@@ -51,8 +47,6 @@ function rawClaimPriority(decision) {
             // Relevance saturates at 1 for every agent that fits at all, so two confident agents would tie
             // and the faster Worker would win. The margin over the other agents' asks separates them.
             return 1 + score * 0.5 + marginFit(decision.margin, score) * 0.5;
-        case 'fallback':
-            return score;
         default:
             return 1;
     }
@@ -112,17 +106,6 @@ export async function decideWake(input) {
         return drop('mode_mention');
     if (input.budgetExhausted)
         return drop('budget');
-    /** A stand-by (fallback) decision for `fit`, or undefined when it is too far off. */
-    const standBy = (fit, needed) => {
-        if (!(opts.fallbackThreshold > 0) || fit < opts.fallbackThreshold)
-            return undefined;
-        // Below 1 on purpose: a stand-by never outranks an agent that goes first (claimPriority).
-        const capped = Math.min(fit, 0.99);
-        const closeness = Math.min(1, Math.max(0, (capped - opts.fallbackThreshold) / Math.max(0.01, needed - opts.fallbackThreshold)));
-        const jitter = hashFraction(`fallback:${event.eventId}:${selfId ?? spec.id}`) * 500;
-        const delayMs = Math.round(opts.fallbackDelayMs - closeness * opts.fallbackSpreadMs + jitter);
-        return { wake: true, reason: 'fallback', delayMs, claim: true, direct: false, score: capped };
-    };
     // Who this message most likely continues with, judged from the room (the same for every agent):
     // the agent whose question is still waiting for an answer, from anyone, else the agent that was
     // just talking with this sender.
@@ -139,31 +122,30 @@ export async function decideWake(input) {
     if (partner && partner === selfId) {
         // Short follow-ups ("Holborn", "the second one?") stay with this agent even when they look
         // unrelated, but not when the person clearly moved on to another agent's topic.
-        const { score, notMine, rawScore } = await getScore();
+        const { score, notMine } = await getScore();
         if (!notMine) {
             const reason = owner?.via === 'open_question' ? 'answers_your_question' : 'your_conversation';
             return { wake: true, reason, delayMs: 0, claim: true, direct: false, score };
         }
-        // The person moved to another agent's topic: that agent goes first, but this one still stands by
-        // in case nobody takes it (it knows the conversation).
-        return standBy(rawScore ?? score, opts.threshold) ?? drop('topic_moved_on', score);
+        // The person moved to another agent's topic: that agent answers, or nobody does.
+        return drop('topic_moved_on', score);
     }
-    const { score, mine, notMine, rawScore, margin } = await getScore();
+    const { score, mine, margin } = await getScore();
     // The sender talking with another agent raises the bar, so follow-ups stay in that thread. But when
     // this message is closer to this agent's asks than to the other agents' (the topic moved here, and
     // the partner drops it as `topic_moved_on`), the usual bar applies or nobody would answer.
     const inPeerThread = Boolean(partner) && !mine;
     const needed = inPeerThread ? opts.peerConversationThreshold : opts.threshold;
     if (score < needed) {
-        // Not sure enough to go first, but close: stand by in case nobody else takes it. "Closer to another
-        // agent's asks" only stops going first: the right agent is sometimes misjudged that way (a dataset
-        // question scored as another agent's), and a room where every stand-by is zeroed answers nobody.
-        const standByScore = notMine ? Math.max(score, rawScore ?? 0) : score;
-        return standBy(standByScore, needed) ?? drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
+        // Not this agent's ask. Nobody stands in for the right agent: an unowned message gets no answer
+        // unless someone @mentions an agent (Zack, 2026-11-27: "沒人 ＠ 就不回").
+        return drop(inPeerThread ? 'peer_conversation' : 'low_relevance', score);
     }
     if (margin !== undefined && margin < opts.minRelevantMargin) {
-        // Looks relevant, but no closer to this agent than to the others: chatter, or nobody's topic.
-        return standBy(Math.min(score, rawScore ?? score), needed) ?? drop('low_margin', score);
+        // Looks relevant, but no closer to this agent than to the others: chatter, or a real ask that fits
+        // two agents. Go after the clear fits, and only once the ask model says it is a real ask.
+        const jitter = hashFraction(`${event.eventId}:${selfId ?? spec.id}`) * 150;
+        return { wake: true, reason: 'relevant', delayMs: Math.round(opts.maxDelayMs + 400 + jitter), claim: true, direct: false, score, margin, askCheck: true };
     }
     // Higher relevance goes first. Relevance saturates at 1, so the margin over the other agents' asks
     // orders equally confident agents; a per-agent hash breaks exact ties.

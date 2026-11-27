@@ -54,8 +54,6 @@ export function chatBehaviourNote(opts: {
   direct: boolean;
   replyLanguage?: string;
   proactive?: boolean;
-  /** Woken as the room's stand-by: nobody answered and the better fits chose not to. */
-  fallback?: boolean;
   /** Another agent's reply to current_message pointed to this agent. */
   handoff?: boolean;
 }): string {
@@ -88,15 +86,6 @@ export function chatBehaviourNote(opts: {
     );
     return lines.join('\n');
   }
-  if (opts.chatType === 'group' && opts.fallback) {
-    lines.push(
-      'Nobody in the room has answered current_message, and the agents that fit it better chose not to. You are the room\'s stand-by.',
-      '- If it is a real question or need, answer it yourself, briefly and helpfully, even if it is outside your speciality: general knowledge is fine, and say plainly if you cannot check live information. Do not only point to another agent.',
-      '- If your own instructions only let you talk about your topic, do not reply that you cannot help: answer [NO_REPLY], and a general answer is given instead.',
-      '- If it is chatter, a reaction or an acknowledgement, or it continues a conversation another agent is clearly still handling, answer [NO_REPLY].',
-    );
-    return lines.join('\n');
-  }
   if (opts.chatType === 'group' && !opts.direct) {
     lines.push(
       'Nobody @mentioned you, so judge from the room who current_message is for. Read your_open_question, sender_is_talking_with and conversation_so_far:',
@@ -104,7 +93,7 @@ export function chatBehaviourNote(opts: {
       '- If it continues another agent\'s conversation, leave it to that agent: [NO_REPLY].',
       '- Otherwise answer only if it is a real question or need you can clearly help with. If another agent in the room fits much better and nobody has answered, you may say so in one short line that names it with @ (for example "@Spotted London knows this better"), at most once per question.',
       '- If current_message asks for something another agent in this room is for (food when you do events, events when you do food, and so on), and all you could offer is a substitute from your own speciality, answer [NO_REPLY], even when the person was just talking with you: that agent is waiting and answers as soon as you step back. Never answer "I don\'t have X, but here is Y".',
-      '- If you cannot help with it at all, do not say so: answer [NO_REPLY]. A reply like "I can only talk about X" counts as an answer and stops the room\'s stand-by from answering it.',
+      '- If you cannot help with it at all, do not say so: answer [NO_REPLY]. Never reply "I can only talk about X".',
     );
   }
   return lines.join('\n');

@@ -61,11 +61,6 @@ export interface V2RoomState {
   claimReactions: Record<string, string>;
   /** target event id -> how many claims on it were released without an answer */
   released?: Record<string, number>;
-  /**
-   * target event id -> how many stand-by (fallback) claims on it were released without an answer:
-   * the room's last resort looked and stayed silent, so no other stand-by should try.
-   */
-  releasedFallback?: Record<string, number>;
 }
 
 export function emptyRoomState(): V2RoomState {
@@ -107,16 +102,11 @@ export function applyClaimRedaction(state: V2RoomState, redactedEventId: string,
   const target = state.claimReactions[redactedEventId];
   if (!target) return false;
   delete state.claimReactions[redactedEventId];
-  const releasedClaim = claimsOn(state, target).find((c) => c.reactionEventId === redactedEventId);
-  const releasedPriority = releasedClaim && typeof releasedClaim.priority === 'number' ? releasedClaim.priority : undefined;
   const left = claimsOn(state, target).filter((c) => c.reactionEventId !== redactedEventId);
   if (left.length > 0) state.claims[target] = left;
   else delete state.claims[target];
   if (reason !== CLAIM_RETRY_REASON) {
     state.released = { ...(state.released ?? {}), [target]: (state.released?.[target] ?? 0) + 1 };
-    if (releasedPriority !== undefined && releasedPriority < 1) {
-      state.releasedFallback = { ...(state.releasedFallback ?? {}), [target]: (state.releasedFallback?.[target] ?? 0) + 1 };
-    }
   }
   return true;
 }
@@ -128,7 +118,7 @@ export function pruneClaims(state: V2RoomState, nowMs: number, keepMs = 30 * 60_
     else delete state.claims[target];
   }
   // Released counts only matter while the message is fresh; keep the newest few.
-  for (const map of [state.released, state.releasedFallback]) {
+  for (const map of [state.released]) {
     if (!map) continue;
     const keys = Object.keys(map);
     for (const k of keys.slice(0, Math.max(0, keys.length - 200))) delete map[k];

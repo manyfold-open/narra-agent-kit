@@ -86,8 +86,12 @@ function sse(text: string): Response {
 const TOPICS: Array<[RegExp, number[]]> = [
   // Live zack test 2026-11-27: chatter is equally close to every profile (bge-m3 ≈ 0.55 to all).
   [/哈哈好喔|謝謝你們/, [1, 1, 1, 0, 0, 0]],
-  // Netmind London 2026-11-27: the events agent outscored the food agent on a Chinese food ask.
-  [/好吃的中餐/, [0.8, 1, 0, 0, 0, 0]],
+  // zack test 2026-11-27 13:35: the food agent is the clear fit (cos .712 vs not .6) right after an events chat.
+  [/好吃的中餐/, [1, 0.85, 0, 0, 0, 0]],
+  // Netmind London Round 4 (2026-11-27): nobody's topic, but bge-m3 gives every agent a weak fit
+  // (the food agent took it from the stand-by chain); a bare 「肚子餓了」 also sits near the ledger agent.
+  [/iPhone|螢幕摔破/i, [0.5, 0.4, 0.4, 0.4, 0.6, 0]],
+  [/^肚子餓了$/, [1, 0, 0, 0.5, 0, 0]],
   // Live zack test 17:39: nobody's topic, several stand-bys at once.
   [/會下雨/, [0, 0.7, 0.5, 0, 0.5]],
   [/general helper/, [0, 0, 0, 0, 1]],
