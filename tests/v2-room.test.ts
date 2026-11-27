@@ -597,3 +597,63 @@ describe('v2 room: the conversation owner thanks with an emoji and never just re
     expect(sim.generalCalls).toEqual(answers);
   });
 });
+
+// Netmind London live test 2026-11-27 12:25–12:36 (kit 12bcb57): ten visible 👀 were put up and
+// taken back in front of real people. A visible 👀 must mean "this agent is answering".
+describe('v2 room: people never see a 👀 that is taken back', () => {
+  const visibleEyesTakenBack = (sim: ReturnType<typeof createRoomSim>) => {
+    const redacted = new Set(sim.timeline.filter((e) => e.type === 'm.room.redaction').map((e) => e.redacts));
+    return sim.timeline.filter((e) => e.type === 'm.reaction' && redacted.has(e.event_id));
+  };
+  const visibleEyesOn = (sim: ReturnType<typeof createRoomSim>, q: string) => {
+    const redacted = new Set(sim.timeline.filter((e) => e.type === 'm.room.redaction').map((e) => e.redacts));
+    return sim.timeline
+      .filter((e) => e.type === 'm.reaction' && !redacted.has(e.event_id))
+      .filter((e) => (e.content['m.relates_to'] as { event_id: string; key: string }).event_id === q)
+      .filter((e) => (e.content['m.relates_to'] as { key: string }).key === '👀')
+      .map((e) => e.sender);
+  };
+
+  it('chatter after an answer: the owner looks and stays silent, nothing visible', async () => {
+    const sim = createRoomSim([food(), events(), data(), penny({ bill: false })], HUMANS);
+    const a = await sim.say(PIKA, '這週末有什麼快閃活動');
+    await sim.run(30_000);
+    expect(sim.answersTo(a)).toEqual(['EVENTS']);
+    const q = await sim.say(PIKA, '哈哈好累');
+    await sim.run(90_000);
+    expect(sim.answersTo(q)).toEqual([]);
+    expect(visibleEyesTakenBack(sim)).toEqual([]);
+    expect(visibleEyesOn(sim, q)).toEqual([]);
+  });
+
+  it('the agent that fits first stays silent, the next one answers: one 👀, from the answerer', async () => {
+    const sim = createRoomSim([food(), events({ brain: () => '[NO_REPLY]' })], HUMANS);
+    const q = await sim.say(ZACK, '今晚 Soho 有什麼好吃的中餐？');
+    await sim.run(120_000);
+    expect(await sim.logOf('EVENTS')).toMatch(/wake=true relevant/);
+    expect(sim.answersTo(q)).toEqual(['FOOD']);
+    expect(visibleEyesTakenBack(sim)).toEqual([]);
+    expect(visibleEyesOn(sim, q)).toEqual([sim.agent('FOOD').id]);
+  });
+
+  it('several stand-bys sort themselves out without any visible 👀 coming and going', async () => {
+    const sim = createRoomSim(
+      [food(), events(), data({ brain: (_t, prompt) => (prompt.includes('stand-by') ? 'DATA: 今天多雲，帶把傘' : '[NO_REPLY]') }), penny({ bill: false })],
+      HUMANS,
+    );
+    const q = await sim.say(PIKA, '倫敦今天天氣怎麼樣？');
+    await sim.run(150_000);
+    expect(sim.answersTo(q)).toHaveLength(1);
+    expect(visibleEyesTakenBack(sim)).toEqual([]);
+    expect(visibleEyesOn(sim, q)).toHaveLength(1);
+  });
+
+  it('a message after an agent question that it does not take: the question-asker looks without a visible 👀', async () => {
+    const sim = createRoomSim([food(), events(), data(), fortune()], HUMANS3);
+    await askFortune(sim);
+    const q = await sim.say(PIKA, '今天運勢適合出門嗎');
+    await sim.run(120_000);
+    expect(await sim.logOf('FORTUNE')).toMatch(/answers_your_question/);
+    expect(visibleEyesTakenBack(sim)).toEqual([]);
+  });
+});

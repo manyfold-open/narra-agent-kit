@@ -184,6 +184,13 @@ export type NarraMatrixOp = {
     txnId?: string;
     extra?: Record<string, unknown>;
 } | {
+    op: 'claim';
+    roomId: string;
+    eventId: string;
+    priorityMilli: number;
+    reason: string;
+    txnId?: string;
+} | {
     op: 'redact';
     roomId: string;
     eventId: string;
@@ -405,6 +412,11 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
      * After a text answer the 👀 stays on the message, so people can see who took it. Only a turn
      * that ends without an answer (silent, failed, yielded) removes it, so the next agent can go on.
      */
+    /**
+     * The visible 👀 for an unaddressed group answer, posted only once this agent is actually answering
+     * (people read it as "this agent took it"). It carries a top priority so peers treat it as a claim.
+     */
+    private showAnsweringEyes;
     private keepV2Claim;
     private releaseV2Claim;
     /** A peer holding a stronger live claim on this message than this agent's own claim, if any. */

@@ -14,6 +14,15 @@ export const REPLY_MODES: readonly ReplyMode[] = ['ambient', 'mention', 'quiet']
 /** Reaction an agent puts on a message it is about to answer ("I've got this"). */
 export const CLAIM_REACTION = '👀';
 
+/**
+ * Room event type for an agent's claim on a message. Agents are separate Workers and can only
+ * coordinate through the room, but a visible 👀 that is later taken back reads to people as "I'll
+ * answer… never mind". Narra clients render only m.room.message (and a few known types), so a claim
+ * sent as this custom event is seen by agents and never by people. A visible 👀 now means the agent
+ * is answering (or was @mentioned).
+ */
+export const CLAIM_EVENT_TYPE = 'ai.narra.claim';
+
 /** A claim older than this no longer blocks other agents (the claimer crashed or went silent). */
 export const CLAIM_TTL_MS = 90_000;
 

@@ -12,7 +12,7 @@ import { fetchEventContext, fetchMatrixCredential, fetchNarraChatMessagesBacksto
 import { chatBehaviourNote, parseBrainOutput } from './v2/actions.js';
 import { DEFAULT_DAILY_RELEVANCE_LIMIT, NARRA_USAGE_SCHEMA, parseLimit, UsageBudget } from './v2/budget.js';
 import { claimPriority, decideWake } from './v2/gate.js';
-import { CLAIM_REACTION, CLAIM_RETRY_REASON, applyClaimReaction, applyClaimRedaction, buildLedgerSummary, emptyRoomState, peerAnswered, peerHandoff, peerClaimHolder, pruneClaims, } from './v2/ledger.js';
+import { CLAIM_EVENT_TYPE, CLAIM_REACTION, CLAIM_RETRY_REASON, applyClaimReaction, applyClaimRedaction, buildLedgerSummary, emptyRoomState, peerAnswered, peerHandoff, peerClaimHolder, pruneClaims, } from './v2/ledger.js';
 import { pipelineForRoom } from './v2/pipeline.js';
 import { continuousStreamText, newStreamContinuity, shouldFlushStream, streamableText } from './v2/stream.js';
 import { languageName, matchScript, replyLanguageFor } from './v2/language.js';
@@ -645,6 +645,11 @@ export class BaseNarraMatrixSync {
             const txnId = op.txnId || crypto.randomUUID();
             url = `${roomBase}/send/m.reaction/${enc(txnId)}`;
             body = { ...(op.extra ?? {}), 'm.relates_to': { rel_type: 'm.annotation', event_id: op.eventId, key: op.key } };
+        }
+        else if (op.op === 'claim') {
+            const txnId = op.txnId || crypto.randomUUID();
+            url = `${roomBase}/send/${CLAIM_EVENT_TYPE}/${enc(txnId)}`;
+            body = { target: op.eventId, priority_milli: op.priorityMilli, reason: op.reason };
         }
         else if (op.op === 'redact') {
             const txnId = op.txnId || crypto.randomUUID();
@@ -2176,6 +2181,24 @@ export class BaseNarraRoomCoordinator {
      * After a text answer the 👀 stays on the message, so people can see who took it. Only a turn
      * that ends without an answer (silent, failed, yielded) removes it, so the next agent can go on.
      */
+    /**
+     * The visible 👀 for an unaddressed group answer, posted only once this agent is actually answering
+     * (people read it as "this agent took it"). It carries a top priority so peers treat it as a claim.
+     */
+    async showAnsweringEyes(turn, decision, context) {
+        if (decision.direct || context.chatType !== 'group' || turn.v2EyesEventId)
+            return;
+        const res = await this.matrixOp({
+            op: 'react',
+            roomId: turn.event.roomId,
+            eventId: turn.event.eventId,
+            key: CLAIM_REACTION,
+            txnId: await deterministicTxnId(`eyes:${turn.event.eventId}`),
+            extra: { 'ai.narra.claim': { priority_milli: 5000, reason: 'answering' } },
+        }).catch(() => null);
+        if (res?.ok && res.eventId)
+            turn.v2EyesEventId = res.eventId;
+    }
     keepV2Claim(turn) {
         turn.v2ClaimEventId = undefined;
     }
@@ -2386,15 +2409,21 @@ export class BaseNarraRoomCoordinator {
         try {
             if (decision.claim && context.chatType === 'group' && !turn.v2ClaimEventId) {
                 const count = turn.v2ClaimCount ?? 0;
-                const claim = await this.matrixOp({
-                    op: 'react',
-                    roomId,
-                    eventId: turn.event.eventId,
-                    key: CLAIM_REACTION,
-                    txnId: await deterministicTxnId(count ? `claim:${turn.event.eventId}:${count}` : `claim:${turn.event.eventId}`),
-                    // Integers only: Synapse refuses an event with a float anywhere in it (canonical JSON).
-                    extra: { 'ai.narra.claim': { priority_milli: Math.round(claimPriority(decision) * 1000), reason: decision.reason } },
-                });
+                const txnId = await deterministicTxnId(count ? `claim:${turn.event.eventId}:${count}` : `claim:${turn.event.eventId}`);
+                // Integers only: Synapse refuses an event with a float anywhere in it (canonical JSON).
+                const priorityMilli = Math.round(claimPriority(decision) * 1000);
+                // Addressed: a visible 👀 at once (it always answers). Otherwise the claim is a hidden room event
+                // until this agent actually answers, so people never see a 👀 that is taken back.
+                const claim = decision.direct
+                    ? await this.matrixOp({
+                        op: 'react',
+                        roomId,
+                        eventId: turn.event.eventId,
+                        key: CLAIM_REACTION,
+                        txnId,
+                        extra: { 'ai.narra.claim': { priority_milli: priorityMilli, reason: decision.reason } },
+                    })
+                    : await this.matrixOp({ op: 'claim', roomId, eventId: turn.event.eventId, priorityMilli, reason: decision.reason, txnId });
                 if (claim.ok && claim.eventId) {
                     turn.v2ClaimEventId = claim.eventId;
                     turn.v2ClaimAtMs = this.nowMs();
@@ -2486,6 +2515,7 @@ export class BaseNarraRoomCoordinator {
                         }
                         const quote = await this.computeShouldQuote(turn.event, context.chatType);
                         stream.replyToEventId = quote ? turn.event.eventId : undefined;
+                        await this.showAnsweringEyes(turn, decision, context);
                         const posted = await this.postReplyToRoom(roomId, display, turn.event.eventId, spec.matrixId, stream.replyToEventId, turn.event.eventId);
                         if (posted.eventId) {
                             turn.v2StreamEventId = posted.eventId;
@@ -2617,6 +2647,15 @@ export class BaseNarraRoomCoordinator {
                     txnId: await deterministicTxnId(`unstream:${turn.v2StreamEventId}`),
                 }).catch(() => undefined);
                 turn.v2StreamEventId = undefined;
+                if (turn.v2EyesEventId) {
+                    await this.matrixOp({
+                        op: 'redact',
+                        roomId,
+                        eventId: turn.v2EyesEventId,
+                        txnId: await deterministicTxnId(`uneyes:${turn.v2EyesEventId}`),
+                    }).catch(() => undefined);
+                    turn.v2EyesEventId = undefined;
+                }
             }
             if (action.kind === 'silent') {
                 await this.releaseV2Claim(turn);
@@ -2705,6 +2744,7 @@ export class BaseNarraRoomCoordinator {
             else {
                 const quote = await this.computeShouldQuote(turn.event, context.chatType);
                 replyToEventId = quote ? turn.event.eventId : undefined;
+                await this.showAnsweringEyes(turn, decision, context);
                 posted = await this.postReplyToRoom(roomId, text, turn.event.eventId, spec.matrixId, replyToEventId, turn.event.eventId);
             }
             await this.recordOwnReply(turn, spec, text, posted.eventId, replyToEventId);
