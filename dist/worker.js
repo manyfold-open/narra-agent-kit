@@ -2133,7 +2133,7 @@ export class BaseNarraRoomCoordinator {
     async v2ReplyHelps(event, reply, spec, partial) {
         if (this.getConfig().v2?.replyCheck === false)
             return undefined;
-        return checkReplyHelps(this.env.AI, { question: event.text ?? '', reply, agentName: spec.name, partial }, { ...(this.env.AI_TRIAGE_MODEL ? { model: this.env.AI_TRIAGE_MODEL } : {}) });
+        return checkReplyHelps(this.env.AI, { question: event.text ?? '', reply, agentName: spec.name, agentDomain: this.getConfig().v2?.profile ?? spec.domainDescription, partial }, { ...(this.env.AI_TRIAGE_MODEL ? { model: this.env.AI_TRIAGE_MODEL } : {}) });
     }
     /** In a group, only an addressed agent or the conversation's owner reacts with an emoji. */
     mayReactInGroup(context, decision) {
@@ -2660,7 +2660,7 @@ export class BaseNarraRoomCoordinator {
                     // A refusal or a substitute is not an answer: never shown, and the claim is released so the
                     // agent that can help (waiting on it) goes next.
                     await this.releaseV2Claim(turn);
-                    await appendDoLog(this.ctx.storage, `v2 dropped reply ${turn.event.eventId} (${decision.reason}): does not help`, this.nowMs(), this.env);
+                    await appendDoLog(this.ctx.storage, `v2 dropped reply ${turn.event.eventId} (${decision.reason}): does not help: ${text.replace(/\s+/g, ' ').slice(0, 80)}`, this.nowMs(), this.env);
                     await this.removePendingTurn(turn.event.eventId);
                     return;
                 }

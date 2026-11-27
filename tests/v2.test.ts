@@ -951,5 +951,6 @@ describe('v2 reply check', () => {
     expect(await checkReplyHelps(ai, { question: '有沒有倫敦房租的公開資料集？', reply: '這個我幫不上，我只知道快閃', agentName: 'Spotted', partial: true })).toBe(false);
     expect(system.startsWith(REPLY_CHECK_MARKER)).toBe(true);
     expect(system).toMatch(/may stop mid-sentence/);
+    expect(system).toMatch(/reports it looked and has nothing/);
   });
 });

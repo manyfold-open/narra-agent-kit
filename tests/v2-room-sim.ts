@@ -278,7 +278,9 @@ export function createRoomSim(defs: SimAgentDef[], humans: Array<{ id: string; n
             if (system.startsWith(REPLY_CHECK_MARKER)) {
               // Reply check: a reply that only declines, or offers something else, does not help.
               const reply = /reply: ([\s\S]*)/.exec(user)?.[1] ?? '';
-              const helps = !SIM_REFUSAL.test(reply);
+              // Like a literal model: "I looked and have nothing" counts only when the prompt says it does.
+              const notFound = /目前沒有|沒有找到|not available|no dataset/i.test(reply);
+              const helps = !SIM_REFUSAL.test(reply) && (!notFound || (system.includes('reports it looked and has nothing') && user.includes('agent_domain:')));
               replyChecks.push({ agent: def.spec.name, reply, helps });
               return { response: JSON.stringify({ helps }) };
             }

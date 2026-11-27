@@ -4,6 +4,8 @@ export interface ReplyCheckInput {
     question: string;
     reply: string;
     agentName: string;
+    /** What the agent is for, so "I checked my own data and it is not there" reads as an answer. */
+    agentDomain?: string;
     /** The reply is the start of a streamed answer and may be cut off mid-sentence. */
     partial?: boolean;
 }
