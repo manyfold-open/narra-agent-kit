@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   CLAIM_REACTION,
   UsageBudget,
+  asksSomething,
+  chatBehaviourNote,
   claimPriority,
   continuousStreamText,
   newStreamContinuity,
@@ -896,5 +898,26 @@ describe('v2 fixes from the 11-26 live run', () => {
     expect(toZhHant('FCC 批準 SpaceX 的計劃，獲準部署')).toBe('FCC 批准 SpaceX 的計劃，獲准部署');
     expect(toZhHant('標準和準備')).toBe('標準和準備');
     expect(toZhHans('批准')).toBe('批准');
+  });
+});
+
+describe('v2 fixes from the 11-27 retest', () => {
+  it('suggested follow-up questions in a list are not a question waiting for an answer', () => {
+    expect(asksSomething('今天可以做的一件小事：找一個人說出來。\n\n接下來你也許想問：\n• 我該先跟誰開口比較好？\n• 要怎麼說才不像在抱怨？')).toBe(false);
+    expect(asksSomething('可以的。你想問的是什麼事？工作、感情還是某個決定？')).toBe(true);
+    expect(asksSomething('三個選項：\n1. 火鍋\n2. 點心\n想吃哪個？')).toBe(true);
+  });
+
+  it('thanks get an emoji even right after the agent\'s own question; a topic-limited stand-by stays silent', () => {
+    expect(chatBehaviourNote({ chatType: 'group', direct: false })).toMatch(/This rule comes first, even right after your own question/);
+    expect(chatBehaviourNote({ chatType: 'group', direct: false, fallback: true })).toMatch(/do not reply that you cannot help: answer \[NO_REPLY\]/);
+  });
+
+  it('looks relevant but no closer to this agent than the others: stand by, do not go first', async () => {
+    const e = ev('$chat', '哈哈好喔', NOW);
+    const d = await decideWake({ event: e, context: ctx(), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.76, rawScore: 0.76, margin: 0.02, mine: true }) });
+    expect(d).toMatchObject({ wake: true, reason: 'fallback' });
+    const real = await decideWake({ event: ev('$ask', '推薦一家 Soho 的點心', NOW), context: ctx(), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 1, rawScore: 1, margin: 0.155, mine: true }) });
+    expect(real).toMatchObject({ wake: true, reason: 'relevant' });
   });
 });

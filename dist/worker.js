@@ -2120,6 +2120,19 @@ export class BaseNarraRoomCoordinator {
         });
         return { decision, ...(relevance ? { relevance } : {}) };
     }
+    /** Stand-by ask check: true/false from the ask model, undefined when it is unavailable (fail open). */
+    async v2StandbyAskCheck(event, context, spec) {
+        if (this.getConfig().v2?.standbyAskCheck === false)
+            return undefined;
+        try {
+            const model = createAskTriageModel(this.env.AI, { ...(this.env.AI_TRIAGE_MODEL ? { model: this.env.AI_TRIAGE_MODEL } : {}) });
+            const res = await model.score({ event, context, spec, detectedLang: detectLang(event.text ?? "", context.userLanguageHint, context.roomLanguageHint) });
+            return res.ask;
+        }
+        catch {
+            return undefined;
+        }
+    }
     /** In a group, only an addressed agent or the conversation's owner reacts with an emoji. */
     mayReactInGroup(context, decision) {
         if (context.chatType !== 'group' || decision.direct)
@@ -2347,6 +2360,18 @@ export class BaseNarraRoomCoordinator {
                 turn.v2WaitingOn = undefined;
             }
         }
+        if (decision.reason === 'fallback' && context.chatType === 'group' && !turn.v2ClaimEventId && turn.v2StandbyAsk === undefined) {
+            // A stand-by takes a message only if it is a real question or need. Chatter often scores close to
+            // every agent; without this, each stand-by would put up a 👀 and call its brain just to stay silent.
+            const ask = await this.v2StandbyAskCheck(turn.event, context, spec);
+            turn.v2StandbyAsk = ask;
+            if (ask === false) {
+                await appendDoLog(this.ctx.storage, `v2 fallback skipped ${turn.event.eventId}: not an ask`, nowMs, this.env);
+                await this.removePendingTurn(turn.event.eventId);
+                return;
+            }
+            await this.updatePendingTurn({ ...turn, v2Decision: decision });
+        }
         try {
             if (decision.claim && context.chatType === 'group' && !turn.v2ClaimEventId) {
                 const count = turn.v2ClaimCount ?? 0;
@@ -2404,6 +2429,7 @@ export class BaseNarraRoomCoordinator {
                 void this.matrixOp({ op: 'typing', roomId, typing: true }).catch(() => undefined);
             }, TYPING_REFRESH_MS);
             let raw = '';
+            let sentEnvelope = '';
             // Reply in the asker's language: zh-Hant, zh-Hans or English; anything else in English.
             const replyLang = replyLanguageFor(turn.event.text ?? '', {
                 mentionNames: [spec.name, ...(spec.aliases ?? []), ...context.members.flatMap((m) => (m.displayName ? [m.displayName] : []))],
@@ -2490,7 +2516,7 @@ export class BaseNarraRoomCoordinator {
                 ]);
                 if (!cred || !cred.url || !cred.token)
                     throw new A2AError('No A2A credential available for Narra gateway.', false);
-                const envelope = buildPromptEnvelope({
+                const envelope = (sentEnvelope = buildPromptEnvelope({
                     event: turn.event,
                     context,
                     decision: triageLike,
@@ -2521,7 +2547,7 @@ export class BaseNarraRoomCoordinator {
                             replyLanguage: languageName(replyLang),
                         }),
                     },
-                });
+                }));
                 const res = await runManyfoldA2ATurnWithMeta({
                     credential: { rpcUrl: cred.url, token: cred.token, label: cred.label ?? spec.name },
                     envelope,
@@ -2542,8 +2568,17 @@ export class BaseNarraRoomCoordinator {
                 clearInterval(typingTimer);
                 await this.matrixOp({ op: 'typing', roomId, typing: false }).catch(() => undefined);
             }
-            const action = parseBrainOutput(raw);
+            let action = parseBrainOutput(raw);
             nowMs = this.nowMs();
+            if (action.kind === 'silent' && decision.reason === 'fallback' && context.chatType === 'group' && turn.v2StandbyAsk === true && sentEnvelope) {
+                // The room's stand-by for a real question, but its brain is limited to its own topic: answer with
+                // the general model instead of leaving the question (or replying "I can only talk about X").
+                const general = await runWorkersAiResilienceFallback(this.env.AI, this.env.AI_TRIAGE_MODEL, spec, sentEnvelope, replyLang, false);
+                if (general && !isSilence(general)) {
+                    action = parseBrainOutput(general);
+                    await appendDoLog(this.ctx.storage, `v2 standby general answer ${turn.event.eventId}`, this.nowMs(), this.env);
+                }
+            }
             if (action.kind !== 'reply' && turn.v2StreamEventId) {
                 // Text was already showing but the brain ended up choosing not to reply: take it back.
                 await this.matrixOp({

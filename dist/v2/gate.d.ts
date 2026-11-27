@@ -2,7 +2,7 @@ import type { AgentSpec, InboundEvent, RoomContext } from '../types.js';
 import { type ReplyMode } from './ledger.js';
 /** Stop speaking once this many agent messages follow the last human one (platform rejects the 7th). */
 export declare const V2_AGENT_TAIL_CAP = 5;
-export type WakeReason = 'dm' | 'mentioned' | 'reply_to_you' | 'your_conversation' | 'answers_your_question' | 'handoff' | 'reaction_to_you' | 'proactive' | 'agent_hint' | 'relevant' | 'fallback' | 'not_text' | 'from_agent' | 'aimed_elsewhere' | 'mode_mention' | 'mode_quiet' | 'agent_tail_cap' | 'peer_conversation' | 'topic_moved_on' | 'low_relevance' | 'budget';
+export type WakeReason = 'dm' | 'mentioned' | 'reply_to_you' | 'your_conversation' | 'answers_your_question' | 'handoff' | 'reaction_to_you' | 'proactive' | 'agent_hint' | 'relevant' | 'fallback' | 'not_text' | 'from_agent' | 'aimed_elsewhere' | 'mode_mention' | 'mode_quiet' | 'agent_tail_cap' | 'peer_conversation' | 'topic_moved_on' | 'low_relevance' | 'low_margin' | 'budget';
 export interface WakeDecision {
     wake: boolean;
     reason: WakeReason;
@@ -36,6 +36,13 @@ export interface WakeGateOptions {
     fallbackDelayMs: number;
     /** ...minus up to this much for a better fit, so the closest agent goes first. */
     fallbackSpreadMs: number;
+    /**
+     * Going first also needs this margin over the other agents' asks (cosine minus best not-example
+     * cosine), when the agent has notExamples. Chatter ("哈哈好喔", "謝謝") sits at the same cosine to
+     * every profile (bge-m3 gives it about 0.55), so its relevance looks high while the margin stays
+     * near 0; real asks beat the other agents by 0.08 and more. Below it the agent only stands by.
+     */
+    minRelevantMargin: number;
 }
 export declare const DEFAULT_WAKE_GATE_OPTIONS: WakeGateOptions;
 export interface WakeGateInput {

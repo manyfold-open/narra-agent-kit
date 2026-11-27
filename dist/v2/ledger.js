@@ -150,8 +150,18 @@ export function threadPartner(history, senderId, nowMs, windowMs = THREAD_WINDOW
 export const OPEN_QUESTION_WINDOW_MS = 15 * 60_000;
 /** After this many human messages without the agent speaking again, the question is stale. */
 const OPEN_QUESTION_MAX_REPLIES = 3;
-function asksSomething(text) {
-    return /[?？]/.test(text.replace(/https?:\/\/\S+/g, ''));
+/**
+ * Whether an agent message puts a question to the room. Question marks inside list items do not count:
+ * "you could also ask: • …？ • …？" offers follow-ups the person may ask, it does not wait for an
+ * answer, so a later "謝謝" is not an answer to it.
+ */
+export function asksSomething(text) {
+    const prose = text
+        .replace(/https?:\/\/\S+/g, '')
+        .split('\n')
+        .filter((line) => !/^\s*(?:[•·\-*–—]|\d+[.)、]|[a-zA-Z][.)])\s*/.test(line))
+        .join('\n');
+    return /[?？]/.test(prose);
 }
 /**
  * The question an agent put to the room and is still waiting on: the latest agent message, if it

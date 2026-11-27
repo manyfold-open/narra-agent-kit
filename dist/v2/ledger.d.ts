@@ -75,6 +75,12 @@ export interface OpenQuestion {
     askedTo?: string;
 }
 /**
+ * Whether an agent message puts a question to the room. Question marks inside list items do not count:
+ * "you could also ask: • …？ • …？" offers follow-ups the person may ask, it does not wait for an
+ * answer, so a later "謝謝" is not an answer to it.
+ */
+export declare function asksSomething(text: string): boolean;
+/**
  * The question an agent put to the room and is still waiting on: the latest agent message, if it
  * asks something, is recent, and has had only a few human messages after it. Anyone may answer it,
  * not only the person it was asked to: in a group, friends answer for each other, and people come
