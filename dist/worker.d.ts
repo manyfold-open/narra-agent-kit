@@ -106,8 +106,10 @@ export interface NarraGatewayConfig<TEnv extends NarraGatewayEnv = NarraGatewayE
         /** Start a fresh Manyfold conversation for every turn instead of one per room. */
         freshContext?: boolean;
         /**
-         * Before a stand-by claims an unanswered message, ask the Workers AI ask model whether it is a real
-         * question or need (default on; fails open when Workers AI is unavailable). false turns it off.
+         * Ask the Workers AI ask model whether a message is a real question or need: before claiming one
+         * that fits this agent no better than another (low margin), and before a text reply to the agent's
+         * own conversation (thanks and "ok" get an emoji). Default on; fails open when Workers AI is
+         * unavailable. false turns it off.
          */
         standbyAskCheck?: boolean;
         /**
@@ -399,8 +401,8 @@ export declare class BaseNarraRoomCoordinator<TEnv extends NarraGatewayEnv = Nar
     private v2Mode;
     private v2Budget;
     private v2Gate;
-    /** Stand-by ask check: true/false from the ask model, undefined when it is unavailable (fail open). */
-    private v2StandbyAskCheck;
+    /** Ask check: true/false from the ask model, undefined when it is unavailable (fail open). */
+    private v2AskCheck;
     /** In a group, only an addressed agent or the conversation's owner reacts with an emoji. */
     private mayReactInGroup;
     private describeGate;

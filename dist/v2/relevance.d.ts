@@ -27,7 +27,7 @@ export interface RelevanceResult {
     score: number;
     /**
      * The fit to this agent's profile alone (scaled best cosine), even when another agent's asks are
-     * closer (`score` is then 0). Used only to stand by as a fallback, never to go first.
+     * closer (`score` is then 0). Logged for calibration; never enough to wake.
      */
     rawScore?: number;
     /** `cosine - notCosine`: how clearly this agent beats the other agents' asks (negative = loses). */

@@ -155,11 +155,13 @@ describe('v2 room: every real ask gets exactly one answer', () => {
     expect(sim.answersTo(b)).toEqual(['EVENTS']);
   });
 
-  it('an ask no agent is sure about still gets one answer from the best fit', async () => {
+  it('an ask no agent is sure about gets no answer until someone @mentions an agent', async () => {
     const sim = createRoomSim([food(), events(), data()], HUMANS);
     const q = await sim.say(ZACK, '有什麼推薦');
     await sim.run(120_000);
-    expect(sim.answersTo(q)).toEqual(['EVENTS']);
+    expect(sim.answersTo(q)).toEqual([]);
+    for (const a of ['FOOD', 'EVENTS', 'DATA']) expect(sim.agent(a).brainCalls).toEqual([]);
+    expect(sim.generalCalls).toEqual([]);
   });
 
   it('the 👀 stays on an answered message and goes away when the claimer stayed silent', async () => {
@@ -283,10 +285,13 @@ describe('v2 room: the best fit wins, not the fastest claim', () => {
   });
 });
 
-describe('v2 room: a real ask nobody claims still gets one answer (zack test, 2026-11-26)', () => {
-  // G10: the events agent fits best by topic but stays silent; the data agent is the right one, yet
-  // its message is "closer to another agent's asks", which used to zero it and empty the stand-by pool.
-  it('a question the better fit declines goes to the agent that fits it on its own (房租資料集)', async () => {
+// Zack 2026-11-27: 「沒人 ＠ 就不回」. An unaddressed message is answered only by an agent it is relevant
+// to, or by the agent whose conversation it continues. Nobody stands in: no stand-by agent, no general
+// answer. Netmind London Round 4 (kit f1d0fa0): the food agent answered 「iPhone 螢幕摔破了要去哪裡修？」
+// from the stand-by chain, and Penny overrode the food agent's silence on 「肚子餓了」 with a general line.
+describe('v2 room: an ask nobody owns gets no answer (沒人 ＠ 就不回)', () => {
+  // G10: the events agent fits best by topic and stays silent; the data agent is not relevant enough.
+  it('the only relevant agent stays silent: the room stays quiet (房租資料集)', async () => {
     const sim = createRoomSim(
       [
         food(),
@@ -297,21 +302,43 @@ describe('v2 room: a real ask nobody claims still gets one answer (zack test, 20
     );
     const q = await sim.say(PIKA, '有沒有倫敦房租的公開資料集？');
     await sim.run(120_000);
-    expect(sim.answersTo(q)).toEqual(['DATA']);
+    expect(sim.answersTo(q)).toEqual([]);
+    expect(sim.agent('DATA').brainCalls).toEqual([]);
+    expect(sim.generalCalls).toEqual([]);
   });
 
-  // G14: nobody's topic. The agents that woke stay silent; one stand-by answers as the room's catch-all.
-  it('a question outside every speciality gets one answer from a stand-by (天氣)', async () => {
-    const standByBrain = (t: string, prompt: string) =>
-      /天氣/.test(t) && prompt.includes('stand-by') ? 'DATA: 今天多雲，帶把傘' : '[NO_REPLY]';
-    const sim = createRoomSim([food(), events({ brain: () => '[NO_REPLY]' }), data({ brain: standByBrain })], HUMANS);
-    const q = await sim.say(PIKA, '倫敦今天天氣怎麼樣？');
+  for (const [label, text] of [
+    ['weather', '倫敦今天天氣怎麼樣？'],
+    ['phone repair', 'iPhone 螢幕摔破了要去哪裡修？'],
+  ]) {
+    it(`a real ask outside every speciality gets no answer, no 👀 and no brain call (${label})`, async () => {
+      const sim = createRoomSim([food(), events(), data(), penny({ bill: false })], HUMANS);
+      const q = await sim.say(PIKA, text);
+      await sim.run(150_000);
+      expect(sim.answersTo(q)).toEqual([]);
+      expect(sim.timeline.filter((e) => e.type === 'm.reaction')).toEqual([]);
+      // Weather sits closest to the events agent (live G14): only it may look, and it stays silent.
+      for (const a of ['FOOD', 'DATA', 'PENNY']) expect(sim.agent(a).brainCalls).toEqual([]);
+      expect(sim.generalCalls).toEqual([]);
+    });
+  }
+
+  it('the owner chooses silence while other agents are in the room: nobody answers in its place (肚子餓了)', async () => {
+    const asksWhere = (t: string) => (/餓/.test(t) ? 'FOOD: 你在哪一帶？' : '[NO_REPLY]');
+    const sim = createRoomSim([food({ brain: asksWhere }), events(), data(), penny({ bill: false })], HUMANS);
+    const a = await sim.say(PIKA, '肚子餓了，附近有什麼吃的？');
+    await sim.run(30_000);
+    expect(sim.answersTo(a)).toEqual(['FOOD']);
+    sim.agent('FOOD').def.brain = () => '[NO_REPLY]';
+    const q = await sim.say(PIKA, '肚子餓了');
     await sim.run(120_000);
-    expect(sim.answersTo(q)).toEqual(['DATA']);
+    expect(await sim.logOf('FOOD')).toMatch(/silent \$\S+ \((answers_your_question|your_conversation|relevant)\)/);
+    expect(sim.answersTo(q)).toEqual([]);
+    for (const n of ['EVENTS', 'DATA', 'PENNY']) expect(sim.agent(n).brainCalls).toEqual([]);
+    expect(sim.generalCalls).toEqual([]);
   });
 
-  // The stand-by is a last resort, not a cascade: chatter one stand-by passed on is not retried.
-  it('chatter a stand-by passed on is not tried again by the next one', async () => {
+  it('chatter nobody owns gets no answer and no stand-by brain call', async () => {
     const sim = createRoomSim(
       [food(), events({ brain: () => '[NO_REPLY]' }), data({ brain: () => '[NO_REPLY]' })],
       HUMANS,
@@ -319,8 +346,8 @@ describe('v2 room: a real ask nobody claims still gets one answer (zack test, 20
     const q = await sim.say(PIKA, '好喔哈哈');
     await sim.run(120_000);
     expect(sim.answersTo(q)).toEqual([]);
-    expect(sim.agent('DATA').brainCalls.length).toBeLessThanOrEqual(1);
-    expect(sim.agent('FOOD').brainCalls).toEqual([]);
+    for (const a of ['FOOD', 'DATA']) expect(sim.agent(a).brainCalls).toEqual([]);
+    expect(sim.generalCalls).toEqual([]);
   });
 
   // G17: two agents fit equally; the one that claimed first only pointed to the other.
@@ -485,59 +512,11 @@ describe('v2 room: emoji acknowledgements come from the agent you talked with', 
   });
 });
 
-describe('v2 room: stand-bys take turns (zack test 17:39, 2026-11-26)', () => {
-  // When the agent that fit best stayed silent, every stand-by resumed at once and five brains ran
-  // for one question. They now go one at a time, best fit first, and stop after two tries.
-  function helper(name: string, id: string, brain: SimAgentDef['brain']): SimAgentDef {
-    return {
-      spec: spec(id, name, 'general helper'),
-      profile: 'general helper',
-      wakeExamples: [],
-      notExamples: EVENT_ASKS,
-      brain,
-    };
-  }
-  const answersIfStandBy = (t: string, prompt: string) => (/下雨/.test(t) && prompt.includes('stand-by') ? 'HELP: 明天會下雨，帶傘' : '[NO_REPLY]');
-
-  it('one answer, and the stand-bys do not all call their brains at once', async () => {
-    const sim = createRoomSim(
-      [
-        events({ brain: () => '[NO_REPLY]' }),
-        data({ brain: () => '[NO_REPLY]' }),
-        helper('HELPA', '@agent-4e1a0006:matrix.netmind.chat', answersIfStandBy),
-        helper('HELPB', '@agent-4e1b0007:matrix.netmind.chat', answersIfStandBy),
-      ],
-      HUMANS,
-    );
-    const q = await sim.say(PIKA, '倫敦明天會下雨嗎？');
-    await sim.run(180_000);
-    expect(sim.answersTo(q)).toHaveLength(1);
-    const standByCalls = ['DATA', 'HELPA', 'HELPB'].reduce((n, a) => n + sim.agent(a).brainCalls.length, 0);
-    expect(standByCalls).toBeLessThanOrEqual(2);
-  });
-
-  it('chatter is given up after two stand-bys looked', async () => {
-    const sim = createRoomSim(
-      [
-        events({ brain: () => '[NO_REPLY]' }),
-        data({ brain: () => '[NO_REPLY]' }),
-        helper('HELPA', '@agent-4e1a0006:matrix.netmind.chat', () => '[NO_REPLY]'),
-        helper('HELPB', '@agent-4e1b0007:matrix.netmind.chat', () => '[NO_REPLY]'),
-      ],
-      HUMANS,
-    );
-    const q = await sim.say(PIKA, '會下雨吧哈哈');
-    await sim.run(180_000);
-    expect(sim.answersTo(q)).toEqual([]);
-    const standByCalls = ['DATA', 'HELPA', 'HELPB'].reduce((n, a) => n + sim.agent(a).brainCalls.length, 0);
-    expect(standByCalls).toBeLessThanOrEqual(2);
-  });
-});
 
 
 // Live zack test 2026-11-27 (kit 6e23085): chatter woke four agents as "relevant" one after another,
 // and a stand-by limited to its own topic answered "I can only talk about AI news".
-describe('v2 room: chatter stays invisible; a stand-by always gives a real answer', () => {
+describe('v2 room: chatter stays invisible', () => {
   const claimsOn = (sim: ReturnType<typeof createRoomSim>, q: string) =>
     sim.timeline.filter((e) => e.type === 'm.reaction' && (e.content['m.relates_to'] as { event_id: string }).event_id === q);
 
@@ -548,17 +527,14 @@ describe('v2 room: chatter stays invisible; a stand-by always gives a real answe
     expect(sim.answersTo(q)).toEqual([]);
     expect(claimsOn(sim, q)).toEqual([]);
     for (const name of ['FOOD', 'EVENTS', 'DATA', 'PENNY']) expect(sim.agent(name).brainCalls).toEqual([]);
-    expect(await sim.logOf('FOOD')).toMatch(/fallback skipped .*not an ask/);
+    expect(await sim.logOf('FOOD')).toMatch(/v2 skipped .*not an ask/);
   });
 
-  it('a real question no brain will take still gets one general answer from the first stand-by', async () => {
-    const sim = createRoomSim([food(), events(), data({ brain: () => '[NO_REPLY]' })], HUMANS);
-    const q = await sim.say(PIKA, '倫敦今天天氣怎麼樣？');
+  it('a real ask that fits two agents equally still gets exactly one answer', async () => {
+    const sim = createRoomSim([food(), events()], HUMANS);
+    const q = await sim.say(ZACK, '吃完飯有什麼市集可以逛');
     await sim.run(120_000);
-    const answers = sim.answersTo(q);
-    expect(answers).toHaveLength(1);
-    expect(sim.generalCalls).toEqual([answers[0]]);
-    expect(await sim.logOf(answers[0])).toMatch(/standby general answer/);
+    expect(sim.answersTo(q)).toHaveLength(1);
   });
 });
 
@@ -582,7 +558,7 @@ describe('v2 room: the conversation owner thanks with an emoji and never just re
     expect(await sim.logOf('EVENTS')).toMatch(/acknowledgement .*emoji/);
   });
 
-  it('an off-topic question to the agent you were talking with still gets a real answer from the room', async () => {
+  it('an off-topic question to the agent you were talking with: no refusal, and nobody answers in its place', async () => {
     const refuses = (t: string, prompt: string) =>
       /天氣/.test(t) ? (prompt.includes('do not say so: answer [NO_REPLY]') ? '[NO_REPLY]' : 'EVENTS: 天氣我幫不上') : /玩|快閃|活動/.test(t) ? 'EVENTS: 三個活動' : '[NO_REPLY]';
     const sim = createRoomSim([food(), events({ brain: refuses }), data({ brain: () => '[NO_REPLY]' })], HUMANS);
@@ -591,10 +567,9 @@ describe('v2 room: the conversation owner thanks with an emoji and never just re
     expect(sim.answersTo(a)).toEqual(['EVENTS']);
     const q = await sim.say(PIKA, '倫敦今天天氣怎麼樣？');
     await sim.run(120_000);
-    const answers = sim.answersTo(q);
-    expect(answers).toHaveLength(1);
-    expect(answers[0]).not.toBe('EVENTS');
-    expect(sim.generalCalls).toEqual(answers);
+    expect(sim.answersTo(q)).toEqual([]);
+    expect(sim.agent('DATA').brainCalls).toEqual([]);
+    expect(sim.generalCalls).toEqual([]);
   });
 });
 
@@ -627,25 +602,13 @@ describe('v2 room: people never see a 👀 that is taken back', () => {
   });
 
   it('the agent that fits first stays silent, the next one answers: one 👀, from the answerer', async () => {
-    const sim = createRoomSim([food(), events({ brain: () => '[NO_REPLY]' })], HUMANS);
-    const q = await sim.say(ZACK, '今晚 Soho 有什麼好吃的中餐？');
+    const sim = createRoomSim([food({ extra: { v2: later } }), events({ brain: () => '[NO_REPLY]', extra: { v2: first } })], HUMANS);
+    const q = await sim.say(ZACK, '吃完飯有什麼市集可以逛');
     await sim.run(120_000);
     expect(await sim.logOf('EVENTS')).toMatch(/wake=true relevant/);
     expect(sim.answersTo(q)).toEqual(['FOOD']);
     expect(visibleEyesTakenBack(sim)).toEqual([]);
     expect(visibleEyesOn(sim, q)).toEqual([sim.agent('FOOD').id]);
-  });
-
-  it('several stand-bys sort themselves out without any visible 👀 coming and going', async () => {
-    const sim = createRoomSim(
-      [food(), events(), data({ brain: (_t, prompt) => (prompt.includes('stand-by') ? 'DATA: 今天多雲，帶把傘' : '[NO_REPLY]') }), penny({ bill: false })],
-      HUMANS,
-    );
-    const q = await sim.say(PIKA, '倫敦今天天氣怎麼樣？');
-    await sim.run(150_000);
-    expect(sim.answersTo(q)).toHaveLength(1);
-    expect(visibleEyesTakenBack(sim)).toEqual([]);
-    expect(visibleEyesOn(sim, q)).toHaveLength(1);
   });
 
   it('a message after an agent question that it does not take: the question-asker looks without a visible 👀', async () => {
@@ -673,7 +636,6 @@ describe('v2 room: a new ask for another agent\'s speciality is not kept by the 
     expect(sim.answersTo(a)).toEqual(['EVENTS']);
     const q = await sim.say(PIKA, '今晚 Soho 有什麼好吃的中餐？');
     await sim.run(120_000);
-    expect(await sim.logOf('EVENTS')).toMatch(/your_conversation/);
     expect(sim.answersTo(q)).toEqual(['FOOD']);
   });
 });

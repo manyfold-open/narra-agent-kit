@@ -66,8 +66,6 @@ export function applyClaimRedaction(state, redactedEventId, reason) {
     if (!target)
         return false;
     delete state.claimReactions[redactedEventId];
-    const releasedClaim = claimsOn(state, target).find((c) => c.reactionEventId === redactedEventId);
-    const releasedPriority = releasedClaim && typeof releasedClaim.priority === 'number' ? releasedClaim.priority : undefined;
     const left = claimsOn(state, target).filter((c) => c.reactionEventId !== redactedEventId);
     if (left.length > 0)
         state.claims[target] = left;
@@ -75,9 +73,6 @@ export function applyClaimRedaction(state, redactedEventId, reason) {
         delete state.claims[target];
     if (reason !== CLAIM_RETRY_REASON) {
         state.released = { ...(state.released ?? {}), [target]: (state.released?.[target] ?? 0) + 1 };
-        if (releasedPriority !== undefined && releasedPriority < 1) {
-            state.releasedFallback = { ...(state.releasedFallback ?? {}), [target]: (state.releasedFallback?.[target] ?? 0) + 1 };
-        }
     }
     return true;
 }
@@ -90,7 +85,7 @@ export function pruneClaims(state, nowMs, keepMs = 30 * 60_000) {
             delete state.claims[target];
     }
     // Released counts only matter while the message is fresh; keep the newest few.
-    for (const map of [state.released, state.releasedFallback]) {
+    for (const map of [state.released]) {
         if (!map)
             continue;
         const keys = Object.keys(map);

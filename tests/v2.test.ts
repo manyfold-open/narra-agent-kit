@@ -224,11 +224,8 @@ describe('v2 wake gate', () => {
     expect(high.delayMs).toBeLessThan(mid.delayMs);
     const history = [turn('$a', ZACK, NOW - 30_000), turn('$b', SPOTTED, NOW - 20_000, { answersEventId: '$a' })];
     const withPeer = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => 0.6 });
-    // Under the bar in someone else's thread: only stands by in case nobody answers.
-    expect(withPeer).toMatchObject({ wake: true, reason: 'fallback', claim: true });
-    expect(withPeer.delayMs).toBeGreaterThan(10_000);
-    const noOpts = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => 0.6, options: { fallbackThreshold: 0 } });
-    expect(noOpts).toMatchObject({ wake: false, reason: 'peer_conversation' });
+    // Under the bar in someone else's thread: stays out of it (nobody stands in).
+    expect(withPeer).toMatchObject({ wake: false, reason: 'peer_conversation' });
   });
 
   it('picks up a topic that moved to it while the sender talks with another agent (那晚上有啥可以玩的嗎 after food)', async () => {
@@ -237,14 +234,12 @@ describe('v2 wake gate', () => {
     // Closer to this agent's asks than to the other agents': the normal threshold applies.
     const moved = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.55, mine: true }) });
     expect(moved).toMatchObject({ wake: true, reason: 'relevant', claim: true });
-    // Still below the normal threshold: only a fallback.
+    // Still below the normal threshold: silent.
     const weak = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.4, mine: true }) });
-    expect(weak).toMatchObject({ wake: true, reason: 'fallback' });
-    // Not clearly this agent's: the peer-thread bar stays, so it only stands by.
+    expect(weak).toMatchObject({ wake: false, reason: 'low_relevance' });
+    // Not clearly this agent's: the peer-thread bar stays, so it stays out.
     const unclear = await decideWake({ event: q, context: ctx({ recentHistory: history }), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.55 }) });
-    expect(unclear).toMatchObject({ wake: true, reason: 'fallback' });
-    // A closer fit stands by for less time.
-    expect(unclear.delayMs).toBeLessThan(weak.delayMs);
+    expect(unclear).toMatchObject({ wake: false, reason: 'peer_conversation' });
   });
 });
 
@@ -860,8 +855,6 @@ describe('v2 fixes from the 11-26 live run', () => {
     const wide = await decideWake({ event: e, context: ctx(), spec: agentSpec(FOOD, 'food'), mode: 'ambient', nowMs: NOW, score: async () => ({ score: 1, margin: 0.3, mine: true }) });
     const narrow = await decideWake({ event: e, context: ctx(), spec: agentSpec(EVENTS, 'events'), mode: 'ambient', nowMs: NOW, score: async () => ({ score: 1, margin: 0.02, mine: true }) });
     expect(wide.delayMs).toBeLessThan(narrow.delayMs);
-    // A stand-by claim never outranks an agent that fits, whatever its margin.
-    expect(claimPriority({ reason: 'fallback', score: 0.99, direct: false })).toBeLessThan(claimPriority({ reason: 'relevant', score: 0.5, direct: false, margin: -0.1 }));
   });
 
   it('does not stream a working note the brain replaces with the real answer', () => {
@@ -911,16 +904,19 @@ describe('v2 fixes from the 11-27 retest', () => {
     expect(asksSomething('三個選項：\n1. 火鍋\n2. 點心\n想吃哪個？')).toBe(true);
   });
 
-  it('thanks get an emoji even right after the agent\'s own question; a topic-limited stand-by stays silent', () => {
+  it('thanks get an emoji even right after the agent\'s own question; never "I can only talk about X"', () => {
     expect(chatBehaviourNote({ chatType: 'group', direct: false })).toMatch(/This rule comes first, even right after your own question/);
-    expect(chatBehaviourNote({ chatType: 'group', direct: false, fallback: true })).toMatch(/do not reply that you cannot help: answer \[NO_REPLY\]/);
+    expect(chatBehaviourNote({ chatType: 'group', direct: false })).toMatch(/If you cannot help with it at all, do not say so: answer \[NO_REPLY\]/);
+    expect(chatBehaviourNote({ chatType: 'group', direct: false })).not.toMatch(/stand-by/);
   });
 
-  it('looks relevant but no closer to this agent than the others: stand by, do not go first', async () => {
+  it('looks relevant but no closer to this agent than the others: goes last, and only after the ask check', async () => {
     const e = ev('$chat', '哈哈好喔', NOW);
     const d = await decideWake({ event: e, context: ctx(), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 0.76, rawScore: 0.76, margin: 0.02, mine: true }) });
-    expect(d).toMatchObject({ wake: true, reason: 'fallback' });
+    expect(d).toMatchObject({ wake: true, reason: 'relevant', askCheck: true });
     const real = await decideWake({ event: ev('$ask', '推薦一家 Soho 的點心', NOW), context: ctx(), spec: NEWS_SPEC, mode: 'ambient', nowMs: NOW, score: async () => ({ score: 1, rawScore: 1, margin: 0.155, mine: true }) });
     expect(real).toMatchObject({ wake: true, reason: 'relevant' });
+    expect(real.askCheck).toBeUndefined();
+    expect(real.delayMs).toBeLessThan(d.delayMs);
   });
 });

@@ -2,7 +2,7 @@ import type { AgentSpec, InboundEvent, RoomContext } from '../types.js';
 import { type ReplyMode } from './ledger.js';
 /** Stop speaking once this many agent messages follow the last human one (platform rejects the 7th). */
 export declare const V2_AGENT_TAIL_CAP = 5;
-export type WakeReason = 'dm' | 'mentioned' | 'reply_to_you' | 'your_conversation' | 'answers_your_question' | 'handoff' | 'reaction_to_you' | 'proactive' | 'agent_hint' | 'relevant' | 'fallback' | 'not_text' | 'from_agent' | 'aimed_elsewhere' | 'mode_mention' | 'mode_quiet' | 'agent_tail_cap' | 'peer_conversation' | 'topic_moved_on' | 'low_relevance' | 'low_margin' | 'budget';
+export type WakeReason = 'dm' | 'mentioned' | 'reply_to_you' | 'your_conversation' | 'answers_your_question' | 'handoff' | 'reaction_to_you' | 'proactive' | 'agent_hint' | 'relevant' | 'not_text' | 'from_agent' | 'aimed_elsewhere' | 'mode_mention' | 'mode_quiet' | 'agent_tail_cap' | 'peer_conversation' | 'topic_moved_on' | 'low_relevance' | 'budget';
 export interface WakeDecision {
     wake: boolean;
     reason: WakeReason;
@@ -15,6 +15,11 @@ export interface WakeDecision {
     score?: number;
     /** How clearly this agent beats the other agents' asks (cosine minus best not-example cosine). */
     margin?: number;
+    /**
+     * Relevant, but no clearer a fit than another agent's (low margin): chatter looks like this, and so
+     * does a real ask that fits two agents. Claim only if the ask model says it is a real question or need.
+     */
+    askCheck?: boolean;
 }
 export interface WakeGateOptions {
     /** Relevance needed to wake on an unaddressed group message (0..1). */
@@ -28,19 +33,10 @@ export interface WakeGateOptions {
     /** Reactions on this agent's own messages that count as a reply to it (e.g. 👍 to confirm). */
     reactionsToSelf?: readonly string[];
     /**
-     * Below the wake bar but at least this relevant: if no agent has answered or claimed the message
-     * after `fallbackDelayMs`, this agent takes it (the closest fit goes first). 0 turns it off.
-     */
-    fallbackThreshold: number;
-    /** Wait before a fallback agent takes an unanswered message, for a score right at the threshold... */
-    fallbackDelayMs: number;
-    /** ...minus up to this much for a better fit, so the closest agent goes first. */
-    fallbackSpreadMs: number;
-    /**
      * Going first also needs this margin over the other agents' asks (cosine minus best not-example
      * cosine), when the agent has notExamples. Chatter ("哈哈好喔", "謝謝") sits at the same cosine to
      * every profile (bge-m3 gives it about 0.55), so its relevance looks high while the margin stays
-     * near 0; real asks beat the other agents by 0.08 and more. Below it the agent only stands by.
+     * near 0; real asks beat the other agents by 0.08 and more. Below it the agent stays silent.
      * Live data (zack test 2026-11-27): chatter and thanks up to 0.054, real asks from 0.078.
      */
     minRelevantMargin: number;
